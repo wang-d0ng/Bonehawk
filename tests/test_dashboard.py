@@ -572,6 +572,44 @@ def test_dashboard_service_tickets_refresh_alpaca_fill_status(tmp_path: Path) ->
     assert payload["tickets"][0]["fill_status"] == "filled"
     assert payload["tickets"][0]["filled_quantity"] == 1
     assert payload["tickets"][0]["filled_average_price"] == 101.25
+    assert payload["tickets"][0]["message"] == "Alpaca order filled."
+
+
+def test_dashboard_service_live_orders_summarizes_recent_order_events(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
+    record_decisions(
+        tmp_path / "logs" / "decision_log.jsonl",
+        "autopilot_order",
+        [
+            {
+                "symbol": "MSFT",
+                "action": "AUTO_BUY_CANDIDATE",
+                "status": "submitted",
+                "broker_status": "accepted",
+                "broker_order_id": "paper-live-view",
+                "filled_quantity": 0,
+                "fill_status": "not_filled_yet",
+                "reason": "Alpaca paper order accepted but not filled yet.",
+                "signals": ["notional 25"],
+                "review_only": False,
+            },
+            {
+                "symbol": "AACB",
+                "action": "AUTO_BUY_CANDIDATE",
+                "status": "rejected",
+                "reason": "Alpaca rejected the order.",
+                "signals": ["notional 25"],
+                "review_only": True,
+            },
+        ],
+    )
+
+    payload = service.live_orders()
+
+    assert payload["summary"]["submitted"] == 1
+    assert payload["summary"]["rejected"] == 1
+    assert payload["events"][0]["symbol"] == "AACB"
+    assert payload["events"][1]["broker_order_id"] == "paper-live-view"
 
 
 def test_dashboard_service_autopilot_snapshot_is_redacted(tmp_path: Path) -> None:
@@ -780,6 +818,7 @@ def test_dashboard_handler_serves_get_routes(tmp_path: Path) -> None:
     index_status, index_body = _http_request(handler, "GET", "/")
     status_status, status_body = _http_request(handler, "GET", "/api/status")
     chart_status, chart_body = _http_request(handler, "GET", "/api/stock-chart?symbol=msft&range=1w")
+    live_status, live_body = _http_request(handler, "GET", "/api/live-orders")
     missing_status, missing_body = _http_request(handler, "GET", "/nope")
 
     assert index_status == 200
@@ -788,6 +827,8 @@ def test_dashboard_handler_serves_get_routes(tmp_path: Path) -> None:
     assert json.loads(status_body)["mode"] == "missing"
     assert chart_status == 200
     assert json.loads(chart_body)["symbol"] == "MSFT"
+    assert live_status == 200
+    assert "events" in json.loads(live_body)
     assert missing_status == 404
     assert json.loads(missing_body)["error"] == "not found"
 
@@ -877,6 +918,13 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "ESSENTIAL_COMMAND_IDS" in HTML
     assert 'id="growth-panel"' in HTML
     assert 'id="tickets-panel"' in HTML
+    assert 'id="live-panel"' in HTML
+    assert "showTab('live-panel'" in HTML
+    assert 'id="live-order-feed"' in HTML
+    assert 'id="live-order-summary"' in HTML
+    assert "/api/live-orders" in HTML
+    assert "renderLiveOrders" in HTML
+    assert "refreshLiveOrders" in HTML
     assert "/api/tickets" in HTML
     assert "renderTickets" in HTML
     assert "/api/growth-candidates" in HTML

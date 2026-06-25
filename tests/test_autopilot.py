@@ -193,6 +193,11 @@ class RejectingProfitablePositionAlpacaClient(ProfitablePositionAlpacaClient):
         }
 
 
+class NonFractionableAlpacaClient(FakeAlpacaClient):
+    def get_asset(self, symbol: str) -> dict:
+        return {"symbol": symbol.upper(), "status": "active", "tradable": True, "fractionable": False}
+
+
 def test_load_autopilot_config_defaults_to_paper_disabled(tmp_path: Path) -> None:
     config = load_autopilot_config(tmp_path / "missing.json")
 
@@ -379,6 +384,42 @@ def test_autopilot_execute_places_paper_orders_and_records_decisions(tmp_path: P
     assert alpaca.orders[0][0].take_profit is None
     assert payload["orders"][0]["stop_loss"] is not None
     assert (tmp_path / "logs" / "decision_log.jsonl").exists()
+
+
+def test_autopilot_buy_uses_whole_quantity_for_non_fractionable_assets(tmp_path: Path) -> None:
+    alpaca = NonFractionableAlpacaClient(cash=10000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["ok"] is True
+    assert payload["executed"][0]["broker_order_id"] == "paper-MSFT"
+    assert alpaca.orders[0][0].quantity >= 1
+    assert float(alpaca.orders[0][0].quantity).is_integer()
+    assert alpaca.orders[0][0].notional is None
+
+
+def test_autopilot_blocks_non_fractionable_buy_when_cash_cannot_buy_one_share(tmp_path: Path) -> None:
+    alpaca = NonFractionableAlpacaClient(cash=5)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["executed"] == []
+    assert any(item["status"] == "whole_share_required" for item in payload["blocked"])
+    assert alpaca.orders == []
 
 
 def test_autopilot_dynamic_sizing_allocates_available_cash_across_orders(tmp_path: Path) -> None:

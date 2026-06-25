@@ -503,6 +503,26 @@ class DashboardService:
         tickets = self._refresh_alpaca_ticket_statuses(tickets)
         return {"tickets": tickets, "summary": {"count": len(tickets)}}
 
+    def live_orders(self) -> dict[str, Any]:
+        tickets_payload = self.tickets()
+        events = [_live_order_event(ticket) for ticket in tickets_payload.get("tickets", [])]
+        summary = _live_order_summary(events)
+        background = self.autopilot_background_status()
+        return {
+            "ok": True,
+            "status": "ready",
+            "events": events[:80],
+            "summary": summary,
+            "background": {
+                "status": background.get("status"),
+                "running": background.get("running"),
+                "runs": background.get("runs"),
+                "last_error": background.get("last_error"),
+                "last_finished_at": background.get("last_finished_at"),
+            },
+            "message": "Live View is watching recent buy/sell tickets and Alpaca broker responses.",
+        }
+
     def _refresh_alpaca_ticket_statuses(self, tickets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         refreshable_indexes = [
             index
@@ -731,6 +751,8 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 self._send(*json_response(service.decision_log()))
             elif path == "/api/tickets":
                 self._send(*json_response(service.tickets()))
+            elif path == "/api/live-orders":
+                self._send(*json_response(service.live_orders()))
             elif path == "/api/commands":
                 self._send(*json_response(service.command_catalog()))
             else:
@@ -964,13 +986,72 @@ def _ticket_from_decision(row: dict[str, Any]) -> dict[str, Any] | None:
 
 def _ticket_with_alpaca_order(ticket: dict[str, Any], order: dict[str, Any]) -> dict[str, Any]:
     fill = alpaca_order_fill_snapshot(order)
+    fill_status = fill["fill_status"]
     return {
         **ticket,
         "broker_status": order.get("status") or ticket.get("broker_status"),
         "filled_quantity": fill["filled_quantity"],
         "filled_average_price": fill["filled_average_price"],
-        "fill_status": fill["fill_status"],
+        "fill_status": fill_status,
+        "message": _refreshed_order_message(fill_status, ticket.get("message")),
     }
+
+
+def _refreshed_order_message(fill_status: str, fallback: Any) -> str:
+    if fill_status == "filled":
+        return "Alpaca order filled."
+    if fill_status == "partially_filled":
+        return "Alpaca order partially filled."
+    if fill_status in {"canceled", "cancelled", "expired", "rejected", "stopped", "suspended", "done_for_day"}:
+        return f"Alpaca order is {fill_status}."
+    return str(fallback or "Alpaca order status refreshed.")
+
+
+def _live_order_event(ticket: dict[str, Any]) -> dict[str, Any]:
+    status = str(ticket.get("status") or "unknown").lower()
+    broker_status = str(ticket.get("broker_status") or "").lower()
+    fill_status = str(ticket.get("fill_status") or "").lower()
+    category = _live_order_category(status, broker_status, fill_status, bool(ticket.get("broker_order_id")))
+    return {
+        "timestamp": ticket.get("timestamp"),
+        "source": ticket.get("source"),
+        "symbol": ticket.get("symbol"),
+        "side": ticket.get("side"),
+        "action": ticket.get("action"),
+        "quantity": ticket.get("quantity"),
+        "current_price": ticket.get("current_price"),
+        "status": status,
+        "broker_status": ticket.get("broker_status"),
+        "broker_order_id": ticket.get("broker_order_id"),
+        "filled_quantity": ticket.get("filled_quantity"),
+        "filled_average_price": ticket.get("filled_average_price"),
+        "fill_status": ticket.get("fill_status"),
+        "message": ticket.get("message"),
+        "review_only": ticket.get("review_only", True),
+        "category": category,
+    }
+
+
+def _live_order_category(status: str, broker_status: str, fill_status: str, has_order_id: bool) -> str:
+    rejected_statuses = {"rejected", "not_configured", "live_not_allowed", "confirmation_required", "invalid_symbol", "invalid_side", "invalid_quantity", "invalid_size"}
+    if fill_status == "filled" or broker_status == "filled":
+        return "filled"
+    if status in rejected_statuses or broker_status == "rejected":
+        return "rejected"
+    if has_order_id or status in {"submitted", "accepted", "new"}:
+        return "submitted"
+    if status == "recorded":
+        return "recorded"
+    return "blocked" if status not in {"unknown", ""} else "unknown"
+
+
+def _live_order_summary(events: list[dict[str, Any]]) -> dict[str, int]:
+    categories = {"submitted": 0, "rejected": 0, "filled": 0, "recorded": 0, "blocked": 0, "unknown": 0}
+    for event in events:
+        category = str(event.get("category") or "unknown")
+        categories[category if category in categories else "unknown"] += 1
+    categories["total"] = len(events)
+    return categories
 
 
 def _ticket_quantity(row: dict[str, Any]) -> float | None:
@@ -1855,13 +1936,14 @@ HTML = """
           <button class="tab" data-title="Growth" onclick="showTab('growth-panel', this)"><span class="nav-glyph">GR</span><span class="nav-text">Growth</span><span class="nav-kbd">03</span></button>
           <button class="tab" data-title="Stocks" onclick="showTab('stocks-panel', this)"><span class="nav-glyph">ST</span><span class="nav-text">Stocks</span><span class="nav-kbd">04</span></button>
           <button class="tab" data-title="Tickets" onclick="showTab('tickets-panel', this)"><span class="nav-glyph">TK</span><span class="nav-text">Tickets</span><span class="nav-kbd">05</span></button>
+          <button class="tab" data-title="Live View" onclick="showTab('live-panel', this)"><span class="nav-glyph">LV</span><span class="nav-text">Live View</span><span class="nav-kbd">06</span></button>
         </nav>
       </div>
       <div class="nav-section">
         <div class="nav-label">System</div>
         <nav class="nav" aria-label="System sections">
-          <button class="tab" data-title="Logs" onclick="showTab('logs-panel', this)"><span class="nav-glyph">LG</span><span class="nav-text">Logs</span><span class="nav-kbd">06</span></button>
-          <button class="tab" data-title="Settings" onclick="showTab('settings-panel', this)"><span class="nav-glyph">⚙</span><span class="nav-text">Settings</span><span class="nav-kbd">07</span></button>
+          <button class="tab" data-title="Logs" onclick="showTab('logs-panel', this)"><span class="nav-glyph">LG</span><span class="nav-text">Logs</span><span class="nav-kbd">07</span></button>
+          <button class="tab" data-title="Settings" onclick="showTab('settings-panel', this)"><span class="nav-glyph">⚙</span><span class="nav-text">Settings</span><span class="nav-kbd">08</span></button>
         </nav>
       </div>
       <div class="rail-status">
@@ -2095,6 +2177,24 @@ HTML = """
           <div id="tickets-status" class="muted"></div>
         </div>
         <div id="tickets-list" class="data-list"></div>
+      </section>
+
+      <section id="live-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Live Order View</h2>
+          <div id="live-order-status" class="muted"></div>
+        </div>
+        <div id="live-order-summary" class="metric-grid"></div>
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Order Tape</h2>
+            <div id="live-order-feed" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Background Loop</h2>
+            <div id="live-order-background" class="data-list"></div>
+          </div>
+        </div>
       </section>
 
       <section id="logs-panel" class="tab-panel">
@@ -2370,6 +2470,7 @@ HTML = """
         'growth-panel': 'growth --new --fast-moving --paper-only',
         'stocks-panel': 'universe --alpaca --available',
         'tickets-panel': 'tickets --orders --broker-response',
+        'live-panel': 'orders --live-view --broker-response',
         'logs-panel': 'logs --decisions --execution',
         'settings-panel': 'settings --connectors --telegram'
       };
@@ -2486,7 +2587,7 @@ HTML = """
     }
     async function refreshIntel() {
       setStatus('Refreshing market data...', 'muted');
-      const [data, trades, growth, sync, logs, tickets, stocks, autopilot, background] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/stocks'), getJson('/api/autopilot'), getJson('/api/autopilot-background')]);
+      const [data, trades, growth, sync, logs, tickets, stocks, autopilot, background, liveOrders] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/stocks'), getJson('/api/autopilot'), getJson('/api/autopilot-background'), getJson('/api/live-orders')]);
       renderPortfolio(data, trades, sync);
       renderTicker(trades);
       renderTradeIdeas(trades);
@@ -2499,6 +2600,7 @@ HTML = """
       renderNews(data);
       renderLogs(logs);
       renderTickets(tickets);
+      renderLiveOrders(liveOrders);
       renderSettings(data);
       const updated = new Date().toLocaleTimeString();
       document.getElementById('rail-updated').textContent = updated;
@@ -2629,6 +2731,7 @@ HTML = """
       renderAutopilotPlan(display);
       document.getElementById('autopilot-output').textContent = formatBackgroundAutopilotOutput(last);
       (display.executed || []).forEach(item => showOrderToast(item, 'Background paper order'));
+      refreshLiveOrders();
       setStatus(`Background loop posted run ${runNumber}: ${last.execution?.submitted || 0} paper order(s) submitted.`, last.ok ? 'ok' : 'muted');
     }
     function renderAutopilotAgents(data) {
@@ -2824,6 +2927,7 @@ HTML = """
         (data.executed || []).forEach(item => showOrderToast(item, 'Autopilot order'));
         setStatus(data.ok ? 'Autopilot paper execution submitted.' : data.message || data.status || 'Autopilot did not submit orders.', data.ok ? 'ok' : 'error');
         await refreshTickets();
+        await refreshLiveOrders();
       }, true, false);
     }
     async function setAutopilotBackground(enabled) {
@@ -2897,6 +3001,55 @@ HTML = """
           `${pill(status, status === 'submitted' || status === 'recorded' ? 'buy' : 'trim')}<span>${escapeHtml(ticket.timestamp || '')}</span>`
         );
       }).join('') || empty('No buy or sell tickets yet.');
+    }
+    function renderLiveOrders(data) {
+      const events = data.events || [];
+      const summary = data.summary || {};
+      const background = data.background || {};
+      const statusNode = document.getElementById('live-order-status');
+      if (!statusNode) return;
+      statusNode.textContent = `${events.length} recent events · ${summary.submitted || 0} submitted · ${summary.rejected || 0} rejected`;
+      document.getElementById('live-order-summary').innerHTML = [
+        metric('Submitted', String(summary.submitted || 0), 'Accepted by Alpaca or carrying an order ID'),
+        metric('Rejected', String(summary.rejected || 0), 'Broker or guardrail rejects'),
+        metric('Filled', String(summary.filled || 0), 'Completed broker fills'),
+        metric('Recorded', String(summary.recorded || 0), 'Review tickets, no order sent')
+      ].join('');
+      document.getElementById('live-order-feed').innerHTML = events.map(event => {
+        const category = String(event.category || event.status || 'unknown');
+        const size = event.quantity ? `qty ${event.quantity}` : '';
+        const fill = event.fill_status ? `fill ${event.fill_status}` : '';
+        const filledQty = Number.isFinite(Number(event.filled_quantity)) ? `filled ${event.filled_quantity}` : '';
+        const broker = event.broker_status ? `broker ${event.broker_status}` : '';
+        const orderId = event.broker_order_id ? `order ${event.broker_order_id}` : 'no order id yet';
+        const detail = [size, broker, fill, filledQty, orderId].filter(Boolean).join(' · ');
+        return row(
+          `${stockSymbolControls(event.symbol)}${pill(event.side || event.action || 'ORDER', actionClass(event.side || event.action))}`,
+          `${escapeHtml(event.source || 'order')} · ${escapeHtml(event.message || '')}<div class="data-sub">${escapeHtml(detail)}</div>`,
+          `${pill(category, liveOrderClass(category))}<span>${escapeHtml(event.timestamp || '')}</span>`
+        );
+      }).join('') || empty('No order events yet.');
+      document.getElementById('live-order-background').innerHTML = [
+        row('Loop', background.running ? 'Background scan and paper run is active.' : 'Background scan and paper run is stopped.', pill(background.status || 'unknown', background.running ? 'buy' : 'trim')),
+        row('Runs', `${background.runs || 0} completed`, background.last_finished_at ? escapeHtml(background.last_finished_at) : ''),
+        background.last_error ? row('Last error', escapeHtml(background.last_error), pill('error', 'sell')) : row('Last error', 'No background loop error reported.', pill('clear', 'buy'))
+      ].join('');
+    }
+    function liveOrderClass(category) {
+      const value = String(category || '').toLowerCase();
+      if (value === 'submitted' || value === 'filled' || value === 'recorded') return 'buy';
+      if (value === 'rejected') return 'sell';
+      if (value === 'blocked') return 'trim';
+      return 'quiet';
+    }
+    async function refreshLiveOrders() {
+      try {
+        const data = await getJson('/api/live-orders');
+        renderLiveOrders(data);
+      } catch (error) {
+        const node = document.getElementById('live-order-status');
+        if (node) node.textContent = error.message || 'Live order feed unavailable.';
+      }
     }
     async function refreshTickets() {
       const tickets = await getJson('/api/tickets');
@@ -3092,6 +3245,7 @@ HTML = """
         showOrderToast(result, 'Live order');
         setStatus(result.message || `${pendingStockTicket.side} order handled.`, response.ok && result.ok ? 'ok' : 'error');
         await refreshTickets();
+        await refreshLiveOrders();
         if (response.ok && result.ok) closeStockTicket();
       }, true, false);
     }
@@ -3107,6 +3261,7 @@ HTML = """
         showOrderToast(result, 'Stock ticket');
         setStatus(result.message || `${side} ticket recorded.`, response.ok && result.ok ? 'ok' : 'error');
         await refreshTickets();
+        await refreshLiveOrders();
         if (response.ok && result.ok) closeStockTicket();
       }, true, false);
     }
@@ -3408,6 +3563,7 @@ HTML = """
     initSidebar();
     refreshAll();
     window.setInterval(refreshAutopilotBackgroundStatus, 10000);
+    window.setInterval(refreshLiveOrders, 2000);
   </script>
 </body>
 </html>

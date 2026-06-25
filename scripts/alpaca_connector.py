@@ -144,6 +144,17 @@ class AlpacaTradingClient:
         payload = response.json()
         return payload if isinstance(payload, list) else []
 
+    def get_asset(self, symbol: str) -> dict[str, Any]:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise AlpacaError("Alpaca asset symbol is missing.")
+        if not self.config.is_configured:
+            raise AlpacaError("Alpaca API keys are missing.")
+        response = self.http_client.get(f"{self.config.trading_base_url}/v2/assets/{normalized_symbol}", headers=self.config.headers())
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
     def get_order(self, order_id: str) -> dict[str, Any]:
         normalized_id = str(order_id or "").strip()
         if not normalized_id:

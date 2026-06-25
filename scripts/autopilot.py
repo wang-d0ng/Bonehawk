@@ -120,18 +120,10 @@ class AutopilotEngine:
             decisions["blocked"].append({"status": "broker_missing", "reason": "Alpaca client is not available."})
         else:
             for order in decisions["orders"]:
-                bracket_prices = _broker_bracket_prices(order, self.config)
-                side = str(order.get("side") or "buy").lower()
-                request = AlpacaOrderRequest(
-                    symbol=order["symbol"],
-                    side=side,
-                    quantity=_safe_float(order.get("quantity"), 0) if side == "sell" else None,
-                    notional=None if side == "sell" else order["notional"],
-                    order_type="market",
-                    time_in_force="day",
-                    stop_loss=bracket_prices.get("stop_loss"),
-                    take_profit=bracket_prices.get("take_profit"),
-                )
+                request, broker_block = _broker_order_request(order, self.config, self.alpaca_client)
+                if broker_block:
+                    decisions["blocked"].append(broker_block)
+                    continue
                 response = self.alpaca_client.place_order(request, confirm=confirm)
                 executed.append(
                     {
@@ -881,6 +873,61 @@ def _order_notional(candidate: dict[str, Any], remaining_cash: float) -> float:
         return 0
     notional = min(suggested, remaining_cash)
     return notional if notional >= 1 else 0
+
+
+def _broker_order_request(order: dict[str, Any], config: AutopilotConfig, alpaca_client: AlpacaTradingClient) -> tuple[AlpacaOrderRequest | None, dict[str, Any] | None]:
+    bracket_prices = _broker_bracket_prices(order, config)
+    side = str(order.get("side") or "buy").lower()
+    symbol = str(order.get("symbol") or "").upper()
+    quantity = _safe_float(order.get("quantity"), 0) if side == "sell" else None
+    notional = None if side == "sell" else _safe_float(order.get("notional"), 0)
+    asset = _broker_asset(alpaca_client, symbol)
+
+    if asset and not _asset_is_tradable(asset):
+        return None, {**order, "status": "asset_not_tradable", "reason": f"Alpaca marks {symbol} as not tradable right now."}
+    if side == "buy" and asset and asset.get("fractionable") is False:
+        current_price = _safe_float(order.get("current_price"), 0)
+        whole_quantity = int(notional // current_price) if current_price > 0 and notional > 0 else 0
+        if whole_quantity < 1:
+            return None, {
+                **order,
+                "status": "whole_share_required",
+                "reason": f"Alpaca does not allow fractional orders for {symbol}; dynamic sizing cannot afford one full share.",
+                "quantity": 0,
+                "quantity_estimate": 0,
+            }
+        quantity = float(whole_quantity)
+        notional = None
+
+    return (
+        AlpacaOrderRequest(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            notional=notional,
+            order_type="market",
+            time_in_force="day",
+            stop_loss=bracket_prices.get("stop_loss"),
+            take_profit=bracket_prices.get("take_profit"),
+        ),
+        None,
+    )
+
+
+def _broker_asset(alpaca_client: AlpacaTradingClient, symbol: str) -> dict[str, Any] | None:
+    if not symbol or not hasattr(alpaca_client, "get_asset"):
+        return None
+    try:
+        asset = alpaca_client.get_asset(symbol)
+    except Exception:
+        return None
+    return asset if isinstance(asset, dict) else None
+
+
+def _asset_is_tradable(asset: dict[str, Any]) -> bool:
+    status = str(asset.get("status") or "active").lower()
+    tradable = asset.get("tradable", True)
+    return status == "active" and bool(tradable)
 
 
 def _broker_bracket_prices(order: dict[str, Any], config: AutopilotConfig) -> dict[str, float | None]:
