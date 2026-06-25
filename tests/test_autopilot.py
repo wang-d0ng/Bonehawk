@@ -73,6 +73,9 @@ class FakeAlpacaClient:
     def get_account(self) -> dict:
         return {"cash": str(self.cash), "buying_power": str(self.buying_power), "portfolio_value": str(self.portfolio_value)}
 
+    def get_positions(self) -> list[dict]:
+        return []
+
     def place_order(self, request, confirm: str = "") -> dict:
         self.orders.append((request, confirm))
         return {
@@ -89,6 +92,53 @@ class FakeAlpacaClient:
         }
 
 
+class ProfitTakingQuoteClient(FakeQuoteClient):
+    def get_quotes(self, symbols):
+        return {symbol: Quote(symbol, 105, previous_close=104) for symbol in symbols}
+
+    def get_histories(self, symbols):
+        return {
+            symbol: PriceHistory(
+                symbol,
+                closes=[96, 98, 100, 102, 104, 105, 105.2, 105.1, 105.05, 105],
+                volumes=[100, 100, 100, 100, 120, 140, 180, 220, 260, 300],
+            )
+            for symbol in symbols
+        }
+
+
+class ProfitablePositionAlpacaClient(FakeAlpacaClient):
+    def get_positions(self) -> list[dict]:
+        return [
+            {
+                "symbol": "MSFT",
+                "qty": "2",
+                "avg_entry_price": "100",
+                "cost_basis": "200",
+                "current_price": "105",
+                "market_value": "210",
+                "unrealized_pl": "10",
+                "unrealized_plpc": "0.05",
+                "change_today": "0.01",
+            }
+        ]
+
+
+class RejectingProfitablePositionAlpacaClient(ProfitablePositionAlpacaClient):
+    def place_order(self, request, confirm: str = "") -> dict:
+        self.orders.append((request, confirm))
+        return {
+            "ok": False,
+            "status": "rejected",
+            "symbol": request.symbol,
+            "side": request.side.upper(),
+            "quantity": request.quantity,
+            "notional": request.notional,
+            "message": "paper order rejected",
+            "review_only": True,
+        }
+
+
 def test_load_autopilot_config_defaults_to_paper_disabled(tmp_path: Path) -> None:
     config = load_autopilot_config(tmp_path / "missing.json")
 
@@ -100,7 +150,7 @@ def test_load_autopilot_config_defaults_to_paper_disabled(tmp_path: Path) -> Non
 
 def test_load_autopilot_config_clamps_risky_values(tmp_path: Path) -> None:
     path = tmp_path / "autopilot.json"
-    path.write_text(json.dumps({"enabled": True, "max_trade_usd": 5000, "max_open_positions": 999, "min_confidence": 5}))
+    path.write_text(json.dumps({"enabled": True, "max_trade_usd": 5000, "max_open_positions": 999, "min_confidence": 5, "scan_window_minutes": 30}))
 
     config = load_autopilot_config(path)
 
@@ -108,6 +158,73 @@ def test_load_autopilot_config_clamps_risky_values(tmp_path: Path) -> None:
     assert config.max_trade_usd == 1000
     assert config.max_open_positions == 25
     assert config.min_confidence == 35
+    assert config.scan_window_minutes == 5
+
+
+def test_autopilot_profit_exit_sells_position_before_new_buys(tmp_path: Path) -> None:
+    alpaca = ProfitablePositionAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, scan_window_minutes=5),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=ProfitTakingQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    scan = engine.scan(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+    execution = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert scan["orders"][0]["side"] == "sell"
+    assert scan["orders"][0]["action"] == "AUTO_SELL_PROFIT_TAKE"
+    assert scan["orders"][0]["quantity"] == 2
+    assert scan["orders"][0]["notional"] == 210
+    assert scan["orders"][0]["exit_window_minutes"] == 5
+    assert scan["orders"][0]["profit_target_pct"] <= scan["orders"][0]["unrealized_pnl_pct"]
+    assert execution["executed"][0]["side"] == "SELL"
+    assert alpaca.orders[0][0].symbol == "MSFT"
+    assert alpaca.orders[0][0].side == "sell"
+    assert alpaca.orders[0][0].quantity == 2
+    assert alpaca.orders[0][0].notional is None
+
+
+def test_autopilot_profit_exit_cooldown_blocks_duplicate_sell(tmp_path: Path) -> None:
+    alpaca = ProfitablePositionAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, scan_window_minutes=5),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=ProfitTakingQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    first = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+    second = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert first["executed"][0]["side"] == "SELL"
+    assert second["executed"] == []
+    assert second["orders"] == []
+    cooldown = next(item for item in second["blocked"] if item["status"] == "cooldown")
+    assert "recent" in cooldown["reason"].lower()
+    assert len(alpaca.orders) == 1
+
+
+def test_autopilot_rejected_exit_attempt_cools_down_duplicate_sell(tmp_path: Path) -> None:
+    alpaca = RejectingProfitablePositionAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, scan_window_minutes=5),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=ProfitTakingQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    first = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+    second = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert first["executed"][0]["status"] == "rejected"
+    assert second["executed"] == []
+    assert any(item["status"] == "cooldown" for item in second["blocked"])
+    assert len(alpaca.orders) == 1
 
 
 def test_autopilot_scan_generates_paper_buy_plan(tmp_path: Path) -> None:

@@ -37,6 +37,7 @@ def _row(timestamp: str, source: str, idea: dict[str, Any]) -> dict[str, Any]:
         "timestamp": timestamp,
         "source": source,
         "symbol": idea.get("symbol"),
+        "side": idea.get("side"),
         "action": idea.get("action"),
         "confidence": idea.get("confidence"),
         "current_price": idea.get("current_price"),

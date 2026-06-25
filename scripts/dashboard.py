@@ -1178,10 +1178,16 @@ def _compact_background_rows(rows: list[dict[str, Any]], limit: int) -> list[dic
         "edge",
         "expected_return_pct",
         "notional",
+        "quantity",
         "quantity_estimate",
         "stop_loss",
         "take_profit",
         "kelly_fraction",
+        "profit_target_pct",
+        "stop_exit_pct",
+        "unrealized_pnl",
+        "unrealized_pnl_pct",
+        "exit_window_minutes",
         "reason",
         "signals",
         "status",
@@ -2008,7 +2014,7 @@ HTML = """
                 </div>
                 <div class="tabs" aria-label="Opportunity filters">
                   <span class="pill buy">Stocks</span>
-                  <span class="pill quiet">1-30m</span>
+                  <span class="pill quiet">1-5m</span>
                   <span class="pill trim">Telegram</span>
                 </div>
               </div>
@@ -2358,7 +2364,7 @@ HTML = """
     function commandForView(id) {
       const commands = {
         'overview-panel': 'scan --broker alpaca --mode paper --risk dynamic',
-        'ideas-panel': 'signals --window 1-30m --rank edge',
+        'ideas-panel': 'signals --window 1-5m --rank edge',
         'growth-panel': 'growth --new --fast-moving --paper-only',
         'stocks-panel': 'universe --alpaca --available',
         'tickets-panel': 'tickets --orders --broker-response',
@@ -2583,7 +2589,7 @@ HTML = """
         metric('Status', humanize(data.status), `Mode ${escapeHtml(config.mode || 'paper')}`),
         metric('Broker', 'Alpaca', humanize(broker.status || 'unknown')),
         metric('Sizing', 'Dynamic', `${config.max_open_positions || 0} max open positions`),
-        metric('Agent window', `${escapeHtml(config.scan_window_minutes || 15)}m`, 'Cash, price, probability, and edge'),
+        metric('Agent window', `${escapeHtml(config.scan_window_minutes || 5)}m`, 'Cash, price, probability, and edge'),
         metric('Live gate', config.live_ready ? 'Ready' : 'Locked', config.allow_live ? 'Live permission on' : 'Paper-first')
       ].join('');
       document.getElementById('autopilot-orders').innerHTML = empty('Run Scan to build a fresh paper plan.');
@@ -2718,9 +2724,16 @@ HTML = """
         const side = String(order.side || order.action || 'BUY').toUpperCase();
         const score = Math.max(0, Math.min(100, Number(order.confidence || 0)));
         const probability = order.probability_up ? pct(Number(order.probability_up) * 100) : `${score}/100`;
-        const edge = order.edge ? pct(Number(order.edge) * 100) : (order.expected_return_pct ? pct(Number(order.expected_return_pct)) : 'n/a');
-        const size = order.notional ? money(order.notional) : (order.quantity_estimate ? `${Number(order.quantity_estimate).toFixed(4)} sh` : 'n/a');
-        const guardrail = [order.stop_loss ? `stop ${money(order.stop_loss)}` : '', order.kelly_fraction ? `kelly ${(Number(order.kelly_fraction) * 100).toFixed(2)}%` : '', order.take_profit ? `target ${money(order.take_profit)}` : ''].filter(Boolean).join(' · ') || 'pass';
+        const edge = order.edge_pct !== undefined ? pct(Number(order.edge_pct)) : (order.edge ? pct(Number(order.edge) * 100) : (order.expected_return_pct ? pct(Number(order.expected_return_pct)) : 'n/a'));
+        const shareSize = order.quantity || order.quantity_estimate;
+        const size = order.notional ? `${money(order.notional)}${shareSize ? ` · ${Number(shareSize).toFixed(4)} sh` : ''}` : (shareSize ? `${Number(shareSize).toFixed(4)} sh` : 'n/a');
+        const guardrail = [
+          order.stop_loss ? `stop ${money(order.stop_loss)}` : '',
+          order.kelly_fraction ? `kelly ${(Number(order.kelly_fraction) * 100).toFixed(2)}%` : '',
+          order.take_profit ? `target ${money(order.take_profit)}` : '',
+          order.profit_target_pct !== undefined ? `profit target ${Number(order.profit_target_pct).toFixed(2)}%` : '',
+          order.unrealized_pnl_pct !== undefined ? `open ${Number(order.unrealized_pnl_pct).toFixed(2)}%` : ''
+        ].filter(Boolean).join(' · ') || 'pass';
         return `
               <tr>
                 <td class="market">${stockSymbolControls(symbol)}<div class="data-sub">${escapeHtml(order.reason || '')}</div></td>
@@ -2754,13 +2767,15 @@ HTML = """
         lines.push('');
         lines.push('Submitted orders:');
         executed.slice(0, 6).forEach(item => {
-          lines.push(`- ${item.symbol || 'UNKNOWN'} ${item.side || 'ORDER'} ${item.notional ? money(item.notional) : ''} | ${item.broker_status || item.status || 'submitted'} | ${item.broker_order_id || 'no order id'}`);
+          const size = item.notional ? money(item.notional) : (item.quantity ? `${Number(item.quantity).toFixed(4)} sh` : '');
+          lines.push(`- ${item.symbol || 'UNKNOWN'} ${item.side || 'ORDER'} ${size} | ${item.broker_status || item.status || 'submitted'} | ${item.broker_order_id || 'no order id'}`);
         });
       } else if (orders.length) {
         lines.push('');
         lines.push('Planned but not submitted:');
         orders.slice(0, 6).forEach(item => {
-          lines.push(`- ${item.symbol || 'UNKNOWN'} ${money(item.notional || 0)} | ${item.reason || 'planned'}`);
+          const size = item.notional ? money(item.notional) : (item.quantity ? `${Number(item.quantity).toFixed(4)} sh` : money(0));
+          lines.push(`- ${item.symbol || 'UNKNOWN'} ${item.side || 'ORDER'} ${size} | ${item.reason || 'planned'}`);
         });
       }
       if (blocked.length) {
@@ -3149,7 +3164,7 @@ HTML = """
         ),
         row(
           'Agentic scan',
-          `Window ${escapeHtml(config.scan_window_minutes || 15)}m · safety ceiling ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}% · min probability ${Number((config.min_probability || 0.56) * 100).toFixed(1)}%`,
+          `Window ${escapeHtml(config.scan_window_minutes || 5)}m · safety ceiling ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}% · min probability ${Number((config.min_probability || 0.56) * 100).toFixed(1)}%`,
           '<button data-action onclick="editAutopilotAgentic()">Edit</button>'
         ),
         row(
@@ -3344,7 +3359,7 @@ HTML = """
     async function editAutopilotAgentic() {
       const snapshot = await getJson('/api/autopilot');
       const config = snapshot.config || {};
-      const windowMinutes = window.prompt('Scan window in minutes (1-30)', config.scan_window_minutes || 15);
+      const windowMinutes = window.prompt('Scan window in minutes (1-5)', config.scan_window_minutes || 5);
       if (windowMinutes === null) return;
       const kellyPct = window.prompt('Kelly safety ceiling (%)', Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1));
       if (kellyPct === null) return;

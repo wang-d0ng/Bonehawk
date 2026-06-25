@@ -97,6 +97,11 @@ class FakeAlpacaClient:
         }
 
 
+class FakeNoPositionAlpacaClient(FakeAlpacaClient):
+    def get_positions(self):
+        return []
+
+
 class FakeFilledOrderAlpacaClient(FakeAlpacaClient):
     def __init__(self) -> None:
         super().__init__()
@@ -528,7 +533,7 @@ def test_dashboard_service_rejects_invalid_stock_order_intent(tmp_path: Path) ->
 
 
 def test_dashboard_service_stock_order_calls_alpaca_client(tmp_path: Path) -> None:
-    alpaca = FakeAlpacaClient()
+    alpaca = FakeNoPositionAlpacaClient()
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=alpaca)
 
     payload = service.stock_order("msft", "buy", "3", confirm="LIVE_ALPACA_ORDER")
@@ -594,7 +599,7 @@ def test_dashboard_service_autopilot_scan_and_execute_paper_order(tmp_path: Path
     (config / "watchlist.json").write_text(json.dumps({"symbols": ["MSFT"], "positions": [], "risk": {}}))
     (config / "market_universe.json").write_text(json.dumps({"symbols": [], "max_scan_symbols": 0}))
     (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper", "max_trade_usd": 25, "min_confidence": 40}))
-    alpaca = FakeAlpacaClient()
+    alpaca = FakeNoPositionAlpacaClient()
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=alpaca)
 
     scan = service.autopilot_scan()
@@ -656,8 +661,11 @@ def test_dashboard_service_autopilot_uses_alpaca_positions_not_watchlist_positio
 
     payload = service.autopilot_scan()
 
-    assert payload["orders"] == []
-    assert any(item.get("symbol") == "NVDA" and item.get("reason") == "Already in configured positions." for item in payload["blocked"])
+    assert payload["orders"][0]["symbol"] == "NVDA"
+    assert payload["orders"][0]["side"] == "sell"
+    assert payload["orders"][0]["action"] == "AUTO_SELL_PROFIT_TAKE"
+    assert payload["orders"][0]["quantity"] == 2
+    assert payload["orders"][0]["profit_target_pct"] <= payload["orders"][0]["unrealized_pnl_pct"]
 
 
 def test_dashboard_service_updates_autopilot_setting_with_live_confirmation(tmp_path: Path) -> None:

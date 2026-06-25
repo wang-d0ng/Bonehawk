@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from scripts.agentic_autotrader import AgenticScanConfig, load_xgboost_model, run_agentic_scan, run_pending_loss_postmortems
 from scripts.alpaca_connector import LIVE_CONFIRM_PHRASE, AlpacaOrderRequest, AlpacaTradingClient
-from scripts.decision_log import record_decisions
+from scripts.decision_log import latest_decisions, record_decisions
 from scripts.growth_scanner import build_growth_candidates
-from scripts.market_intel import MarketIntelClient, Watchlist
+from scripts.market_intel import MarketIntelClient, Position, Watchlist
 from scripts.market_scanner import scan_market
 from scripts.market_universe import combine_symbols, load_market_universe
 from scripts.quotes import YahooQuoteClient
@@ -27,7 +28,7 @@ class AutopilotConfig:
     max_open_positions: int = 3
     min_confidence: int = 55
     symbols_per_run: int = 40
-    scan_window_minutes: int = 15
+    scan_window_minutes: int = 5
     max_kelly_fraction: float = 0.05
     min_probability: float = 0.56
     paper_trade_downtrend: bool = True
@@ -110,6 +111,7 @@ class AutopilotEngine:
                 }
         scan_payload = self._build_scan(watchlist)
         decisions = self._build_orders(scan_payload, watchlist)
+        decisions = _apply_order_cooldown(self.root, decisions, self.config)
         executed: list[dict[str, Any]] = []
         if self.config.broker != "alpaca":
             decisions["blocked"].append({"status": "broker_disabled", "reason": "Only Alpaca paper execution is implemented."})
@@ -118,10 +120,12 @@ class AutopilotEngine:
         else:
             for order in decisions["orders"]:
                 bracket_prices = _broker_bracket_prices(order, self.config)
+                side = str(order.get("side") or "buy").lower()
                 request = AlpacaOrderRequest(
                     symbol=order["symbol"],
-                    side=order["side"],
-                    notional=order["notional"],
+                    side=side,
+                    quantity=_safe_float(order.get("quantity"), 0) if side == "sell" else None,
+                    notional=None if side == "sell" else order["notional"],
                     order_type="market",
                     time_in_force="day",
                     stop_loss=bracket_prices.get("stop_loss"),
@@ -133,7 +137,11 @@ class AutopilotEngine:
                         **response,
                         "symbol": response.get("symbol") or order.get("symbol"),
                         "side": response.get("side") or order.get("side"),
+                        "quantity": response.get("quantity") or order.get("quantity"),
                         "notional": response.get("notional") or order.get("notional"),
+                        "current_price": order.get("current_price"),
+                        "action": order.get("action"),
+                        "reason": order.get("reason"),
                     }
                 )
         decision_rows = [_decision_from_execution(item) for item in executed] if executed else decisions["orders"]
@@ -160,12 +168,14 @@ class AutopilotEngine:
         }
 
     def _build_scan(self, watchlist: Watchlist) -> dict[str, Any]:
+        open_positions = self._open_positions(watchlist)
+        position_symbols = [position["symbol"] for position in open_positions]
         symbols = _autopilot_symbols(self.root, watchlist, self.config.symbols_per_run)
-        active_watchlist = replace(watchlist, symbols=symbols)
+        active_watchlist = replace(watchlist, symbols=symbols, positions=_watchlist_positions(open_positions))
         account_state = self._account_state()
         snapshot = self.intel_client.snapshot(active_watchlist)
         scan_result = scan_market(active_watchlist, snapshot)
-        quote_symbols = list(dict.fromkeys([*symbols[: self.config.symbols_per_run], "SPY", "QQQ"]))
+        quote_symbols = list(dict.fromkeys([*symbols[: self.config.symbols_per_run], *position_symbols, "SPY", "QQQ"]))
         quotes = self.quote_client.get_quotes(quote_symbols)
         histories = self.quote_client.get_histories(quote_symbols)
         technicals = {symbol: history.technicals() for symbol, history in histories.items()}
@@ -190,6 +200,7 @@ class AutopilotEngine:
         postmortems = run_pending_loss_postmortems(self.root)
         if postmortems:
             agentic_scan = {**agentic_scan, "postmortems": postmortems}
+        exit_candidates = _build_exit_candidates(open_positions, quotes, technicals, agentic_scan, self.config, market_trend)
         return {
             "summary": scan_result["summary"],
             "market_trend": market_trend,
@@ -197,14 +208,25 @@ class AutopilotEngine:
             "growth_candidates": growth,
             "agentic_scan": agentic_scan,
             "account_state": account_state,
+            "open_positions": open_positions,
+            "exit_candidates": exit_candidates,
         }
 
     def _build_orders(self, scan_payload: dict[str, Any], watchlist: Watchlist) -> dict[str, list[dict[str, Any]]]:
         held_symbols = {position.symbol for position in watchlist.positions}
+        held_symbols.update(str(position.get("symbol") or "").upper() for position in scan_payload.get("open_positions", []))
+        held_symbols.discard("")
         orders: list[dict[str, Any]] = []
         blocked: list[dict[str, Any]] = []
         open_slots = max(0, self.config.max_open_positions - len(held_symbols))
         remaining_cash = _safe_float((scan_payload.get("account_state") or {}).get("available_cash"), 0)
+
+        for exit_candidate in scan_payload.get("exit_candidates", []):
+            if exit_candidate.get("status") == "planned":
+                orders.append(exit_candidate)
+            else:
+                blocked.append(exit_candidate)
+        buy_order_count = 0
 
         ranked = _rank_candidate_orders(
             scan_payload.get("ideas", []),
@@ -213,7 +235,7 @@ class AutopilotEngine:
             self.config,
         )
         for candidate in ranked:
-            if len(orders) >= open_slots:
+            if buy_order_count >= open_slots:
                 blocked.append({**candidate, "status": "blocked", "reason": "Max open position limit reached."})
                 continue
             if candidate["confidence"] < self.config.min_confidence:
@@ -237,8 +259,19 @@ class AutopilotEngine:
                 "review_only": True,
             }
             orders.append(order)
+            buy_order_count += 1
             remaining_cash = max(0, remaining_cash - notional)
         return {"orders": orders, "blocked": blocked}
+
+    def _open_positions(self, watchlist: Watchlist) -> list[dict[str, Any]]:
+        if self.alpaca_client and hasattr(self.alpaca_client, "get_positions"):
+            try:
+                positions = self.alpaca_client.get_positions()
+            except Exception:
+                positions = None
+            if positions is not None:
+                return [position for position in (_normalize_alpaca_position(item) for item in positions) if position]
+        return [_normalize_watchlist_position(position) for position in watchlist.positions if position.quantity > 0]
 
     def _account_state(self) -> dict[str, float | str]:
         fallback = max(1, self.config.max_trade_usd * max(1, self.config.max_open_positions))
@@ -298,7 +331,7 @@ def load_autopilot_config(path: Path) -> AutopilotConfig:
         max_open_positions=int(_clamp_float(raw.get("max_open_positions"), 0, 25, 3)),
         min_confidence=int(_clamp_float(raw.get("min_confidence"), 35, 95, 55)),
         symbols_per_run=int(_clamp_float(raw.get("symbols_per_run"), 1, 250, 40)),
-        scan_window_minutes=int(_clamp_float(raw.get("scan_window_minutes"), 1, 30, 15)),
+        scan_window_minutes=int(_clamp_float(raw.get("scan_window_minutes"), 1, 5, 5)),
         max_kelly_fraction=_clamp_float(raw.get("max_kelly_fraction"), 0, 0.25, 0.05),
         min_probability=_clamp_float(raw.get("min_probability"), 0.5, 0.95, 0.56),
         paper_trade_downtrend=bool(raw.get("paper_trade_downtrend", True)),
@@ -336,7 +369,7 @@ def update_autopilot_config(config: AutopilotConfig, setting: Any, value: Any, c
     if key == "min_confidence":
         return replace(config, min_confidence=int(_clamp_float(value, 35, 95, config.min_confidence))), {"ok": True, "status": "updated", "message": "Minimum confidence updated."}
     if key == "scan_window_minutes":
-        return replace(config, scan_window_minutes=int(_clamp_float(value, 1, 30, config.scan_window_minutes))), {"ok": True, "status": "updated", "message": "Short-window scan horizon updated."}
+        return replace(config, scan_window_minutes=int(_clamp_float(value, 1, 5, config.scan_window_minutes))), {"ok": True, "status": "updated", "message": "Short-window scan horizon updated."}
     if key == "max_kelly_fraction":
         return replace(config, max_kelly_fraction=_clamp_float(value, 0, 0.25, config.max_kelly_fraction)), {"ok": True, "status": "updated", "message": "Kelly cap updated."}
     if key == "min_probability":
@@ -352,6 +385,349 @@ def _autopilot_symbols(root: Path, watchlist: Watchlist, limit: int) -> list[str
         universe_path = root / "config" / "market_universe.example.json"
     universe = load_market_universe(universe_path)
     return combine_symbols(watchlist.symbols, universe, limit=max(1, limit))
+
+
+def _apply_order_cooldown(root: Path, decisions: dict[str, list[dict[str, Any]]], config: AutopilotConfig) -> dict[str, list[dict[str, Any]]]:
+    cooldown_minutes = int(_clamp_float(config.scan_window_minutes, 1, 5, 5))
+    recent = _recent_order_fingerprints(root / "logs" / "decision_log.jsonl", cooldown_minutes)
+    if not recent:
+        return decisions
+    orders: list[dict[str, Any]] = []
+    blocked = list(decisions.get("blocked", []))
+    for order in decisions.get("orders", []):
+        fingerprint = _order_fingerprint(order)
+        if fingerprint in recent:
+            blocked.append(
+                {
+                    **order,
+                    "status": "cooldown",
+                    "reason": f"Recent {order.get('side', 'order')} for {order.get('symbol')} was already submitted inside the {cooldown_minutes} minute window.",
+                    "cooldown_minutes": cooldown_minutes,
+                }
+            )
+            continue
+        orders.append(order)
+    return {"orders": orders, "blocked": blocked}
+
+
+def _recent_order_fingerprints(path: Path, cooldown_minutes: int) -> set[tuple[str, str, str]]:
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(minutes=cooldown_minutes)
+    fingerprints: set[tuple[str, str, str]] = set()
+    for row in latest_decisions(path, limit=200):
+        if row.get("source") != "autopilot_order":
+            continue
+        if not _was_recent_order_attempt(row):
+            continue
+        timestamp = _parse_timestamp(row.get("timestamp"))
+        if timestamp is None or timestamp < cutoff:
+            continue
+        fingerprint = _order_fingerprint(row)
+        if all(fingerprint):
+            fingerprints.add(fingerprint)
+    return fingerprints
+
+
+def _was_recent_order_attempt(row: dict[str, Any]) -> bool:
+    symbol, side, action = _order_fingerprint(row)
+    return bool(symbol and side and action)
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _order_fingerprint(row: dict[str, Any]) -> tuple[str, str, str]:
+    symbol = str(row.get("symbol") or "").upper()
+    side = str(row.get("side") or "").lower()
+    action = str(row.get("action") or "").upper()
+    if not side:
+        action_text = action.lower()
+        if "sell" in action_text:
+            side = "sell"
+        elif "buy" in action_text:
+            side = "buy"
+    return symbol, side, action
+
+
+def _watchlist_positions(rows: list[dict[str, Any]]) -> list[Position]:
+    return [
+        Position(
+            symbol=str(row.get("symbol") or "").upper(),
+            quantity=_safe_float(row.get("quantity")),
+            cost_basis=_safe_float(row.get("cost_basis")),
+        )
+        for row in rows
+        if str(row.get("symbol") or "").strip() and _safe_float(row.get("quantity")) > 0
+    ]
+
+
+def _normalize_alpaca_position(row: dict[str, Any]) -> dict[str, Any] | None:
+    symbol = str(row.get("symbol") or "").upper()
+    quantity = abs(_safe_float(row.get("qty")))
+    if not symbol or quantity < 0.000001:
+        return None
+    cost_basis = _safe_float(row.get("avg_entry_price"))
+    current_price = _safe_float(row.get("current_price"), cost_basis)
+    cost_value = _safe_float(row.get("cost_basis"), quantity * cost_basis)
+    market_value = _safe_float(row.get("market_value"), quantity * current_price)
+    unrealized_pnl = _safe_float(row.get("unrealized_pl"), market_value - cost_value)
+    raw_pnl_pct = _safe_float(row.get("unrealized_plpc"))
+    unrealized_pnl_pct = raw_pnl_pct * 100 if raw_pnl_pct else ((unrealized_pnl / cost_value) * 100 if cost_value else 0)
+    return {
+        "symbol": symbol,
+        "quantity": quantity,
+        "cost_basis": cost_basis,
+        "current_price": current_price,
+        "market_value": market_value,
+        "cost_value": cost_value,
+        "unrealized_pnl": unrealized_pnl,
+        "unrealized_pnl_pct": unrealized_pnl_pct,
+        "day_change_pct": _safe_float(row.get("change_today")) * 100,
+        "asset_class": row.get("asset_class") or "us_equity",
+        "side": str(row.get("side") or "long").lower(),
+        "source": "alpaca",
+    }
+
+
+def _normalize_watchlist_position(position: Position) -> dict[str, Any]:
+    quantity = max(0, _safe_float(position.quantity))
+    cost_basis = _safe_float(position.cost_basis)
+    return {
+        "symbol": position.symbol.upper(),
+        "quantity": quantity,
+        "cost_basis": cost_basis,
+        "current_price": cost_basis,
+        "market_value": quantity * cost_basis,
+        "cost_value": quantity * cost_basis,
+        "unrealized_pnl": 0,
+        "unrealized_pnl_pct": 0,
+        "day_change_pct": 0,
+        "asset_class": "configured_position",
+        "side": "long",
+        "source": "watchlist",
+    }
+
+
+def _build_exit_candidates(
+    open_positions: list[dict[str, Any]],
+    quotes: dict[str, Any],
+    technicals: dict[str, dict[str, float]],
+    agentic_scan: dict[str, Any],
+    config: AutopilotConfig,
+    market_trend: str,
+) -> list[dict[str, Any]]:
+    probabilities = _agentic_probability_lookup(agentic_scan)
+    candidates: list[dict[str, Any]] = []
+    for position in open_positions:
+        symbol = str(position.get("symbol") or "").upper()
+        quantity = _safe_float(position.get("quantity"))
+        if not symbol or quantity < 0.000001:
+            continue
+        quote = quotes.get(symbol)
+        current_price = quote.price if quote else _safe_float(position.get("current_price"), _safe_float(position.get("cost_basis")))
+        cost_basis = _safe_float(position.get("cost_basis"))
+        cost_value = quantity * cost_basis
+        market_value = quantity * current_price
+        unrealized_pnl = market_value - cost_value
+        unrealized_pnl_pct = (unrealized_pnl / cost_value) * 100 if cost_value else _safe_float(position.get("unrealized_pnl_pct"))
+        symbol_technicals = technicals.get(symbol, {})
+        probability_up = probabilities.get(symbol, _exit_probability(quote, symbol_technicals, market_trend))
+        profit_target_pct = _profit_target_pct(probability_up, symbol_technicals, config, market_trend)
+        stop_exit_pct = _stop_exit_pct(probability_up, profit_target_pct)
+        signals = [
+            f"profit {unrealized_pnl_pct:.2f}%",
+            f"target {profit_target_pct:.2f}%",
+            f"prob {probability_up * 100:.1f}%",
+            f"window {config.scan_window_minutes}m",
+            f"market {market_trend.lower()}",
+        ]
+        if symbol_technicals:
+            signals.extend(
+                [
+                    f"rsi {symbol_technicals.get('rsi_14', 50):.1f}",
+                    f"volume {symbol_technicals.get('volume_ratio', 1):.2f}x",
+                ]
+            )
+        if unrealized_pnl_pct >= profit_target_pct:
+            candidates.append(
+                _exit_order(
+                    symbol=symbol,
+                    quantity=quantity,
+                    current_price=current_price,
+                    notional=market_value,
+                    action="AUTO_SELL_PROFIT_TAKE",
+                    confidence=_exit_confidence(unrealized_pnl_pct, profit_target_pct, probability_up),
+                    probability_up=probability_up,
+                    unrealized_pnl=unrealized_pnl,
+                    unrealized_pnl_pct=unrealized_pnl_pct,
+                    profit_target_pct=profit_target_pct,
+                    stop_exit_pct=stop_exit_pct,
+                    reason="Open profit cleared the dynamic 1-5 minute target; closing the paper position to lock gains.",
+                    signals=signals,
+                    config=config,
+                )
+            )
+            continue
+        if unrealized_pnl_pct <= -abs(stop_exit_pct):
+            candidates.append(
+                _exit_order(
+                    symbol=symbol,
+                    quantity=quantity,
+                    current_price=current_price,
+                    notional=market_value,
+                    action="AUTO_SELL_RISK_EXIT",
+                    confidence=92,
+                    probability_up=probability_up,
+                    unrealized_pnl=unrealized_pnl,
+                    unrealized_pnl_pct=unrealized_pnl_pct,
+                    profit_target_pct=profit_target_pct,
+                    stop_exit_pct=stop_exit_pct,
+                    reason="Loss crossed the dynamic short-window stop; closing the paper position before risk expands.",
+                    signals=signals,
+                    config=config,
+                )
+            )
+            continue
+        candidates.append(
+            {
+                "symbol": symbol,
+                "side": "sell",
+                "action": "HOLD_POSITION",
+                "confidence": _exit_confidence(unrealized_pnl_pct, profit_target_pct, probability_up),
+                "current_price": round(current_price, 4),
+                "quantity": round(quantity, 6),
+                "quantity_estimate": round(quantity, 6),
+                "notional": round(market_value, 2),
+                "probability_up": round(probability_up, 4),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+                "profit_target_pct": round(profit_target_pct, 2),
+                "stop_exit_pct": round(stop_exit_pct, 2),
+                "exit_window_minutes": config.scan_window_minutes,
+                "status": "blocked",
+                "reason": "Open position has not reached the dynamic profit target or risk-exit level.",
+                "signals": signals,
+                "source": "autopilot_exit",
+                "review_only": True,
+            }
+        )
+    return candidates
+
+
+def _exit_order(
+    *,
+    symbol: str,
+    quantity: float,
+    current_price: float,
+    notional: float,
+    action: str,
+    confidence: int,
+    probability_up: float,
+    unrealized_pnl: float,
+    unrealized_pnl_pct: float,
+    profit_target_pct: float,
+    stop_exit_pct: float,
+    reason: str,
+    signals: list[str],
+    config: AutopilotConfig,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "side": "sell",
+        "action": action,
+        "confidence": confidence,
+        "current_price": round(current_price, 4),
+        "quantity": round(quantity, 6),
+        "quantity_estimate": round(quantity, 6),
+        "notional": round(notional, 2),
+        "probability_up": round(probability_up, 4),
+        "edge_pct": round(max(0, unrealized_pnl_pct - profit_target_pct), 4),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+        "profit_target_pct": round(profit_target_pct, 2),
+        "stop_exit_pct": round(stop_exit_pct, 2),
+        "exit_window_minutes": config.scan_window_minutes,
+        "status": "planned",
+        "source": "autopilot_exit",
+        "sizing_method": "close_position_quantity",
+        "reason": reason,
+        "signals": signals,
+        "review_only": True,
+    }
+
+
+def _agentic_probability_lookup(agentic_scan: dict[str, Any]) -> dict[str, float]:
+    rows = [*agentic_scan.get("opportunities", []), *agentic_scan.get("blocked", [])]
+    lookup: dict[str, float] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        probability = _safe_float(row.get("probability_up"), 0)
+        if symbol and probability > 0:
+            lookup[symbol] = probability
+    return lookup
+
+
+def _exit_probability(quote: Any, technicals: dict[str, float], market_trend: str) -> float:
+    probability = 0.5
+    if quote:
+        probability += _clamp_float(quote.change_pct, -5, 5, 0) / 100
+    sma_5 = _safe_float(technicals.get("sma_5"))
+    sma_20 = _safe_float(technicals.get("sma_20"))
+    if sma_5 and sma_20:
+        probability += 0.04 if sma_5 >= sma_20 else -0.04
+    rsi = _safe_float(technicals.get("rsi_14"), 50)
+    if rsi >= 72:
+        probability -= 0.08
+    elif 52 <= rsi <= 66:
+        probability += 0.03
+    elif rsi <= 40:
+        probability -= 0.04
+    if _safe_float(technicals.get("volume_ratio"), 1) >= 1.5:
+        probability += 0.02
+    if market_trend == "UP":
+        probability += 0.02
+    elif market_trend == "DOWN":
+        probability -= 0.04
+    return _clamp_float(probability, 0.05, 0.95, 0.5)
+
+
+def _profit_target_pct(probability_up: float, technicals: dict[str, float], config: AutopilotConfig, market_trend: str) -> float:
+    window = int(_clamp_float(config.scan_window_minutes, 1, 5, 5))
+    target = 0.35 + ((window - 1) * 0.1)
+    if probability_up >= 0.68:
+        target += 0.45
+    elif probability_up >= 0.6:
+        target += 0.25
+    elif probability_up <= 0.52:
+        target -= 0.1
+    if market_trend == "DOWN":
+        target -= 0.1
+    rsi = _safe_float(technicals.get("rsi_14"), 50)
+    if rsi >= 72:
+        target -= 0.15
+    if _safe_float(technicals.get("volume_ratio"), 1) >= 2 and _safe_float(technicals.get("sma_5")) >= _safe_float(technicals.get("sma_20")):
+        target += 0.1
+    return round(_clamp_float(target, 0.25, 2.5, 0.65), 2)
+
+
+def _stop_exit_pct(probability_up: float, profit_target_pct: float) -> float:
+    stop = profit_target_pct * (1.1 if probability_up >= 0.6 else 0.85)
+    if probability_up < 0.5:
+        stop *= 0.8
+    return round(_clamp_float(stop, 0.3, 3, 0.75), 2)
+
+
+def _exit_confidence(unrealized_pnl_pct: float, profit_target_pct: float, probability_up: float) -> int:
+    capture_bonus = max(0, unrealized_pnl_pct - profit_target_pct) * 5
+    fade_bonus = max(0, 0.6 - probability_up) * 80
+    return int(_clamp_float(62 + capture_bonus + fade_bonus, 35, 95, 62))
 
 
 def _rank_candidate_orders(ideas: list[dict[str, Any]], growth: list[dict[str, Any]], agentic_scan: dict[str, Any], config: AutopilotConfig) -> list[dict[str, Any]]:
@@ -472,13 +848,15 @@ def _execution_message(status: str, submitted: list[dict[str, Any]], rejected: l
 def _decision_from_execution(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "symbol": item.get("symbol"),
-        "action": f"{item.get('side', 'ORDER')}_ALPACA",
+        "side": item.get("side"),
+        "action": item.get("action") or f"{item.get('side', 'ORDER')}_ALPACA",
         "confidence": None,
         "current_price": None,
         "quantity": item.get("quantity") or item.get("notional"),
         "status": item.get("status"),
         "broker_status": item.get("broker_status"),
         "broker_order_id": item.get("broker_order_id"),
+        "quantity": item.get("quantity"),
         "filled_quantity": item.get("filled_quantity"),
         "filled_average_price": item.get("filled_average_price"),
         "fill_status": item.get("fill_status"),

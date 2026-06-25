@@ -129,7 +129,7 @@ Default risk settings live in `config/autopilot.json`:
 - `max_trade_usd`: legacy fallback only; dynamic sizing does not use it as the trade decision
 - `max_open_positions`: cap for planned open positions
 - `min_confidence`: safety gate before an order is planned
-- `scan_window_minutes`: short-window scan horizon, clamped to 1-30 minutes
+- `scan_window_minutes`: short-window scan horizon, clamped to 1-5 minutes
 - `max_kelly_fraction`: safety ceiling; the bot still chooses the actual fraction from account and market data
 - `min_probability`: safety gate for calibrated probability before an order is planned
 - `paper_trade_downtrend`: lets paper mode test small down-market probes; live mode still blocks downtrend buys

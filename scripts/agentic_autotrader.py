@@ -156,7 +156,7 @@ def run_agentic_scan(
         "agents": {
             "scan": {
                 "status": "ready",
-                "goal": "Rank 1-30 minute buy candidates with short-window payoff potential.",
+                "goal": "Rank 1-5 minute buy candidates with short-window payoff potential.",
                 "symbols_scanned": len(scan_result.get("scans", [])),
             },
             "research": {
