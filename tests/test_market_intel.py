@@ -124,7 +124,29 @@ def test_market_intel_client_fetches_news_and_insiders_with_mock_transport(tmp_p
     assert snapshot["symbols"] == ["AAPL"]
     assert snapshot["quotes"]["AAPL"]["price"] == 120
     assert snapshot["news"][0]["title"] == "AAPL news"
+    assert snapshot["social_items"] == []
     assert snapshot["insider_filings"][0]["title"] == "4 - APPLE INC"
+
+
+def test_market_intel_client_fetches_configured_social_feeds(monkeypatch) -> None:
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(
+            200,
+            text="<rss><channel><item><title>MSFT bullish reddit breakout</title><link>https://reddit.example/msft</link></item></channel></rss>",
+        )
+
+    monkeypatch.setenv("BONEHAWK_REDDIT_RSS", "true")
+    client = MarketIntelClient(http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    items = client.fetch_social_items(["MSFT", "BTC-USD"])
+
+    assert len(items) == 1
+    assert items[0]["source"] == "reddit"
+    assert items[0]["symbol"] == "MSFT"
+    assert "reddit" in calls[0]
 
 
 def test_market_intel_client_stops_news_fetching_after_limit() -> None:

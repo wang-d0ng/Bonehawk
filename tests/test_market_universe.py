@@ -51,8 +51,8 @@ def test_market_universe_snapshot_reports_scan_cap_and_limitations(tmp_path: Pat
     assert payload["total_symbols"] == 3
     assert payload["scan_symbols"] == 2
     assert payload["sample_symbols"] == ["AAPL"]
-    assert payload["execution"]["robinhood_crypto_api"] == "stocks_not_supported"
-    assert payload["execution"]["robinhood_agentic_mcp"] == "required_for_live_stock_orders"
+    assert payload["execution"]["alpaca_trading_api"] == "stock_and_crypto_orders"
+    assert payload["execution"]["alpaca_paper_trading"] == "default_order_path"
 
 
 def test_fetch_nasdaqtrader_universe_parses_listed_and_otherlisted() -> None:

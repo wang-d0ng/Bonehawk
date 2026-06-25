@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 
 from scripts.market_intel import Position
-from scripts.quotes import YahooQuoteClient, compute_portfolio_performance, parse_history_chart, parse_stock_chart, parse_yahoo_chart
+from scripts.quotes import YahooQuoteClient, compute_alpaca_portfolio_performance, compute_portfolio_performance, parse_history_chart, parse_stock_chart, parse_yahoo_chart
 
 
 def test_parse_yahoo_chart_extracts_quote() -> None:
@@ -164,3 +164,30 @@ def test_compute_portfolio_performance_uses_live_quotes() -> None:
     assert performance["unrealized_pnl"] == 30
     assert performance["positions"][0]["unrealized_pnl"] == 40
     assert performance["positions"][1]["day_change_pct"] < 0
+
+
+def test_compute_alpaca_portfolio_performance_uses_broker_values() -> None:
+    account = {"portfolio_value": "1250.50", "cash": "900.25", "buying_power": "1800.00"}
+    positions = [
+        {
+            "symbol": "AAPL",
+            "qty": "2",
+            "avg_entry_price": "100",
+            "cost_basis": "200",
+            "current_price": "120",
+            "market_value": "240",
+            "unrealized_pl": "40",
+            "unrealized_plpc": "0.20",
+            "change_today": "0.0125",
+        }
+    ]
+
+    performance = compute_alpaca_portfolio_performance(account, positions)
+
+    assert performance["source"] == "alpaca"
+    assert performance["account_value"] == 1250.50
+    assert performance["cash"] == 900.25
+    assert performance["positions"][0]["cost_basis"] == 100
+    assert performance["positions"][0]["cost_value"] == 200
+    assert performance["positions"][0]["unrealized_pnl_pct"] == 20
+    assert performance["positions"][0]["day_change_pct"] == 1.25

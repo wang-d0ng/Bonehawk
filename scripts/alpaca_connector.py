@@ -136,6 +136,14 @@ class AlpacaTradingClient:
         response.raise_for_status()
         return response.json()
 
+    def get_positions(self) -> list[dict[str, Any]]:
+        if not self.config.is_configured:
+            raise AlpacaError("Alpaca API keys are missing.")
+        response = self.http_client.get(f"{self.config.trading_base_url}/v2/positions", headers=self.config.headers())
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
     def place_order(self, request: AlpacaOrderRequest, confirm: str = "") -> dict[str, Any]:
         validation = _validate_order_request(request)
         if validation:

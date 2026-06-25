@@ -1,1 +1,1 @@
-"""Wrapper scripts used by the Robinhood swing bot."""
+"""Command and broker helpers used by the Bonehawk Alpaca trading dashboard."""

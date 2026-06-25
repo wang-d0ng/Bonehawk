@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from scripts.agentic_autotrader import AgenticScanConfig, load_xgboost_model, run_agentic_scan, run_pending_loss_postmortems
 from scripts.alpaca_connector import LIVE_CONFIRM_PHRASE, AlpacaOrderRequest, AlpacaTradingClient
 from scripts.decision_log import record_decisions
 from scripts.growth_scanner import build_growth_candidates
@@ -26,6 +27,10 @@ class AutopilotConfig:
     max_open_positions: int = 3
     min_confidence: int = 55
     symbols_per_run: int = 40
+    scan_window_minutes: int = 15
+    max_kelly_fraction: float = 0.05
+    min_probability: float = 0.56
+    paper_trade_downtrend: bool = True
     strategies: tuple[str, ...] = ("trend_following", "momentum_breakout", "risk_exit")
 
     def snapshot(self) -> dict[str, Any]:
@@ -112,26 +117,45 @@ class AutopilotEngine:
             decisions["blocked"].append({"status": "broker_missing", "reason": "Alpaca client is not available."})
         else:
             for order in decisions["orders"]:
+                bracket_prices = _broker_bracket_prices(order, self.config)
                 request = AlpacaOrderRequest(
                     symbol=order["symbol"],
                     side=order["side"],
                     notional=order["notional"],
                     order_type="market",
                     time_in_force="day",
-                    stop_loss=order.get("stop_loss"),
-                    take_profit=order.get("take_profit"),
+                    stop_loss=bracket_prices.get("stop_loss"),
+                    take_profit=bracket_prices.get("take_profit"),
                 )
-                executed.append(self.alpaca_client.place_order(request, confirm=confirm))
+                response = self.alpaca_client.place_order(request, confirm=confirm)
+                executed.append(
+                    {
+                        **response,
+                        "symbol": response.get("symbol") or order.get("symbol"),
+                        "side": response.get("side") or order.get("side"),
+                        "notional": response.get("notional") or order.get("notional"),
+                    }
+                )
         decision_rows = [_decision_from_execution(item) for item in executed] if executed else decisions["orders"]
         record_decisions(self.root / "logs" / "decision_log.jsonl", "autopilot_order", decision_rows)
+        submitted = [item for item in executed if item.get("ok")]
+        rejected = [item for item in executed if not item.get("ok")]
+        status = _execution_status(executed)
         return {
-            "ok": all(item.get("ok") for item in executed) if executed else False,
-            "status": "executed" if executed else "no_orders_submitted",
+            "ok": bool(executed) and not rejected,
+            "status": status,
             "mode": self.config.mode,
             "config": self.config.snapshot(),
             **scan_payload,
             **decisions,
             "executed": executed,
+            "execution_summary": {
+                "submitted": len(submitted),
+                "rejected": len(rejected),
+                "planned": len(decisions["orders"]),
+                "blocked": len(decisions["blocked"]),
+                "message": _execution_message(status, submitted, rejected, decisions["orders"]),
+            },
             "notice": "Paper execution submitted to Alpaca when configured. Check tickets for order IDs and statuses.",
         }
 
@@ -147,11 +171,31 @@ class AutopilotEngine:
         market_trend = build_market_trend(technicals)
         ideas = build_trade_ideas(scan_result, quotes, active_watchlist.positions, active_watchlist.risk, technicals=technicals, market_trend=market_trend, max_ideas=12)
         growth = build_growth_candidates(scan_result, quotes, technicals, market_trend=market_trend, max_candidates=12)
+        bankroll_usd = self._bankroll_usd()
+        agentic_scan = run_agentic_scan(
+            scan_result=scan_result,
+            quotes=quotes,
+            technicals=technicals,
+            snapshot={**snapshot, "market_trend": market_trend},
+            config=AgenticScanConfig(
+                bankroll_usd=bankroll_usd,
+                max_trade_usd=self.config.max_trade_usd,
+                max_kelly_fraction=self.config.max_kelly_fraction,
+                window_minutes=self.config.scan_window_minutes,
+                min_probability=self.config.min_probability,
+                allow_downtrend=self.config.mode == "paper" and self.config.paper_trade_downtrend,
+            ),
+            xgboost_model=load_xgboost_model(self.root / "models" / "xgboost_short_window.json"),
+        )
+        postmortems = run_pending_loss_postmortems(self.root)
+        if postmortems:
+            agentic_scan = {**agentic_scan, "postmortems": postmortems}
         return {
             "summary": scan_result["summary"],
             "market_trend": market_trend,
             "ideas": ideas,
             "growth_candidates": growth,
+            "agentic_scan": agentic_scan,
         }
 
     def _build_orders(self, scan_payload: dict[str, Any], watchlist: Watchlist) -> dict[str, list[dict[str, Any]]]:
@@ -160,7 +204,12 @@ class AutopilotEngine:
         blocked: list[dict[str, Any]] = []
         open_slots = max(0, self.config.max_open_positions - len(held_symbols))
 
-        ranked = _rank_candidate_orders(scan_payload.get("ideas", []), scan_payload.get("growth_candidates", []), self.config)
+        ranked = _rank_candidate_orders(
+            scan_payload.get("ideas", []),
+            scan_payload.get("growth_candidates", []),
+            scan_payload.get("agentic_scan", {}),
+            self.config,
+        )
         for candidate in ranked:
             if len(orders) >= open_slots:
                 blocked.append({**candidate, "status": "blocked", "reason": "Max open position limit reached."})
@@ -174,13 +223,27 @@ class AutopilotEngine:
             order = {
                 **candidate,
                 "side": "buy",
-                "notional": round(self.config.max_trade_usd, 2),
+                "notional": round(_order_notional(candidate, self.config), 2),
                 "status": "planned",
                 "source": "autopilot",
                 "review_only": True,
             }
             orders.append(order)
         return {"orders": orders, "blocked": blocked}
+
+    def _bankroll_usd(self) -> float:
+        fallback = max(self.config.max_trade_usd, self.config.max_trade_usd * max(1, self.config.max_open_positions))
+        if not self.alpaca_client or not hasattr(self.alpaca_client, "get_account"):
+            return fallback
+        try:
+            account = self.alpaca_client.get_account()
+        except Exception:
+            return fallback
+        cash = _safe_float(account.get("cash"))
+        buying_power = _safe_float(account.get("buying_power"))
+        portfolio_value = _safe_float(account.get("portfolio_value"))
+        candidates = [value for value in (cash, buying_power, portfolio_value) if value > 0]
+        return min(candidates) if candidates else fallback
 
 
 def load_autopilot_config(path: Path) -> AutopilotConfig:
@@ -205,6 +268,10 @@ def load_autopilot_config(path: Path) -> AutopilotConfig:
         max_open_positions=int(_clamp_float(raw.get("max_open_positions"), 0, 25, 3)),
         min_confidence=int(_clamp_float(raw.get("min_confidence"), 35, 95, 55)),
         symbols_per_run=int(_clamp_float(raw.get("symbols_per_run"), 1, 250, 40)),
+        scan_window_minutes=int(_clamp_float(raw.get("scan_window_minutes"), 1, 30, 15)),
+        max_kelly_fraction=_clamp_float(raw.get("max_kelly_fraction"), 0, 0.25, 0.05),
+        min_probability=_clamp_float(raw.get("min_probability"), 0.5, 0.95, 0.56),
+        paper_trade_downtrend=bool(raw.get("paper_trade_downtrend", True)),
         strategies=tuple(str(item) for item in strategies if str(item).strip()),
     )
 
@@ -238,6 +305,14 @@ def update_autopilot_config(config: AutopilotConfig, setting: Any, value: Any, c
         return replace(config, max_open_positions=int(_clamp_float(value, 0, 25, config.max_open_positions))), {"ok": True, "status": "updated", "message": "Max open positions updated."}
     if key == "min_confidence":
         return replace(config, min_confidence=int(_clamp_float(value, 35, 95, config.min_confidence))), {"ok": True, "status": "updated", "message": "Minimum confidence updated."}
+    if key == "scan_window_minutes":
+        return replace(config, scan_window_minutes=int(_clamp_float(value, 1, 30, config.scan_window_minutes))), {"ok": True, "status": "updated", "message": "Short-window scan horizon updated."}
+    if key == "max_kelly_fraction":
+        return replace(config, max_kelly_fraction=_clamp_float(value, 0, 0.25, config.max_kelly_fraction)), {"ok": True, "status": "updated", "message": "Kelly cap updated."}
+    if key == "min_probability":
+        return replace(config, min_probability=_clamp_float(value, 0.5, 0.95, config.min_probability)), {"ok": True, "status": "updated", "message": "Prediction threshold updated."}
+    if key == "paper_trade_downtrend":
+        return replace(config, paper_trade_downtrend=_truthy(value)), {"ok": True, "status": "updated", "message": "Paper downtrend exploration updated."}
     return config, {"ok": False, "status": "invalid_setting", "message": "Unknown autopilot setting."}
 
 
@@ -249,23 +324,46 @@ def _autopilot_symbols(root: Path, watchlist: Watchlist, limit: int) -> list[str
     return combine_symbols(watchlist.symbols, universe, limit=max(1, limit))
 
 
-def _rank_candidate_orders(ideas: list[dict[str, Any]], growth: list[dict[str, Any]], config: AutopilotConfig) -> list[dict[str, Any]]:
+def _rank_candidate_orders(ideas: list[dict[str, Any]], growth: list[dict[str, Any]], agentic_scan: dict[str, Any], config: AutopilotConfig) -> list[dict[str, Any]]:
     by_symbol: dict[str, dict[str, Any]] = {}
+    for opportunity in agentic_scan.get("opportunities", []):
+        symbol = str(opportunity.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        by_symbol[symbol] = {
+            "symbol": symbol,
+            "action": "AUTO_BUY_CANDIDATE",
+            "confidence": int(opportunity.get("confidence") or 0),
+            "current_price": opportunity.get("current_price"),
+            "stop_loss": opportunity.get("stop_loss"),
+            "take_profit": opportunity.get("take_profit"),
+            "suggested_notional": opportunity.get("suggested_notional"),
+            "probability_up": opportunity.get("probability_up"),
+            "edge_pct": opportunity.get("edge_pct"),
+            "kelly_fraction": opportunity.get("kelly_fraction"),
+            "reason": opportunity.get("reason"),
+            "signals": list(opportunity.get("signals") or []),
+        }
     for idea in ideas:
         if idea.get("action") != "BUY_REVIEW":
             continue
         symbol = str(idea.get("symbol") or "").upper()
         if not symbol:
             continue
+        existing = by_symbol.get(symbol)
+        if existing and int(existing.get("confidence") or 0) >= int(idea.get("confidence") or 0):
+            existing["signals"] = list(dict.fromkeys([*(existing.get("signals") or []), *(idea.get("signals") or [])]))
+            continue
         by_symbol[symbol] = {
+            **(existing or {}),
             "symbol": symbol,
             "action": "BUY_REVIEW",
             "confidence": int(idea.get("confidence") or 0),
             "current_price": idea.get("current_price"),
-            "stop_loss": idea.get("stop_loss"),
-            "take_profit": idea.get("take_profit"),
+            "stop_loss": idea.get("stop_loss") or (existing or {}).get("stop_loss"),
+            "take_profit": idea.get("take_profit") or (existing or {}).get("take_profit"),
             "reason": idea.get("reason"),
-            "signals": list(idea.get("signals") or []),
+            "signals": list(dict.fromkeys([*((existing or {}).get("signals") or []), *(idea.get("signals") or [])])),
         }
     for candidate in growth:
         if candidate.get("action") not in {"WATCH_FAST_GROWTH", "WATCH"}:
@@ -286,6 +384,40 @@ def _rank_candidate_orders(ideas: list[dict[str, Any]], growth: list[dict[str, A
         }
     ranked = sorted(by_symbol.values(), key=lambda item: int(item.get("confidence") or 0), reverse=True)
     return ranked[: max(1, config.max_open_positions + 4)]
+
+
+def _order_notional(candidate: dict[str, Any], config: AutopilotConfig) -> float:
+    suggested = _safe_float(candidate.get("suggested_notional"), config.max_trade_usd)
+    return max(1, min(config.max_trade_usd, suggested))
+
+
+def _broker_bracket_prices(order: dict[str, Any], config: AutopilotConfig) -> dict[str, float | None]:
+    if config.mode == "paper":
+        return {"stop_loss": None, "take_profit": None}
+    return {"stop_loss": order.get("stop_loss"), "take_profit": order.get("take_profit")}
+
+
+def _execution_status(executed: list[dict[str, Any]]) -> str:
+    if not executed:
+        return "no_orders_submitted"
+    success_count = sum(1 for item in executed if item.get("ok"))
+    if success_count == len(executed):
+        return "executed"
+    if success_count:
+        return "partially_executed"
+    return "orders_rejected"
+
+
+def _execution_message(status: str, submitted: list[dict[str, Any]], rejected: list[dict[str, Any]], orders: list[dict[str, Any]]) -> str:
+    if submitted and not rejected:
+        return f"Submitted {len(submitted)} Alpaca paper order(s)."
+    if submitted and rejected:
+        return f"Submitted {len(submitted)} order(s); {len(rejected)} rejected."
+    if rejected:
+        return f"Alpaca rejected {len(rejected)} planned order(s)."
+    if orders:
+        return "Orders were planned but not sent."
+    return "No paper orders met the agent rules."
 
 
 def _decision_from_execution(item: dict[str, Any]) -> dict[str, Any]:
@@ -318,3 +450,12 @@ def _clamp_float(value: Any, minimum: float, maximum: float, default: float) -> 
     except (TypeError, ValueError):
         number = default
     return max(minimum, min(maximum, number))
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default

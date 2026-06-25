@@ -196,6 +196,65 @@ def compute_portfolio_performance(positions: list[Any], quotes: dict[str, Quote]
     }
 
 
+def compute_alpaca_portfolio_performance(account: dict[str, Any], positions: list[dict[str, Any]]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    total_cost = 0.0
+    total_value = 0.0
+    unrealized = 0.0
+    for position in positions:
+        symbol = str(position.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        quantity = _safe_float(position.get("qty"))
+        average_entry = _safe_float(position.get("avg_entry_price"))
+        cost_value = _safe_float(position.get("cost_basis"), quantity * average_entry)
+        current_price = _safe_float(position.get("current_price"), average_entry)
+        market_value = _safe_float(position.get("market_value"), quantity * current_price)
+        pnl = _safe_float(position.get("unrealized_pl"), market_value - cost_value)
+        pnl_pct = _safe_float(position.get("unrealized_plpc")) * 100
+        day_change_pct = _safe_float(position.get("change_today")) * 100
+        total_cost += cost_value
+        total_value += market_value
+        unrealized += pnl
+        rows.append(
+            {
+                "symbol": symbol,
+                "quantity": quantity,
+                "cost_basis": round(average_entry, 4),
+                "current_price": round(current_price, 4),
+                "market_value": round(market_value, 2),
+                "cost_value": round(cost_value, 2),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+                "day_change_pct": round(day_change_pct, 2),
+                "asset_class": position.get("asset_class"),
+                "side": position.get("side"),
+                "source": "alpaca",
+            }
+        )
+    account_value = _safe_float(account.get("portfolio_value"), total_value)
+    return {
+        "source": "alpaca",
+        "positions": rows,
+        "total_cost": round(total_cost, 2),
+        "total_value": round(total_value, 2),
+        "account_value": round(account_value, 2),
+        "cash": round(_safe_float(account.get("cash")), 2),
+        "buying_power": round(_safe_float(account.get("buying_power")), 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "unrealized_pnl_pct": round((unrealized / total_cost) * 100, 2) if total_cost else 0,
+    }
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _last_close(result: dict[str, Any]) -> float:
     closes = result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
     values = [value for value in closes if value is not None]

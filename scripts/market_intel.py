@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,7 @@ from scripts.quotes import Quote, YahooQuoteClient, compute_portfolio_performanc
 
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "NVDA", "TSLA", "BTC-USD"]
 SEC_USER_AGENT = "market-intel-bot contact@example.com"
+SOCIAL_USER_AGENT = "BonehawkMarketResearch/0.1"
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,7 @@ class MarketIntelClient:
 
     def snapshot(self, watchlist: Watchlist) -> dict[str, Any]:
         news = self.fetch_news(watchlist.symbols)
+        social_items = self.fetch_social_items(watchlist.symbols)
         filings = self.fetch_recent_form4_filings()
         quote_symbols = [position.symbol for position in watchlist.positions]
         quotes = self.quote_client.get_quotes(quote_symbols)
@@ -62,12 +66,13 @@ class MarketIntelClient:
             "quotes": {symbol: asdict(quote) | {"change_pct": round(quote.change_pct, 2)} for symbol, quote in quotes.items()},
             "portfolio_performance": performance,
             "news": [asdict(item) for item in news],
+            "social_items": social_items,
             "insider_filings": filings,
             "risk_flags": compute_risk_flags(RiskInput(watchlist.positions, quotes, watchlist.risk)),
             "capabilities": {
-                "crypto_trading": "Robinhood Crypto API configured separately in .env",
-                "stock_trading": "Requires Robinhood Agentic Trading/MCP connector; not available through crypto API key",
-                "live_orders": "Disabled in this dashboard; use paper cycle until broker adapter is connected",
+                "broker": "Alpaca paper trading by default",
+                "stock_trading": "Manual tickets and autopilot route through Alpaca",
+                "live_orders": "Require Alpaca live permission and explicit confirmation",
             },
         }
 
@@ -86,6 +91,43 @@ class MarketIntelClient:
             if len(items) >= 80:
                 break
         return items[:80]
+
+    def fetch_social_items(self, symbols: list[str]) -> list[dict[str, str]]:
+        templates = _social_feed_templates()
+        if not templates:
+            return []
+        jobs = []
+        for symbol in [item for item in symbols if not item.endswith("-USD")][:20]:
+            for source, template in templates:
+                jobs.append((symbol, source, template.format(symbol=quote(symbol), raw_symbol=symbol)))
+        if not jobs:
+            return []
+        items: list[dict[str, str]] = []
+        with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
+            futures = {
+                pool.submit(self._fetch_social_feed, symbol, source, url): (symbol, source)
+                for symbol, source, url in jobs
+            }
+            for future in as_completed(futures):
+                try:
+                    items.extend(future.result())
+                except (httpx.HTTPError, ET.ParseError, ValueError):
+                    continue
+        return items[:120]
+
+    def _fetch_social_feed(self, symbol: str, source: str, url: str) -> list[dict[str, str]]:
+        response = self.http_client.get(url, headers={"User-Agent": SOCIAL_USER_AGENT})
+        response.raise_for_status()
+        return [
+            {
+                "source": source,
+                "symbol": item.symbol,
+                "text": item.title,
+                "url": item.url,
+                "published": item.published,
+            }
+            for item in parse_yahoo_rss(symbol, response.text)[:8]
+        ]
 
     def fetch_recent_form4_filings(self) -> list[dict[str, str]]:
         try:
@@ -177,3 +219,27 @@ def _child_text(element: ET.Element, name: str) -> str:
     if child is None or child.text is None:
         return ""
     return child.text.strip()
+
+
+def _social_feed_templates() -> list[tuple[str, str]]:
+    templates: list[tuple[str, str]] = []
+    if _truthy(os.getenv("BONEHAWK_REDDIT_RSS", "")):
+        templates.append(("reddit", "https://www.reddit.com/search.rss?q={symbol}%20stock&sort=new"))
+    x_template = os.getenv("BONEHAWK_X_RSS_TEMPLATE", "").strip()
+    if x_template:
+        templates.append(("x", x_template))
+    extra = os.getenv("BONEHAWK_SOCIAL_RSS_TEMPLATES", "").strip()
+    if extra:
+        try:
+            parsed = json.loads(extra)
+        except json.JSONDecodeError:
+            parsed = []
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict) and item.get("source") and item.get("url"):
+                    templates.append((str(item["source"]).lower(), str(item["url"])))
+    return templates
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}

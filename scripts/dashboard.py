@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -14,34 +15,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.alpaca_connector import AlpacaConfig, AlpacaTradingClient
+from scripts.alpaca_connector import AlpacaConfig, AlpacaOrderRequest, AlpacaTradingClient
 from scripts.autopilot import AutopilotConfig, AutopilotEngine, load_autopilot_config, save_autopilot_config, update_autopilot_config
 from scripts.command_center import command_catalog, run_command
 from scripts.decision_log import latest_decisions, record_decisions
 from scripts.growth_scanner import build_growth_candidates, build_growth_candidates_message
-from scripts.market_intel import MarketIntelClient, load_watchlist
+from scripts.market_intel import MarketIntelClient, Position, Watchlist, load_watchlist
 from scripts.market_scanner import build_alert_message, scan_market
 from scripts.market_universe import combine_symbols, load_market_universe, market_universe_snapshot
 from scripts.portfolio_sync import portfolio_sync_snapshot
-from scripts.quotes import CHART_RANGES, YahooQuoteClient
-from scripts.robinhood import RobinhoodConfig, RobinhoodCryptoClient
-from scripts.robinhood_agentic import AgenticTradingConfig, agentic_trading_snapshot
-from scripts.robinhood_integration import robinhood_snapshot
-from scripts.robinhood_stock_connector import RobinhoodStockOrderConnector, StockConnectorConfig, StockOrderRequest
+from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfolio_performance
 from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
-
-STOCK_SETTING_SPECS = {
-    "BONEHAWK_STOCK_TRADING_MODE": {
-        "values": {"review", "paper", "live"},
-        "confirm_value": "live",
-        "confirm_phrase": "LIVE_STOCK_MODE",
-    },
-    "BONEHAWK_STOCK_ORDER_CONNECTOR": {
-        "values": {"disabled", "codex_mcp"},
-        "confirm_value": "codex_mcp",
-        "confirm_phrase": "ENABLE_STOCK_CONNECTOR",
-    },
-}
 
 UI_THEME_VALUES = {"arcade", "classic"}
 SETUP_SECRET_KEYS = {
@@ -49,10 +33,14 @@ SETUP_SECRET_KEYS = {
     "ALPACA_SECRET_KEY",
     "TELEGRAM_BOT_TOKEN",
     "ALLOWED_CHAT_IDS",
-    "ROBINHOOD_API_KEY",
-    "ROBINHOOD_PRIVATE_KEY_BASE64",
-    "ROBINHOOD_ACCOUNT_NUMBER",
 }
+
+
+@dataclass(frozen=True)
+class StockOrderTicket:
+    symbol: str
+    side: str
+    quantity: float
 
 
 class DashboardService:
@@ -62,14 +50,12 @@ class DashboardService:
         intel_client: MarketIntelClient | None = None,
         quote_client: YahooQuoteClient | None = None,
         codex_config_path: Path | None = None,
-        stock_connector: Any | None = None,
         alpaca_client: Any | None = None,
     ) -> None:
         self.root = root
         self.intel_client = intel_client or MarketIntelClient()
         self.quote_client = quote_client or getattr(self.intel_client, "quote_client", YahooQuoteClient())
         self.codex_config_path = codex_config_path
-        self.stock_connector = stock_connector
         self.alpaca_client = alpaca_client
 
     def status(self) -> dict[str, Any]:
@@ -80,9 +66,9 @@ class DashboardService:
             "env": env,
             "guardrails": [
                 "Autopilot runs paper-first through Alpaca.",
-                "Stock live trading requires Alpaca live permission or Robinhood Agentic Trading/MCP connector.",
-                "Crypto live trading is blocked unless TRADING_MODE=live.",
-                "Dashboard live stock orders require explicit confirmation gates.",
+                "Manual stock orders use Alpaca paper mode unless Alpaca live mode is explicitly enabled.",
+                "Live Alpaca orders require ALPACA_ALLOW_LIVE=true and the LIVE_ALPACA_ORDER confirmation phrase.",
+                "Dashboard order tickets always record the broker response and order id when Alpaca returns one.",
             ],
         }
 
@@ -104,33 +90,6 @@ class DashboardService:
             "status": "updated",
             "mode": normalized,
             "message": f"Trading mode switched to {normalized}.",
-        }
-
-    def set_stock_setting(self, setting: Any, value: Any, confirm: str = "") -> dict[str, Any]:
-        key = str(setting or "").strip()
-        spec = STOCK_SETTING_SPECS.get(key)
-        if not spec:
-            return {"ok": False, "status": "invalid_setting", "message": "Unknown stock setting."}
-        normalized_value = str(value or "").strip().lower()
-        if normalized_value not in spec["values"]:
-            return {"ok": False, "status": "invalid_value", "setting": key, "message": "Choose a valid setting value."}
-        current = _read_env_presence(self.root / ".env").get(key, "missing")
-        if normalized_value == spec["confirm_value"] and confirm != spec["confirm_phrase"]:
-            return {
-                "ok": False,
-                "status": "confirmation_required",
-                "setting": key,
-                "value": current,
-                "confirm_phrase": spec["confirm_phrase"],
-                "message": f"{key} requires confirmation.",
-            }
-        _write_env_value(self.root / ".env", key, normalized_value)
-        return {
-            "ok": True,
-            "status": "updated",
-            "setting": key,
-            "value": normalized_value,
-            "message": f"{key} set to {normalized_value}.",
         }
 
     def set_ui_theme(self, theme: Any) -> dict[str, Any]:
@@ -165,10 +124,6 @@ class DashboardService:
                     "status": "set" if env.get("TELEGRAM_BOT_TOKEN") == "set" and env.get("ALLOWED_CHAT_IDS") == "set" else "optional",
                     "message": "Telegram alerts are optional.",
                 },
-                "robinhood": {
-                    "status": "set" if env.get("ROBINHOOD_API_KEY") == "set" and env.get("ROBINHOOD_PRIVATE_KEY_BASE64") == "set" else "optional",
-                    "message": "Robinhood remains optional for crypto and MCP stock tickets.",
-                },
             },
             "env": {key: env.get(key, "missing") for key in sorted(env) if key in SETUP_SECRET_KEYS or key.startswith("ALPACA_") or key == "BONEHAWK_SETUP_COMPLETE"},
         }
@@ -183,9 +138,6 @@ class DashboardService:
             "ALPACA_SECRET_KEY": payload.get("alpaca_secret_key"),
             "TELEGRAM_BOT_TOKEN": payload.get("telegram_bot_token"),
             "ALLOWED_CHAT_IDS": payload.get("allowed_chat_ids"),
-            "ROBINHOOD_API_KEY": payload.get("robinhood_api_key"),
-            "ROBINHOOD_PRIVATE_KEY_BASE64": payload.get("robinhood_private_key_base64"),
-            "ROBINHOOD_ACCOUNT_NUMBER": payload.get("robinhood_account_number"),
         }
         for key, value in secret_updates.items():
             normalized = str(value or "").strip()
@@ -194,8 +146,6 @@ class DashboardService:
         _write_env_value(env_path, "ALPACA_PAPER", "true" if _setup_bool(payload.get("alpaca_paper"), default=True) else "false")
         _write_env_value(env_path, "ALPACA_ALLOW_LIVE", "false")
         _write_env_value(env_path, "TRADING_MODE", "paper")
-        _write_env_value(env_path, "BONEHAWK_STOCK_TRADING_MODE", "review")
-        _write_env_value(env_path, "BONEHAWK_STOCK_ORDER_CONNECTOR", "disabled")
         _write_env_value(env_path, "BONEHAWK_SETUP_COMPLETE", "true")
 
         autopilot_path = self.root / "config" / "autopilot.json"
@@ -222,42 +172,30 @@ class DashboardService:
 
     def market_intel(self) -> dict[str, Any]:
         watchlist = self.watchlist()
-        return self.intel_client.snapshot(watchlist)
+        portfolio = self._alpaca_portfolio()
+        snapshot_watchlist = _watchlist_with_portfolio_positions(watchlist, portfolio.get("watchlist_positions") or [])
+        snapshot = self.intel_client.snapshot(snapshot_watchlist)
+        snapshot["portfolio_source"] = {
+            "status": portfolio.get("status", "watchlist"),
+            "message": portfolio.get("message", "Using configured watchlist positions."),
+        }
+        if portfolio.get("performance"):
+            snapshot["positions"] = portfolio.get("positions", [])
+            snapshot["portfolio_performance"] = portfolio["performance"]
+            snapshot["portfolio_account"] = portfolio.get("account", {})
+        return snapshot
 
     def portfolio_sync(self) -> dict[str, Any]:
-        crypto_client = None
-        try:
-            crypto_client = RobinhoodCryptoClient(RobinhoodConfig.from_env(self.root / ".env"))
-        except Exception:
-            crypto_client = None
-        return portfolio_sync_snapshot(self.watchlist(), crypto_client=crypto_client)
-
-    def robinhood(self) -> dict[str, Any]:
-        config = RobinhoodConfig.from_env(self.root / ".env")
-        client = None
-        try:
-            client = RobinhoodCryptoClient(config)
-        except Exception:
-            client = None
-        return robinhood_snapshot(config, client)
-
-    def agentic_trading(self) -> dict[str, Any]:
-        config = AgenticTradingConfig.from_env(codex_config_path=self.codex_config_path)
-        payload = agentic_trading_snapshot(config)
-        payload["stock_order_connector"] = self._stock_connector().snapshot()
-        return payload
-
-    def stock_connector_diagnostics(self) -> dict[str, Any]:
-        return self._stock_connector().diagnose()
+        return portfolio_sync_snapshot(self.watchlist(), alpaca_portfolio=self._alpaca_portfolio())
 
     def autopilot(self) -> dict[str, Any]:
-        return self._autopilot_engine().snapshot()
+        return self._with_autopilot_channels(self._autopilot_engine().snapshot())
 
     def autopilot_scan(self) -> dict[str, Any]:
-        return self._autopilot_engine().scan(self.scanner_watchlist())
+        return self._with_autopilot_channels(self._autopilot_engine().scan(self._autopilot_watchlist()))
 
     def autopilot_execute(self, confirm: str = "") -> dict[str, Any]:
-        return self._autopilot_engine().execute(self.scanner_watchlist(), confirm=confirm)
+        return self._with_autopilot_channels(self._autopilot_engine().execute(self._autopilot_watchlist(), confirm=confirm))
 
     def set_autopilot_setting(self, setting: Any, value: Any, confirm: str = "") -> dict[str, Any]:
         path = self.root / "config" / "autopilot.json"
@@ -390,10 +328,17 @@ class DashboardService:
         if isinstance(request_or_error, dict):
             return request_or_error
         request = request_or_error
-        result = self._stock_connector().place_order(request, confirm=confirm)
+        order = AlpacaOrderRequest(
+            symbol=request.symbol,
+            side=request.side.lower(),
+            quantity=request.quantity,
+            order_type="market",
+            time_in_force="day",
+        )
+        result = self._alpaca_client().place_order(order, confirm=confirm)
         record_decisions(
             self.root / "logs" / "decision_log.jsonl",
-            "live_stock_order" if result.get("ok") else "stock_order_attempt",
+            "alpaca_stock_order" if result.get("ok") else "stock_order_attempt",
             [
                 {
                     "symbol": result.get("symbol") or request.symbol,
@@ -417,15 +362,58 @@ class DashboardService:
         tickets = [ticket for ticket in tickets if ticket is not None]
         return {"tickets": tickets, "summary": {"count": len(tickets)}}
 
-    def _stock_connector(self) -> Any:
-        if self.stock_connector is not None:
-            return self.stock_connector
-        return RobinhoodStockOrderConnector(StockConnectorConfig.from_project_env(self.root / ".env", codex_config_path=self.codex_config_path))
-
     def _alpaca_client(self) -> Any:
         if self.alpaca_client is not None:
             return self.alpaca_client
         return AlpacaTradingClient(AlpacaConfig.from_env(self.root / ".env"))
+
+    def _alpaca_portfolio(self) -> dict[str, Any]:
+        try:
+            client = self._alpaca_client()
+            configured = bool(getattr(getattr(client, "config", None), "is_configured", True))
+        except Exception:
+            return {"status": "watchlist", "message": "Using configured watchlist positions until Alpaca portfolio data is available."}
+        try:
+            account = client.get_account()
+        except Exception:
+            if configured:
+                return {
+                    "status": "error",
+                    "message": "Alpaca account data is unavailable. Check that the key pair matches the selected paper/live mode.",
+                    "account": {},
+                    "positions": [],
+                    "watchlist_positions": [],
+                    "performance": _empty_portfolio_performance("alpaca_error"),
+                }
+            return {"status": "watchlist", "message": "Using configured watchlist positions until Alpaca portfolio data is available."}
+        try:
+            raw_positions = client.get_positions()
+        except Exception:
+            raw_positions = []
+            status = "partial"
+            message = "Loaded Alpaca account value, but open positions are unavailable."
+        else:
+            status = "connected"
+            message = f"Loaded {len(raw_positions)} Alpaca position(s)."
+        performance = compute_alpaca_portfolio_performance(account, raw_positions)
+        positions = performance.get("positions", [])
+        return {
+            "status": status,
+            "message": message,
+            "account": _public_alpaca_account(account),
+            "positions": positions,
+            "raw_positions": raw_positions,
+            "watchlist_positions": [
+                Position(
+                    symbol=str(position.get("symbol") or "").upper(),
+                    quantity=float(position.get("quantity") or 0),
+                    cost_basis=float(position.get("cost_basis") or 0),
+                )
+                for position in positions
+                if position.get("symbol")
+            ],
+            "performance": performance,
+        }
 
     def _autopilot_engine(self) -> AutopilotEngine:
         return AutopilotEngine(
@@ -435,6 +423,27 @@ class DashboardService:
             quote_client=self.quote_client,
             alpaca_client=self._alpaca_client(),
         )
+
+    def _with_autopilot_channels(self, payload: dict[str, Any]) -> dict[str, Any]:
+        env = _read_env_presence(self.root / ".env")
+        token_ready = env.get("TELEGRAM_BOT_TOKEN") == "set"
+        chats_ready = env.get("ALLOWED_CHAT_IDS") == "set"
+        telegram_status = "ready" if token_ready and chats_ready else "needs_setup"
+        return {
+            **payload,
+            "data_sources": {
+                "news": "RSS/news plus optional Reddit and X feed templates.",
+                "market": "Alpaca account/orders with Yahoo market quotes and charts.",
+                "execution": "Alpaca paper orders by default.",
+            },
+            "telegram": {
+                "status": telegram_status,
+                "bot_token": "set" if token_ready else env.get("TELEGRAM_BOT_TOKEN", "missing"),
+                "chat_ids": "set" if chats_ready else env.get("ALLOWED_CHAT_IDS", "missing"),
+                "channel": "Telegram",
+                "message": "Telegram alerts are ready." if telegram_status == "ready" else "Add TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_IDS in setup to enable Telegram alerts.",
+            },
+        }
 
     def decision_log(self) -> dict[str, Any]:
         rows = latest_decisions(self.root / "logs" / "decision_log.jsonl")
@@ -492,6 +501,15 @@ class DashboardService:
         symbols = combine_symbols(watchlist.symbols, universe, limit=len(watchlist.symbols) + len(universe))
         return type(watchlist)(symbols=symbols, positions=watchlist.positions, risk=watchlist.risk, aliases=watchlist.aliases)
 
+    def _autopilot_watchlist(self):
+        watchlist = self.scanner_watchlist()
+        portfolio = self._alpaca_portfolio()
+        if portfolio.get("status") in {"connected", "partial"}:
+            return _watchlist_with_portfolio_positions(watchlist, portfolio.get("watchlist_positions") or [])
+        if portfolio.get("status") == "error":
+            return _watchlist_with_portfolio_positions(watchlist, [])
+        return watchlist
+
     def paper_cycle(self, notify: bool = False) -> dict[str, Any]:
         args = [str(self.root / ".venv" / "bin" / "python"), str(self.root / "scripts" / "paper_cycle.py")]
         if notify:
@@ -531,14 +549,8 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 self._send(*json_response(service.market_intel()))
             elif path == "/api/portfolio-sync":
                 self._send(*json_response(service.portfolio_sync()))
-            elif path == "/api/robinhood":
-                self._send(*json_response(service.robinhood()))
-            elif path == "/api/agentic-trading":
-                self._send(*json_response(service.agentic_trading()))
             elif path == "/api/autopilot":
                 self._send(*json_response(service.autopilot()))
-            elif path == "/api/stock-connector-diagnostics":
-                self._send(*json_response(service.stock_connector_diagnostics()))
             elif path == "/api/stocks":
                 self._send(*json_response(service.stocks()))
             elif path == "/api/scanner":
@@ -598,15 +610,6 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 result = service.set_trading_mode(payload.get("mode"), confirm=str(payload.get("confirm", "")))
                 status = 200 if result.get("ok") else 409 if result.get("status") == "confirmation_required" else 400
                 self._send(*json_response(result, status=status))
-            elif self.path == "/api/stock-settings":
-                try:
-                    payload = self._read_json_body()
-                except ValueError as error:
-                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
-                    return
-                result = service.set_stock_setting(payload.get("setting"), payload.get("value"), confirm=str(payload.get("confirm", "")))
-                status = 200 if result.get("ok") else 409 if result.get("status") == "confirmation_required" else 400
-                self._send(*json_response(result, status=status))
             elif self.path == "/api/autopilot-settings":
                 try:
                     payload = self._read_json_body()
@@ -654,7 +657,7 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                     self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
                     return
                 result = service.stock_order(payload.get("symbol"), payload.get("side"), payload.get("quantity"), confirm=str(payload.get("confirm", "")))
-                status = 200 if result.get("ok") else 409 if result.get("status") in {"confirmation_required", "connector_disabled", "mcp_not_configured", "app_not_live", "stock_mode_not_live"} else 400
+                status = 200 if result.get("ok") else 409 if result.get("status") in {"confirmation_required", "live_not_allowed", "not_configured"} else 400
                 self._send(*json_response(result, status=status))
             else:
                 self._send(*json_response({"error": "not found"}, status=404))
@@ -688,14 +691,9 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
 
 def _read_env_presence(path: Path) -> dict[str, str]:
     keys = {
-        "ROBINHOOD_API_KEY": "missing",
-        "ROBINHOOD_PRIVATE_KEY_BASE64": "missing",
-        "ROBINHOOD_ACCOUNT_NUMBER": "missing",
         "TELEGRAM_BOT_TOKEN": "missing",
         "ALLOWED_CHAT_IDS": "missing",
         "TRADING_MODE": "missing",
-        "BONEHAWK_STOCK_TRADING_MODE": "missing",
-        "BONEHAWK_STOCK_ORDER_CONNECTOR": "missing",
         "BONEHAWK_UI_THEME": "arcade",
         "ALPACA_API_KEY": "missing",
         "ALPACA_SECRET_KEY": "missing",
@@ -712,7 +710,7 @@ def _read_env_presence(path: Path) -> dict[str, str]:
         key = key.strip()
         if key in keys:
             keys[key] = "set" if value.strip() else "blank"
-            if key in {"TRADING_MODE", "BONEHAWK_STOCK_TRADING_MODE", "BONEHAWK_STOCK_ORDER_CONNECTOR", "BONEHAWK_UI_THEME", "ALPACA_PAPER", "ALPACA_ALLOW_LIVE", "BONEHAWK_SETUP_COMPLETE"} and value.strip():
+            if key in {"TRADING_MODE", "BONEHAWK_UI_THEME", "ALPACA_PAPER", "ALPACA_ALLOW_LIVE", "BONEHAWK_SETUP_COMPLETE"} and value.strip():
                 keys[key] = value.strip()
     return keys
 
@@ -723,7 +721,7 @@ def _ui_theme_from_env(env: dict[str, str]) -> str:
 
 
 def _validate_setup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
-    for key in ("alpaca_api_key", "alpaca_secret_key", "telegram_bot_token", "allowed_chat_ids", "robinhood_api_key", "robinhood_private_key_base64", "robinhood_account_number"):
+    for key in ("alpaca_api_key", "alpaca_secret_key", "telegram_bot_token", "allowed_chat_ids"):
         value = payload.get(key)
         if value is not None and len(str(value)) > 4096:
             return {"ok": False, "status": "invalid_setup", "message": "A setup value is too long."}
@@ -752,7 +750,7 @@ def _setup_bool(value: Any, default: bool) -> bool:
 def _ticket_from_decision(row: dict[str, Any]) -> dict[str, Any] | None:
     source = str(row.get("source") or "")
     action = str(row.get("action") or "")
-    ticket_sources = {"stock_order_intent", "live_stock_order", "stock_order_attempt", "autopilot_order"}
+    ticket_sources = {"stock_order_intent", "alpaca_stock_order", "stock_order_attempt", "autopilot_order"}
     if source not in ticket_sources and "_INTENT" not in action and "_LIVE" not in action and "_ALPACA" not in action:
         return None
     status = str(row.get("status") or "").strip().lower()
@@ -833,6 +831,32 @@ def _trade_quote_symbols(scan_result: dict[str, Any], positions: list[Any], limi
     return list(dict.fromkeys(symbols))[:limit]
 
 
+def _watchlist_with_portfolio_positions(watchlist: Watchlist, positions: list[Position]) -> Watchlist:
+    if not positions:
+        return watchlist
+    symbols = list(dict.fromkeys([*watchlist.symbols, *[position.symbol for position in positions]]))
+    return Watchlist(symbols=symbols, positions=positions, risk=watchlist.risk, aliases=watchlist.aliases)
+
+
+def _public_alpaca_account(account: dict[str, Any]) -> dict[str, Any]:
+    allowed = ("status", "portfolio_value", "cash", "buying_power", "equity", "currency")
+    return {key: account.get(key) for key in allowed if key in account}
+
+
+def _empty_portfolio_performance(source: str) -> dict[str, Any]:
+    return {
+        "source": source,
+        "positions": [],
+        "total_cost": 0,
+        "total_value": 0,
+        "account_value": 0,
+        "cash": 0,
+        "buying_power": 0,
+        "unrealized_pnl": 0,
+        "unrealized_pnl_pct": 0,
+    }
+
+
 def _first_query_value(query: dict[str, list[str]], key: str) -> str:
     values = query.get(key, [])
     return values[0] if values else ""
@@ -847,7 +871,7 @@ def _normalize_stock_symbol(symbol: Any) -> str:
     return value
 
 
-def _stock_order_request(symbol: Any, side: Any, quantity: Any) -> StockOrderRequest | dict[str, Any]:
+def _stock_order_request(symbol: Any, side: Any, quantity: Any) -> StockOrderTicket | dict[str, Any]:
     normalized_symbol = _normalize_stock_symbol(symbol)
     if not normalized_symbol:
         return {"ok": False, "status": "invalid_symbol", "message": "Choose a valid stock symbol."}
@@ -860,7 +884,7 @@ def _stock_order_request(symbol: Any, side: Any, quantity: Any) -> StockOrderReq
         return {"ok": False, "status": "invalid_quantity", "message": "Quantity must be a number."}
     if normalized_quantity <= 0 or normalized_quantity > 1_000_000:
         return {"ok": False, "status": "invalid_quantity", "message": "Quantity must be greater than 0."}
-    return StockOrderRequest(symbol=normalized_symbol, side=normalized_side, quantity=normalized_quantity)
+    return StockOrderTicket(symbol=normalized_symbol, side=normalized_side, quantity=normalized_quantity)
 
 
 HTML = """
@@ -869,6 +893,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
   <title>bonehawk</title>
   <style>
     :root {
@@ -1103,6 +1128,7 @@ HTML = """
     .command-code { color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
     .command-actions { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
     .command-card button { min-width: 82px; }
+    .agent-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     @media (max-width: 1080px) {
       .app-shell { grid-template-columns: 1fr; }
       aside { position: static; }
@@ -1112,6 +1138,7 @@ HTML = """
       .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .two-col { grid-template-columns: 1fr; }
       .command-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .agent-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 640px) {
       main { padding: 14px; }
@@ -1122,6 +1149,7 @@ HTML = """
       .right-stack { justify-items: start; white-space: normal; }
       .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .command-grid { grid-template-columns: 1fr; }
+      .agent-grid { grid-template-columns: 1fr; }
       .chart-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .ticket-drawer { left: 22px; }
       .toast-stack { left: 14px; right: 14px; width: auto; }
@@ -1151,8 +1179,6 @@ HTML = """
         <button class="tab" onclick="showTab('growth-panel', this)">Growth</button>
         <button class="tab" onclick="showTab('stocks-panel', this)">Stocks</button>
         <button class="tab" onclick="showTab('autopilot-panel', this)">Autopilot</button>
-        <button class="tab" onclick="showTab('agentic-panel', this)">Agentic</button>
-        <button class="tab" onclick="showTab('robinhood-panel', this)">Robinhood</button>
         <button class="tab" onclick="showTab('scanner-panel', this)">Scanner</button>
         <button class="tab" onclick="showTab('news-panel', this)">News</button>
         <button class="tab" onclick="showTab('tickets-panel', this)">Tickets</button>
@@ -1176,13 +1202,13 @@ HTML = """
         </div>
         <div id="market-state" class="market-state">Market data live</div>
         <div class="toolbar">
-          <button id="menu-toggle" class="menu-toggle" data-action onclick="toggleSidebar()" title="Toggle menu">☰</button>
+          <button id="menu-toggle" class="menu-toggle" data-action onclick="toggleSidebar(event)" title="Toggle menu">☰</button>
           <div class="mode-switch" role="group" aria-label="Trading mode">
             <button data-action data-mode-option="paper" class="mode-option" onclick="setTradingMode('paper')">Paper</button>
             <button data-action data-mode-option="live" class="mode-option live" onclick="setTradingMode('live')">Live</button>
           </div>
           <button data-action onclick="refreshAll()">Refresh</button>
-          <button data-action class="primary" onclick="runPaper(false)">Paper Cycle</button>
+          <button data-action class="primary" onclick="runPaper(false)">Run Paper Agent</button>
           <button data-action onclick="runPaper(true)">Paper + Telegram</button>
           <button data-action onclick="sendScannerAlerts()">Scanner Alerts</button>
           <button data-action onclick="sendTradeIdeas()">Trade Ideas Telegram</button>
@@ -1264,6 +1290,40 @@ HTML = """
           </div>
         </div>
         <div id="autopilot-metrics" class="metric-grid"></div>
+        <div class="agent-grid">
+          <div class="panel-block">
+            <h2>Data Sources</h2>
+            <div id="agent-scan" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Agent 1: Sentiment</h2>
+            <div id="agent-research" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Agent 2: Technical</h2>
+            <div id="agent-prediction" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Agent 3: Portfolio Manager</h2>
+            <div id="agent-risk" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Agent 4: Executor</h2>
+            <div id="agent-execution" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Post-Mortem Agents</h2>
+            <div id="agent-postmortem" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Performance Report</h2>
+            <div id="agent-performance" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Telegram Alert</h2>
+            <div id="agent-telegram" class="data-list"></div>
+          </div>
+        </div>
         <div class="two-col">
           <div class="panel-block">
             <h2>Planned Orders</h2>
@@ -1277,53 +1337,6 @@ HTML = """
         <div class="panel-block">
           <h2>Execution Output</h2>
           <pre id="autopilot-output">No autopilot run yet.</pre>
-        </div>
-      </section>
-
-      <section id="agentic-panel" class="tab-panel">
-        <div class="section-head">
-          <h2>Robinhood Agentic Trading</h2>
-          <div id="agentic-status" class="muted"></div>
-        </div>
-        <div id="agentic-metrics" class="metric-grid"></div>
-        <div class="two-col">
-          <div class="panel-block">
-            <h2>Setup</h2>
-            <div id="agentic-setup" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Guardrails</h2>
-            <div id="agentic-guardrails" class="data-list"></div>
-          </div>
-        </div>
-        <div class="panel-block">
-          <div class="section-head">
-            <h2>Connector Diagnostics</h2>
-            <button data-action onclick="diagnoseStockConnector()">Diagnose Connector</button>
-          </div>
-          <pre id="stock-connector-diagnostics">No diagnosis run yet.</pre>
-        </div>
-      </section>
-
-      <section id="robinhood-panel" class="tab-panel">
-        <div class="section-head">
-          <h2>Robinhood Crypto</h2>
-          <div id="robinhood-status" class="muted"></div>
-        </div>
-        <div id="robinhood-metrics" class="metric-grid"></div>
-        <div class="two-col">
-          <div class="panel-block">
-            <h2>Holdings</h2>
-            <div id="robinhood-holdings" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Open Orders</h2>
-            <div id="robinhood-orders" class="data-list"></div>
-          </div>
-        </div>
-        <div class="panel-block">
-          <h2>Crypto Quotes</h2>
-          <div id="robinhood-quotes" class="data-list"></div>
         </div>
       </section>
 
@@ -1381,10 +1394,6 @@ HTML = """
             <div id="status" class="data-list"></div>
           </div>
           <div class="panel-block">
-            <h2>Stock Order Controls</h2>
-            <div id="stock-settings" class="data-list"></div>
-          </div>
-          <div class="panel-block">
             <h2>Autopilot Controls</h2>
             <div id="autopilot-settings" class="data-list"></div>
           </div>
@@ -1440,18 +1449,6 @@ HTML = """
             Telegram chat IDs
             <input id="setup-chat-ids" type="text" autocomplete="off" placeholder="Optional comma-separated IDs">
           </label>
-          <label class="setup-field">
-            Robinhood API key
-            <input id="setup-robinhood-api-key" type="password" autocomplete="off" placeholder="Optional crypto key">
-          </label>
-          <label class="setup-field full">
-            Robinhood private key base64
-            <input id="setup-robinhood-private-key" type="password" autocomplete="off" placeholder="Optional crypto private key">
-          </label>
-          <label class="setup-field">
-            Robinhood account number
-            <input id="setup-robinhood-account" type="password" autocomplete="off" placeholder="Optional">
-          </label>
         </div>
         <div class="setup-actions">
           <button type="button" onclick="hideSetupModal()">Skip for now</button>
@@ -1493,7 +1490,7 @@ HTML = """
           <h2 id="stock-ticket-title">Stock Ticket</h2>
           <span id="stock-ticket-side" class="pill quiet">Buy</span>
         </div>
-        <div id="stock-ticket-note" class="muted">Review-only ticket. No live order placed.</div>
+        <div id="stock-ticket-note" class="muted">Paper ticket by default. Live Alpaca orders need confirmation.</div>
       </div>
       <button onclick="closeStockTicket()">Close</button>
     </div>
@@ -1504,7 +1501,7 @@ HTML = """
       </label>
       <label>
         Live confirmation
-        <input id="stock-ticket-confirm" type="text" autocomplete="off" placeholder="LIVE_STOCK_ORDER">
+        <input id="stock-ticket-confirm" type="text" autocomplete="off" placeholder="LIVE_ALPACA_ORDER">
       </label>
       <div class="ticket-actions">
         <button onclick="closeStockTicket()">Cancel</button>
@@ -1637,16 +1634,30 @@ HTML = """
       document.body.classList.toggle('sidebar-collapsed', collapsed);
       document.body.classList.remove('menu-open');
     }
-    function toggleSidebar() {
+    function toggleSidebar(event) {
+      if (event) event.stopPropagation();
       const collapsed = document.body.classList.contains('sidebar-collapsed');
       const open = document.body.classList.contains('menu-open');
-      if (!collapsed) {
+      const overlayMode = window.matchMedia('(max-width: 860px)').matches;
+      if (open) {
         document.body.classList.add('sidebar-collapsed');
         document.body.classList.remove('menu-open');
         window.localStorage.setItem('bonehawk-sidebar-collapsed', 'true');
         return;
       }
-      document.body.classList.toggle('menu-open', !open);
+      if (collapsed) {
+        if (overlayMode) {
+          document.body.classList.add('menu-open');
+          document.body.classList.add('sidebar-collapsed');
+          window.localStorage.setItem('bonehawk-sidebar-collapsed', 'true');
+        } else {
+          expandSidebar();
+        }
+        return;
+      }
+      document.body.classList.add('sidebar-collapsed');
+      document.body.classList.remove('menu-open');
+      window.localStorage.setItem('bonehawk-sidebar-collapsed', 'true');
     }
     function closeSidebar() {
       document.body.classList.remove('menu-open');
@@ -1664,7 +1675,6 @@ HTML = """
       setModeButtons(data.mode || 'missing');
       applyUiTheme(data.ui_theme || data.env?.BONEHAWK_UI_THEME || 'arcade');
       document.getElementById('status').innerHTML = Object.entries(data.env).map(([k,v]) => row(escapeHtml(k), '', pill(v))).join('');
-      renderStockSettings(data);
       renderUiThemeSettings(data);
       renderSetupModal(setup);
     }
@@ -1697,9 +1707,6 @@ HTML = """
         alpaca_paper: true,
         telegram_bot_token: document.getElementById('setup-telegram-token').value,
         allowed_chat_ids: document.getElementById('setup-chat-ids').value,
-        robinhood_api_key: document.getElementById('setup-robinhood-api-key').value,
-        robinhood_private_key_base64: document.getElementById('setup-robinhood-private-key').value,
-        robinhood_account_number: document.getElementById('setup-robinhood-account').value,
         autopilot_enabled: true,
         max_trade_usd: document.getElementById('setup-max-trade-usd').value,
         max_open_positions: document.getElementById('setup-max-open-positions').value,
@@ -1711,7 +1718,7 @@ HTML = """
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(payload)
         });
-        ['setup-alpaca-api-key', 'setup-alpaca-secret-key', 'setup-telegram-token', 'setup-robinhood-api-key', 'setup-robinhood-private-key', 'setup-robinhood-account'].forEach(id => document.getElementById(id).value = '');
+        ['setup-alpaca-api-key', 'setup-alpaca-secret-key', 'setup-telegram-token'].forEach(id => document.getElementById(id).value = '');
         setupDismissed = false;
         renderSetupModal(data.setup);
         await refreshStatus();
@@ -1731,14 +1738,12 @@ HTML = """
     }
     async function refreshIntel() {
       setStatus('Refreshing market data...', 'muted');
-      const [data, trades, growth, sync, logs, tickets, robinhood, stocks, agentic, autopilot] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/robinhood'), getJson('/api/stocks'), getJson('/api/agentic-trading'), getJson('/api/autopilot')]);
+      const [data, trades, growth, sync, logs, tickets, stocks, autopilot] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/stocks'), getJson('/api/autopilot')]);
       renderPortfolio(data, trades, sync);
       renderTicker(trades);
       renderTradeIdeas(trades);
       renderGrowthCandidates(growth);
-      renderRobinhood(robinhood);
       renderStocks(stocks);
-      renderAgentic(agentic);
       renderAutopilot(autopilot);
       renderAutopilotSettings(autopilot);
       renderScanner(trades, data);
@@ -1759,10 +1764,12 @@ HTML = """
     }
     function renderPortfolio(data, trades, sync) {
       const performance = data.portfolio_performance || {};
+      const source = data.portfolio_source || {};
+      const displayValue = performance.account_value ?? performance.total_value;
       document.getElementById('symbols').textContent = data.symbols.join(', ');
       document.getElementById('metric-grid').innerHTML = [
-        metric('Portfolio value', money(performance.total_value), 'Manual stock positions plus priced holdings'),
-        metric('Open P&L', `${money(performance.unrealized_pnl)} ${pct(performance.unrealized_pnl_pct)}`, 'Configured positions only'),
+        metric('Portfolio value', money(displayValue), source.status === 'connected' ? 'Alpaca account value' : 'Watchlist estimate'),
+        metric('Open P&L', `${money(performance.unrealized_pnl)} ${pct(performance.unrealized_pnl_pct)}`, source.status === 'connected' ? 'Alpaca open positions' : 'Configured positions only'),
         metric('Market trend', escapeHtml(trades.market_trend || 'unknown'), `${trades.summary?.symbols_scanned || 0} symbols scanned`),
         metric('Alerts', String(trades.summary?.alerts || 0), 'Review-only scanner alerts')
       ].join('');
@@ -1771,7 +1778,7 @@ HTML = """
         stockSymbolControls(position.symbol),
         `Qty ${position.quantity} · cost ${money(position.cost_basis)} · price ${money(position.current_price)}`,
         `${money(position.market_value)}<span>${pct(position.unrealized_pnl_pct)}</span>`
-      )).join('') || empty('No priced stock positions configured.');
+      )).join('') || empty(source.status === 'connected' ? 'No open Alpaca positions.' : 'No priced stock positions configured.');
       document.getElementById('portfolio-sync').innerHTML = [
         row('Stock sync', escapeHtml(sync.stock_sync?.message || ''), pill(sync.stock_sync?.status || 'unknown')),
         row('Crypto sync', escapeHtml(sync.crypto_sync?.message || ''), pill(sync.crypto_sync?.status || 'unknown'))
@@ -1811,61 +1818,20 @@ HTML = """
         );
       }).join('') || empty('No quick-growth candidates loaded.');
     }
-    function renderRobinhood(data) {
-      document.getElementById('robinhood-status').textContent = data.message || '';
-      document.getElementById('robinhood-metrics').innerHTML = [
-        metric('Connection', escapeHtml(data.status || 'unknown'), `Mode ${escapeHtml(data.trading_mode || 'unknown')}`),
-        metric('API version', escapeHtml(data.api_version || 'unknown'), `Account ${escapeHtml(data.configured_account_number || 'missing')}`),
-        metric('Crypto orders', escapeHtml(data.capabilities?.crypto_order_place || 'unknown'), 'Live orders require TRADING_MODE=live'),
-        metric('Stocks', escapeHtml(data.capabilities?.stock_trading || 'unknown'), 'Crypto API cannot place stock orders')
-      ].join('');
-      document.getElementById('robinhood-holdings').innerHTML = (data.holdings || []).map(item => row(
-        `<strong>${escapeHtml(item.symbol)}</strong>`,
-        `Available ${escapeHtml(item.available_quantity)} · total ${escapeHtml(item.total_quantity)}`,
-        pill('crypto', 'buy')
-      )).join('') || empty('No crypto holdings loaded.');
-      document.getElementById('robinhood-orders').innerHTML = (data.orders || []).map(item => row(
-        `<strong>${escapeHtml(item.symbol || 'order')}</strong>${pill(item.side || 'order', actionClass(item.side))}`,
-        `${escapeHtml(item.type || '')} · ${escapeHtml(item.state || '')}`,
-        escapeHtml(item.id || '')
-      )).join('') || empty('No open crypto orders.');
-      document.getElementById('robinhood-quotes').innerHTML = (data.quotes || []).map(item => row(
-        `<strong>${escapeHtml(item.symbol)}</strong>`,
-        `Bid ${escapeHtml(item.bid)} · ask ${escapeHtml(item.ask)}`,
-        pill('quote', 'quiet')
-      )).join('') || empty('No Robinhood quotes loaded.');
-    }
     function renderStocks(data) {
       const sample = data.sample_symbols || [];
       document.getElementById('stocks-status').textContent = `${data.total_symbols || 0} stock symbols loaded`;
       document.getElementById('stocks-metrics').innerHTML = [
         metric('Universe', String(data.total_symbols || 0), escapeHtml(data.source || 'market_universe')),
         metric('Active scan', String(data.scan_symbols || 0), `Cap ${escapeHtml(data.max_scan_symbols || 0)}`),
-        metric('Crypto API', humanize(data.execution?.robinhood_crypto_api), 'Stock orders not available here'),
-        metric('Stock orders', humanize(data.execution?.robinhood_agentic_mcp), 'Needs Robinhood Agentic Trading')
+        metric('Broker', 'Alpaca', humanize(data.execution?.alpaca_trading_api)),
+        metric('Manual orders', humanize(data.execution?.alpaca_paper_trading), 'Buy/Sell tickets use Alpaca')
       ].join('');
       document.getElementById('stock-symbols').innerHTML = sample.map(symbol => `<div class="symbol-chip">${stockSymbolControls(symbol)}</div>`).join('') || empty('No stock symbols loaded.');
       document.getElementById('stock-execution').innerHTML = [
-        row('Robinhood Crypto API', 'Crypto market data, account reads, holdings, and crypto orders.', pill(humanize(data.execution?.robinhood_crypto_api), 'quiet')),
-        row('Robinhood Agentic Trading', 'Required before bonehawk can place live stock orders through Robinhood.', pill(humanize(data.execution?.robinhood_agentic_mcp), 'trim'))
+        row('Alpaca Trading API', 'Stock orders, account reads, and paper/live execution.', pill(humanize(data.execution?.alpaca_trading_api), 'buy')),
+        row('Alpaca paper trading', 'Default path for manual tickets and autopilot orders.', pill(humanize(data.execution?.alpaca_paper_trading), 'quiet'))
       ].join('');
-    }
-    function renderAgentic(data) {
-      document.getElementById('agentic-status').textContent = data.message || '';
-      const connector = data.stock_order_connector || {};
-      document.getElementById('agentic-metrics').innerHTML = [
-        metric('MCP status', humanize(data.status), data.codex_mcp_configured ? 'Configured in Codex' : 'Not found in Codex config'),
-        metric('Stock mode', humanize(data.stock_trading_mode), 'Review mode is safest for testing'),
-        metric('Connector', humanize(connector.status), humanize(connector.connector_mode)),
-        metric('Order placement', humanize(data.capabilities?.stock_order_place), `Confirm ${escapeHtml(connector.confirmation_phrase || 'required')}`)
-      ].join('');
-      document.getElementById('agentic-setup').innerHTML = [
-        row('MCP server', escapeHtml(data.mcp_url || ''), pill(data.mcp_name || 'robinhood-trading', 'quiet')),
-        row('Add to Codex', escapeHtml(data.setup?.codex_cli_command || ''), pill(data.codex_mcp_configured ? 'done' : 'needed', data.codex_mcp_configured ? 'buy' : 'trim')),
-        row('Login', escapeHtml(data.setup?.codex_login_command || ''), pill('OAuth', 'trim')),
-        row('Desktop onboarding', escapeHtml(data.setup?.desktop_note || ''), pill('required', 'trim'))
-      ].join('');
-      document.getElementById('agentic-guardrails').innerHTML = (data.guardrails || []).map(item => row(escapeHtml(item), '', pill('guardrail', 'quiet'))).join('') || empty('No guardrails loaded.');
     }
     function renderAutopilot(data) {
       const config = data.config || {};
@@ -1874,6 +1840,7 @@ HTML = """
         metric('Status', humanize(data.status), `Mode ${escapeHtml(config.mode || 'paper')}`),
         metric('Broker', 'Alpaca', humanize(broker.status || 'unknown')),
         metric('Trade size', money(config.max_trade_usd || 0), `${config.max_open_positions || 0} max open positions`),
+        metric('Agent window', `${escapeHtml(config.scan_window_minutes || 15)}m`, `Kelly cap ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}%`),
         metric('Live gate', config.live_ready ? 'Ready' : 'Locked', config.allow_live ? 'Live permission on' : 'Paper-first')
       ].join('');
       document.getElementById('autopilot-orders').innerHTML = empty('Run Scan to build a fresh paper plan.');
@@ -1883,13 +1850,64 @@ HTML = """
         row('Paper mode', 'Paper execution uses Alpaca paper trading.', pill(String(broker.paper ?? true), 'quiet')),
         row('Guardrail', escapeHtml(data.notice || ''), pill('risk', 'trim'))
       ].join('');
+      renderAutopilotAgents(data);
+    }
+    function renderAutopilotAgents(data) {
+      const agentic = data.agentic_scan || {};
+      const agents = agentic.agents || {};
+      const executed = data.executed || [];
+      const orders = data.orders || [];
+      const blocked = [...(data.blocked || []), ...(agentic.blocked || [])];
+      const dataSources = data.data_sources || {};
+      const telegram = data.telegram || {};
+      const executionSummary = data.execution_summary || {};
+      const sources = agents.research?.sources || {};
+      const sourceText = Object.entries(sources).map(([source, count]) => `${source}: ${count}`).join(' · ') || 'No social/RSS sources loaded yet.';
+      document.getElementById('agent-scan').innerHTML = [
+        row('News Data', escapeHtml(dataSources.news || 'RSS/news plus optional social feeds.'), pill(agents.research?.status || 'waiting', 'quiet')),
+        row('Market Data', escapeHtml(dataSources.market || 'Alpaca plus quote history.'), pill(data.market_trend || 'waiting', data.market_trend === 'DOWN' ? 'trim' : 'quiet')),
+        row('Universe', `${data.summary?.symbols_scanned || agents.scan?.symbols_scanned || 0} symbols scanned`, pill(`${agentic.summary?.opportunities || 0} opps`, agentic.summary?.opportunities ? 'buy' : 'quiet'))
+      ].join('');
+      document.getElementById('agent-research').innerHTML = [
+        row('Sources', sourceText, pill(agents.research?.status || 'waiting', 'quiet')),
+        row('Sentiment', escapeHtml(agents.research?.method || 'Waiting for scan.'), pill('LLM/local', 'quiet'))
+      ].join('');
+      document.getElementById('agent-prediction').innerHTML = [
+        row('Market model', escapeHtml(agents.prediction?.model || 'waiting'), pill(agents.prediction?.status || 'idle', 'quiet')),
+        row('Calibration', escapeHtml(agents.prediction?.llm_calibration || 'Waiting for scan.'), pill('probability', 'quiet'))
+      ].join('');
+      document.getElementById('agent-risk').innerHTML = [
+        row('Portfolio rule', `${orders.length} planned · ${blocked.length} blocked`, pill(agentic.summary?.top_symbol || 'none', 'quiet')),
+        row('Kelly sizing', escapeHtml(agents.risk?.method || 'waiting'), pill(agents.risk?.max_kelly_fraction ? `${Number(agents.risk.max_kelly_fraction * 100).toFixed(1)}% cap` : 'idle', 'quiet')),
+        row('Bankroll', money(agents.risk?.bankroll_usd || 0), pill(`${orders.length} planned`, orders.length ? 'buy' : 'quiet'))
+      ].join('');
+      document.getElementById('agent-execution').innerHTML = [
+        row('Submitted', `${executed.length} paper order${executed.length === 1 ? '' : 's'}`, pill(data.status || 'idle', executed.length ? 'buy' : 'quiet')),
+        row('Broker', executed[0]?.broker_order_id || 'No order id yet', pill(data.mode || 'paper', data.mode === 'live' ? 'sell' : 'buy')),
+        row('Execution path', escapeHtml(dataSources.execution || 'Alpaca paper orders by default.'), pill('Alpaca', 'quiet'))
+      ].join('');
+      document.getElementById('agent-postmortem').innerHTML = (agentic.postmortems || []).slice(0, 3).map(item =>
+        row(`${escapeHtml(item.symbol || 'loss')}`, `${escapeHtml(String(item.realized_pnl || ''))} realized P&L`, pill('reviewed', 'trim'))
+      ).join('') || row('Loss review', 'No new loss post-mortems.', pill(agents.postmortem?.status || 'ready', 'quiet'));
+      document.getElementById('agent-performance').innerHTML = [
+        row('Report', escapeHtml(executionSummary.message || data.notice || 'Run Scan or Run Paper to build a performance report.'), pill(data.status || 'idle', 'quiet')),
+        row('Counts', `${executionSummary.submitted || 0} submitted · ${executionSummary.rejected || 0} rejected · ${executionSummary.planned || orders.length} planned`, pill(`${blocked.length} blocked`, blocked.length ? 'trim' : 'quiet'))
+      ].join('');
+      document.getElementById('agent-telegram').innerHTML = [
+        row('Channel', 'Telegram', pill(telegram.status || 'needs_setup', telegram.status === 'ready' ? 'buy' : 'trim')),
+        row('Setup', escapeHtml(telegram.message || 'Add Telegram setup values to enable alerts.'), pill(telegram.chat_ids === 'set' ? 'chat set' : 'chat missing', telegram.chat_ids === 'set' ? 'buy' : 'quiet'))
+      ].join('');
     }
     function renderAutopilotPlan(data) {
       const orders = data.orders || [];
-      const blocked = data.blocked || [];
+      const agentic = data.agentic_scan || {};
+      const blocked = [...(data.blocked || []), ...(agentic.blocked || [])];
+      const sources = agentic.agents?.research?.sources || {};
+      const sourceText = Object.entries(sources).map(([source, count]) => `${source} ${count}`).join(' · ') || 'rss/news only';
+      const postmortems = agentic.postmortems || [];
       document.getElementById('autopilot-orders').innerHTML = orders.map(order => {
         const score = Math.max(0, Math.min(100, Number(order.confidence || 0)));
-        const stops = [order.current_price ? `price ${money(order.current_price)}` : '', order.stop_loss ? `stop ${money(order.stop_loss)}` : '', order.take_profit ? `target ${money(order.take_profit)}` : '', order.notional ? `size ${money(order.notional)}` : ''].filter(Boolean).join(' · ');
+        const stops = [order.current_price ? `price ${money(order.current_price)}` : '', order.stop_loss ? `stop ${money(order.stop_loss)}` : '', order.take_profit ? `target ${money(order.take_profit)}` : '', order.notional ? `size ${money(order.notional)}` : '', order.probability_up ? `prob ${pct(Number(order.probability_up) * 100)}` : '', order.kelly_fraction ? `kelly ${pct(Number(order.kelly_fraction) * 100)}` : ''].filter(Boolean).join(' · ');
         return row(
           `${stockSymbolControls(order.symbol)}${pill(order.side || order.action, actionClass(order.side || order.action))}`,
           `${escapeHtml(order.reason || '')} · ${stops}<div class="data-sub">${(order.signals || []).map(signal => pill(signal, 'quiet')).join('')}</div>`,
@@ -1899,14 +1917,51 @@ HTML = """
       document.getElementById('autopilot-risk').innerHTML = [
         row('Market trend', escapeHtml(data.market_trend || 'unknown'), pill(data.mode || 'paper', data.mode === 'live' ? 'sell' : 'buy')),
         row('Symbols scanned', String(data.summary?.symbols_scanned || 0), pill(`${orders.length} planned`, orders.length ? 'buy' : 'quiet')),
+        row('Research agents', sourceText, pill(`${agentic.summary?.opportunities || 0} opps`, agentic.summary?.opportunities ? 'buy' : 'quiet')),
+        row('Prediction / risk', `Model ${escapeHtml(agentic.agents?.prediction?.model || 'n/a')} · ${escapeHtml(agentic.agents?.risk?.method || 'n/a')}`, pill(`${escapeHtml(agentic.window_minutes || 15)}m`, 'quiet')),
+        ...postmortems.slice(0, 3).map(item => row(`Post-mortem ${escapeHtml(item.symbol || '')}`, `${escapeHtml(String(item.realized_pnl || ''))} realized P&L`, pill('loss review', 'trim'))),
         ...blocked.slice(0, 8).map(item => row(`${escapeHtml(item.symbol || 'blocked')}`, escapeHtml(item.reason || ''), pill('blocked', 'trim')))
       ].join('');
+      renderAutopilotAgents(data);
+    }
+    function formatAutopilotOutput(data) {
+      const executed = data.executed || [];
+      const orders = data.orders || [];
+      const blocked = [...(data.blocked || []), ...(data.agentic_scan?.blocked || [])];
+      const lines = [
+        executed.length
+          ? `Submitted ${executed.length} Alpaca ${escapeHtml(data.mode || 'paper')} order${executed.length === 1 ? '' : 's'}.`
+          : `No orders submitted. ${data.status || 'No status returned.'}`,
+        `Trend: ${data.market_trend || 'unknown'} | Scanned: ${data.summary?.symbols_scanned || 0} | Planned: ${orders.length} | Blocked: ${blocked.length}`,
+        `Telegram: ${data.telegram?.status || 'needs_setup'}`,
+      ];
+      if (executed.length) {
+        lines.push('');
+        lines.push('Submitted orders:');
+        executed.slice(0, 6).forEach(item => {
+          lines.push(`- ${item.symbol || 'UNKNOWN'} ${item.side || 'ORDER'} ${item.notional ? money(item.notional) : ''} | ${item.broker_status || item.status || 'submitted'} | ${item.broker_order_id || 'no order id'}`);
+        });
+      } else if (orders.length) {
+        lines.push('');
+        lines.push('Planned but not submitted:');
+        orders.slice(0, 6).forEach(item => {
+          lines.push(`- ${item.symbol || 'UNKNOWN'} ${money(item.notional || 0)} | ${item.reason || 'planned'}`);
+        });
+      }
+      if (blocked.length) {
+        lines.push('');
+        lines.push('Top blocks:');
+        blocked.slice(0, 5).forEach(item => {
+          lines.push(`- ${item.symbol || 'Blocked'}: ${item.reason || item.status || 'blocked'}`);
+        });
+      }
+      return lines.join('\\n');
     }
     async function scanAutopilot() {
       await runAction('Scanning Alpaca autopilot setups...', async () => {
         const data = await getJson('/api/autopilot-scan', {method: 'POST'});
         renderAutopilotPlan(data);
-        document.getElementById('autopilot-output').textContent = JSON.stringify(data, null, 2);
+        document.getElementById('autopilot-output').textContent = formatAutopilotOutput(data);
         setStatus(`Autopilot planned ${data.orders?.length || 0} paper order(s).`, 'ok');
       }, false, false);
     }
@@ -1919,34 +1974,11 @@ HTML = """
         });
         const data = await response.json();
         renderAutopilotPlan(data);
-        document.getElementById('autopilot-output').textContent = JSON.stringify(data, null, 2);
+        document.getElementById('autopilot-output').textContent = formatAutopilotOutput(data);
         (data.executed || []).forEach(item => showOrderToast(item, 'Autopilot order'));
         setStatus(data.ok ? 'Autopilot paper execution submitted.' : data.message || data.status || 'Autopilot did not submit orders.', data.ok ? 'ok' : 'error');
         await refreshTickets();
       }, true, false);
-    }
-    async function diagnoseStockConnector() {
-      await runAction('Diagnosing Robinhood stock connector...', async () => {
-        const data = await getJson('/api/stock-connector-diagnostics');
-        document.getElementById('stock-connector-diagnostics').textContent = formatConnectorDiagnosis(data);
-        showToast(data.ok ? 'Connector ready' : 'Connector blocked', data.message || 'Diagnosis finished.', data.ok ? 'ok' : 'warn');
-        setStatus(data.message || 'Connector diagnosis finished.', data.ok ? 'ok' : 'error');
-      }, false, false);
-    }
-    function formatConnectorDiagnosis(data) {
-      const lines = [
-        `status: ${data.status || 'unknown'}`,
-        `message: ${data.message || ''}`,
-        '',
-        'checks:',
-        ...(data.checks || []).map(check => `- ${check.ok ? 'OK' : 'BLOCKED'} ${check.label}${check.fix ? ` · ${check.fix}` : ''}`),
-        '',
-        'codex mcp list:',
-        `status: ${data.codex_mcp_list?.status || 'unknown'}`,
-        `returncode: ${data.codex_mcp_list?.returncode ?? 'n/a'}`,
-        data.codex_mcp_list?.output || ''
-      ];
-      return lines.join('\\n');
     }
     function renderScanner(trades, data) {
       document.getElementById('scanner').innerHTML = (trades.scans || []).map(scan => {
@@ -2235,29 +2267,6 @@ HTML = """
         settingSwitch([{label: 'Arcade', value: 'arcade'}, {label: 'Classic', value: 'classic'}], theme, 'setUiTheme')
       );
     }
-    function renderStockSettings(status) {
-      const env = status.env || {};
-      const appMode = String(status.mode || env.TRADING_MODE || 'missing').toLowerCase();
-      const stockMode = String(env.BONEHAWK_STOCK_TRADING_MODE || 'missing').toLowerCase();
-      const connector = String(env.BONEHAWK_STOCK_ORDER_CONNECTOR || 'missing').toLowerCase();
-      document.getElementById('stock-settings').innerHTML = [
-        row(
-          'App trading mode',
-          'Controls crypto live order commands and is required for live stock connector sends.',
-          settingSwitch([{label: 'Paper', value: 'paper'}, {label: 'Live', value: 'live', danger: true}], appMode, 'setSettingsTradingMode')
-        ),
-        row(
-          'Stock trading mode',
-          'Controls whether stock orders can leave review mode.',
-          settingSwitch([{label: 'Review', value: 'review'}, {label: 'Paper', value: 'paper'}, {label: 'Live', value: 'live', danger: true}], stockMode, 'setStockTradingMode')
-        ),
-        row(
-          'Stock connector',
-          'Controls whether Send Live can call the Robinhood MCP bridge.',
-          settingSwitch([{label: 'Disabled', value: 'disabled'}, {label: 'Codex MCP', value: 'codex_mcp', danger: true}], connector, 'setStockConnectorMode')
-        )
-      ].join('');
-    }
     function renderAutopilotSettings(data) {
       const config = data.config || {};
       document.getElementById('autopilot-settings').innerHTML = [
@@ -2280,6 +2289,16 @@ HTML = """
           'Risk numbers',
           `Trade size ${money(config.max_trade_usd || 0)} · max positions ${escapeHtml(config.max_open_positions || 0)} · minimum score ${escapeHtml(config.min_confidence || 0)}`,
           '<button data-action onclick="editAutopilotRisk()">Edit</button>'
+        ),
+        row(
+          'Agentic scan',
+          `Window ${escapeHtml(config.scan_window_minutes || 15)}m · Kelly cap ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}% · min probability ${Number((config.min_probability || 0.56) * 100).toFixed(1)}%`,
+          '<button data-action onclick="editAutopilotAgentic()">Edit</button>'
+        ),
+        row(
+          'Paper downtrend probes',
+          'Paper mode can submit tiny test orders even when SPY/QQQ trend is down. Live mode stays blocked.',
+          settingSwitch([{label: 'Off', value: 'false'}, {label: 'On', value: 'true'}], String(Boolean(config.paper_trade_downtrend)), 'setAutopilotPaperDowntrend')
         )
       ].join('');
     }
@@ -2331,6 +2350,10 @@ HTML = """
       if (symbol) openStockChart(symbol);
     }
     async function runPaper(notify) {
+      if (!notify) {
+        await runAutopilotPaper();
+        return;
+      }
       await runAction(notify ? 'Running paper cycle and sending Telegram...' : 'Running paper cycle...', async () => {
         const data = await getJson(notify ? '/api/paper-cycle-notify' : '/api/paper-cycle', {method: 'POST'});
         document.getElementById('paper').textContent = data.stdout || data.stderr || JSON.stringify(data, null, 2);
@@ -2397,7 +2420,7 @@ HTML = """
     async function setTradingMode(mode) {
       const nextMode = String(mode || '').toLowerCase();
       if (nextMode === 'live') {
-        const ok = window.confirm('Switch bonehawk to LIVE mode? Crypto order commands can place real orders when TRADING_MODE=live.');
+        const ok = window.confirm('Switch bonehawk to LIVE mode? Alpaca live orders still need Alpaca live permission and confirmation.');
         if (!ok) return;
       }
       await runAction(`Switching to ${nextMode.toUpperCase()} mode...`, async () => {
@@ -2414,26 +2437,6 @@ HTML = """
     }
     async function setSettingsTradingMode(mode) {
       await setTradingMode(mode);
-    }
-    async function setStockTradingMode(mode) {
-      const value = String(mode || '').toLowerCase();
-      let confirm = '';
-      if (value === 'live') {
-        const typed = window.prompt('Type LIVE_STOCK_MODE to enable live stock mode.', '');
-        if (typed === null) return;
-        confirm = typed;
-      }
-      await setStockSetting('BONEHAWK_STOCK_TRADING_MODE', value, confirm);
-    }
-    async function setStockConnectorMode(mode) {
-      const value = String(mode || '').toLowerCase();
-      let confirm = '';
-      if (value === 'codex_mcp') {
-        const typed = window.prompt('Type ENABLE_STOCK_CONNECTOR to enable the Robinhood stock connector.', '');
-        if (typed === null) return;
-        confirm = typed;
-      }
-      await setStockSetting('BONEHAWK_STOCK_ORDER_CONNECTOR', value, confirm);
     }
     async function setUiTheme(theme) {
       const value = String(theme || 'arcade').toLowerCase();
@@ -2471,6 +2474,9 @@ HTML = """
       }
       await setAutopilotSetting('allow_live', next, confirm);
     }
+    async function setAutopilotPaperDowntrend(value) {
+      await setAutopilotSetting('paper_trade_downtrend', value, '');
+    }
     async function editAutopilotRisk() {
       const snapshot = await getJson('/api/autopilot');
       const config = snapshot.config || {};
@@ -2484,6 +2490,19 @@ HTML = """
       await setAutopilotSetting('max_open_positions', maxPositions, '', false);
       await setAutopilotSetting('min_confidence', minConfidence, '', true);
     }
+    async function editAutopilotAgentic() {
+      const snapshot = await getJson('/api/autopilot');
+      const config = snapshot.config || {};
+      const windowMinutes = window.prompt('Scan window in minutes (1-30)', config.scan_window_minutes || 15);
+      if (windowMinutes === null) return;
+      const kellyPct = window.prompt('Max Kelly risk fraction (%)', Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1));
+      if (kellyPct === null) return;
+      const minProbabilityPct = window.prompt('Minimum prediction probability (%)', Number((config.min_probability || 0.56) * 100).toFixed(1));
+      if (minProbabilityPct === null) return;
+      await setAutopilotSetting('scan_window_minutes', windowMinutes, '', false);
+      await setAutopilotSetting('max_kelly_fraction', Number(kellyPct) / 100, '', false);
+      await setAutopilotSetting('min_probability', Number(minProbabilityPct) / 100, '', true);
+    }
     async function setAutopilotSetting(setting, value, confirm, refresh = true) {
       await runAction(`Updating autopilot ${setting}...`, async () => {
         const data = await getJson('/api/autopilot-settings', {
@@ -2496,18 +2515,6 @@ HTML = """
         renderAutopilotSettings(autopilot);
         setStatus(data.message || 'Autopilot setting updated.', data.ok ? 'ok' : 'error');
       }, refresh, false);
-    }
-    async function setStockSetting(setting, value, confirm) {
-      await runAction(`Updating ${setting}...`, async () => {
-        const data = await getJson('/api/stock-settings', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({setting, value, confirm})
-        });
-        await refreshStatus();
-        await refreshIntel();
-        setStatus(data.message || 'Stock setting updated.', data.ok ? 'ok' : 'error');
-      }, false, false);
     }
     async function runAction(label, action, refreshAfter = true, disableButtons = true) {
       if (disableButtons) setBusy(true);

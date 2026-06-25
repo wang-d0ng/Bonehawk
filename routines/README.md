@@ -1,16 +1,19 @@
-# Routines
+# Bonehawk Routines
 
-These prompts adapt the Opus 4.7 Coinbase setup guide to Robinhood Crypto.
-Configure them as scheduled agent runs if you use a cloud routine system.
+These prompts support the Alpaca-first Bonehawk dashboard.
 
-Required routine environment variables:
+Required setup:
 
-- `ROBINHOOD_API_KEY`
-- `ROBINHOOD_PRIVATE_KEY_BASE64`
-- `ROBINHOOD_ACCOUNT_NUMBER`
-- `ROBINHOOD_API_VERSION=v2`
-- `TRADING_MODE=paper` or `live`
-- `TELEGRAM_BOT_TOKEN`
-- `ALLOWED_CHAT_IDS`
+- `ALPACA_API_KEY`
+- `ALPACA_SECRET_KEY`
+- `ALPACA_PAPER=true`
+- `ALPACA_ALLOW_LIVE=false`
 
-Keep `TRADING_MODE=paper` until read-only smoke tests and one manual dry review pass succeed.
+Useful routines:
+
+- `research-and-plan.md`: scan the market and prepare review-only ideas
+- `execute.md`: run the safe paper cycle or Alpaca paper autopilot
+- `manage.md`: review tickets, logs, and open risk
+- `panic-check.md`: stop automation when data or broker checks look unsafe
+- `daily-summary.md`: summarize scanner, tickets, and portfolio notes
+- `weekly-review.md`: review paper results and risk settings

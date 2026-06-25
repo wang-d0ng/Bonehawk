@@ -2,10 +2,10 @@
 
 ## Overview
 
-- What: Robinhood Crypto BTC swing bot
-- Platform: Robinhood Crypto Trading API
-- Asset: BTC-USD spot only
-- Strategy: swing trading with hard gates and Telegram notifications
+- What: Bonehawk Alpaca AI trading dashboard
+- Broker: Alpaca paper trading by default
+- Assets: US stocks from the configured market universe; crypto symbols may be monitored only when explicitly added
+- Strategy: scanner-driven trade ideas, risk-limited paper orders, Telegram alerts, and logged buy/sell tickets
 
 ## Volatile Flags
 

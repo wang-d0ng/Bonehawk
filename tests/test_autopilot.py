@@ -41,6 +41,25 @@ class FakeQuoteClient:
         }
 
 
+class DowntrendQuoteClient(FakeQuoteClient):
+    def get_histories(self, symbols):
+        histories = {}
+        for symbol in symbols:
+            if symbol in {"SPY", "QQQ"}:
+                histories[symbol] = PriceHistory(
+                    symbol,
+                    closes=[140, 139, 138, 137, 136, 135, 134, 133, 132, 131, 130, 129, 128, 127, 126, 125, 124, 123, 122, 121, 120, 119, 118, 117, 116],
+                    volumes=[100] * 24 + [160],
+                )
+            else:
+                histories[symbol] = PriceHistory(
+                    symbol,
+                    closes=[80, 82, 84, 86, 88, 90, 92, 95, 97, 100],
+                    volumes=[100] * 9 + [260],
+                )
+        return histories
+
+
 class FakeAlpacaClient:
     def __init__(self) -> None:
         self.orders = []
@@ -101,8 +120,10 @@ def test_autopilot_scan_generates_paper_buy_plan(tmp_path: Path) -> None:
     assert payload["mode"] == "paper"
     assert payload["orders"][0]["symbol"] == "MSFT"
     assert payload["orders"][0]["side"] == "buy"
-    assert payload["orders"][0]["notional"] == 25
+    assert 0 < payload["orders"][0]["notional"] <= 25
     assert payload["orders"][0]["review_only"] is True
+    assert payload["agentic_scan"]["opportunities"]
+    assert "kelly" in " ".join(payload["orders"][0]["signals"]).lower()
 
 
 def test_autopilot_execute_places_paper_orders_and_records_decisions(tmp_path: Path) -> None:
@@ -120,7 +141,47 @@ def test_autopilot_execute_places_paper_orders_and_records_decisions(tmp_path: P
     assert payload["ok"] is True
     assert payload["executed"][0]["broker_order_id"] == "paper-MSFT"
     assert alpaca.orders[0][0].symbol == "MSFT"
+    assert alpaca.orders[0][0].stop_loss is None
+    assert alpaca.orders[0][0].take_profit is None
+    assert payload["orders"][0]["stop_loss"] is not None
     assert (tmp_path / "logs" / "decision_log.jsonl").exists()
+
+
+def test_autopilot_paper_mode_can_submit_downtrend_probe_orders(tmp_path: Path) -> None:
+    alpaca = FakeAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, paper_trade_downtrend=True),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=DowntrendQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["market_trend"] == "DOWN"
+    assert payload["ok"] is True
+    assert payload["executed"][0]["broker_order_id"] == "paper-MSFT"
+    assert alpaca.orders[0][0].symbol == "MSFT"
+    assert "paper_downtrend_probe" in " ".join(payload["orders"][0]["signals"])
+
+
+def test_autopilot_live_mode_blocks_downtrend_entries(tmp_path: Path) -> None:
+    alpaca = FakeAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="live", allow_live=True, max_trade_usd=25, min_confidence=40),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=DowntrendQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.scan(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["market_trend"] == "DOWN"
+    assert payload["orders"] == []
+    assert payload["agentic_scan"]["opportunities"] == []
+    assert alpaca.orders == []
 
 
 def test_autopilot_blocks_when_disabled(tmp_path: Path) -> None:

@@ -51,15 +51,6 @@ class CommandSpec:
         }
 
 
-SYMBOL = CommandInput("symbol", "Symbol", "BTC-USD", r"[A-Za-z0-9-]{1,24}")
-USD = CommandInput("usd", "USD amount", "50", r"\d+(\.\d{1,8})?")
-PCT = CommandInput("pct", "Percent", "30", r"\d+(\.\d{1,8})?")
-BASE = CommandInput("base", "Base quantity", "0.001", r"\d+(\.\d{1,8})?")
-STOP_PRICE = CommandInput("stop_price", "Stop price", "60000", r"\d+(\.\d{1,8})?")
-LIMIT_PRICE = CommandInput("limit", "Limit price", "59700", r"\d+(\.\d{1,8})?")
-ORDER_ID = CommandInput("order_id", "Order ID", "", r"[A-Za-z0-9_-]{1,128}")
-
-
 COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("setup-venv", "Setup", "Create venv", "Create the local Python virtual environment.", "python3 -m venv .venv", ("python3", "-m", "venv", ".venv")),
     CommandSpec("install-requirements", "Setup", "Install requirements", "Install Python packages inside the project venv.", "python -m pip install -r requirements.txt", ("{python}", "-m", "pip", "install", "-r", "requirements.txt"), timeout=180),
@@ -70,29 +61,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("dashboard-health", "Setup", "Dashboard health", "Confirm this dashboard is already running.", "python scripts/dashboard.py", action="status"),
     CommandSpec("desktop-run", "Desktop", "Open desktop app", "Launch Bonehawk in a desktop window.", "python scripts/desktop_app.py", ("{python}", "scripts/desktop_app.py"), action="background"),
     CommandSpec("desktop-build", "Desktop", "Build Mac app", "Create dist/Bonehawk.app with PyInstaller.", "python scripts/build_desktop_app.py", ("{python}", "scripts/build_desktop_app.py"), timeout=240),
-    CommandSpec("robinhood-account", "Robinhood read-only", "Account", "Run Robinhood account read-only check.", "python scripts/robinhood.py account", ("{python}", "scripts/robinhood.py", "account")),
-    CommandSpec("robinhood-position", "Robinhood read-only", "BTC position", "Read BTC crypto holdings.", "python scripts/robinhood.py position", ("{python}", "scripts/robinhood.py", "position")),
-    CommandSpec("robinhood-quote", "Robinhood read-only", "Quote", "Fetch a Robinhood crypto quote.", "python scripts/robinhood.py quote BTC-USD", ("{python}", "scripts/robinhood.py", "quote", "{symbol}"), (SYMBOL,)),
-    CommandSpec("robinhood-orders", "Robinhood read-only", "Orders", "Read Robinhood crypto orders.", "python scripts/robinhood.py orders", ("{python}", "scripts/robinhood.py", "orders")),
-    CommandSpec("robinhood-smoke", "Robinhood read-only", "Sanitized smoke", "Run the sanitized Robinhood integration smoke check.", "python scripts/robinhood_smoke.py", ("{python}", "scripts/robinhood_smoke.py")),
-    CommandSpec("telegram-test", "Alerts", "Telegram test", "Send the README smoke-test Telegram message.", 'bash scripts/telegram.sh "Robinhood swing bot smoke test"', ("bash", "scripts/telegram.sh", "Robinhood swing bot smoke test")),
+    CommandSpec("telegram-test", "Alerts", "Telegram test", "Send a Bonehawk Telegram smoke-test message.", 'bash scripts/telegram.sh "Bonehawk Alpaca smoke test"', ("bash", "scripts/telegram.sh", "Bonehawk Alpaca smoke test")),
     CommandSpec("pytest", "Checks", "Run tests", "Run the project test suite.", "python -m pytest", ("{python}", "-m", "pytest"), timeout=180),
     CommandSpec("paper-cycle", "Cycles", "Paper cycle", "Run the safe paper trading cycle.", "python scripts/paper_cycle.py", ("{python}", "scripts/paper_cycle.py")),
     CommandSpec("paper-cycle-notify", "Cycles", "Paper + Telegram", "Run the paper cycle and notify Telegram.", "python scripts/paper_cycle.py --notify", ("{python}", "scripts/paper_cycle.py", "--notify")),
-    CommandSpec("codex-mcp-add", "Agentic", "Add Robinhood MCP", "Add Robinhood Trading MCP to Codex.", "codex mcp add robinhood-trading --url https://agent.robinhood.com/mcp/trading", ("codex", "mcp", "add", "robinhood-trading", "--url", "https://agent.robinhood.com/mcp/trading")),
-    CommandSpec("codex-mcp-login", "Agentic", "Login Robinhood MCP", "Start Robinhood Trading MCP OAuth.", "codex mcp login robinhood-trading", ("codex", "mcp", "login", "robinhood-trading"), timeout=180),
-    CommandSpec("codex-mcp-list", "Agentic", "List MCP servers", "Show configured Codex MCP servers.", "codex mcp list", ("codex", "mcp", "list")),
     CommandSpec("daily-schedule-copy", "Daily alerts", "Create schedule", "Copy the daily schedule example if missing.", "cp config/daily_schedule.example.json config/daily_schedule.json", action="copy", source_path="config/daily_schedule.example.json", target_path="config/daily_schedule.json"),
     CommandSpec("daily-once-morning", "Daily alerts", "Morning alert", "Send one morning trade-ideas alert.", "python scripts/daily_scheduler.py --once morning", ("{python}", "scripts/daily_scheduler.py", "--once", "morning")),
     CommandSpec("daily-once-midday", "Daily alerts", "Midday alert", "Send one midday scanner alert.", "python scripts/daily_scheduler.py --once midday", ("{python}", "scripts/daily_scheduler.py", "--once", "midday")),
     CommandSpec("daily-once-end", "Daily alerts", "End-of-day alert", "Send one end-of-day portfolio summary.", "python scripts/daily_scheduler.py --once end_of_day", ("{python}", "scripts/daily_scheduler.py", "--once", "end_of_day")),
     CommandSpec("daily-loop", "Daily alerts", "Start scheduler loop", "Start the daily scheduler in the background.", "python scripts/daily_scheduler.py --loop", ("{python}", "scripts/daily_scheduler.py", "--loop"), confirm_phrase="START_LOOP", action="background"),
-    CommandSpec("robinhood-buy-usd", "Live crypto orders", "Buy crypto", "Place the README market buy example. Requires live mode and confirmation.", "python scripts/robinhood.py buy --usd 50", ("{python}", "scripts/robinhood.py", "buy", "--usd", "{usd}"), (USD,), "LIVE_ORDER"),
-    CommandSpec("robinhood-sell-pct", "Live crypto orders", "Sell percent", "Place the README market sell example. Requires live mode and confirmation.", "python scripts/robinhood.py sell --pct 30", ("{python}", "scripts/robinhood.py", "sell", "--pct", "{pct}"), (PCT,), "LIVE_ORDER"),
-    CommandSpec("robinhood-stop", "Live crypto orders", "Stop limit", "Place the README stop-limit sell example. Requires live mode and confirmation.", "python scripts/robinhood.py stop --base 0.001 --stop-price 60000 --limit 59700", ("{python}", "scripts/robinhood.py", "stop", "--base", "{base}", "--stop-price", "{stop_price}", "--limit", "{limit}"), (BASE, STOP_PRICE, LIMIT_PRICE), "LIVE_ORDER"),
-    CommandSpec("robinhood-cancel", "Live crypto orders", "Cancel order", "Cancel one Robinhood crypto order by ID.", "python scripts/robinhood.py cancel ORDER_ID", ("{python}", "scripts/robinhood.py", "cancel", "{order_id}"), (ORDER_ID,), "CANCEL_ORDER"),
-    CommandSpec("robinhood-cancel-all", "Live crypto orders", "Cancel all", "Cancel all open Robinhood crypto orders.", "python scripts/robinhood.py cancel-all", ("{python}", "scripts/robinhood.py", "cancel-all"), (), "CANCEL_ALL"),
-    CommandSpec("robinhood-close", "Live crypto orders", "Close BTC", "Sell available BTC. Requires live mode and confirmation.", "python scripts/robinhood.py close", ("{python}", "scripts/robinhood.py", "close"), (), "CLOSE_POSITION"),
 )
 
 COMMAND_BY_ID = {command.id: command for command in COMMANDS}

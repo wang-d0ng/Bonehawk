@@ -92,7 +92,16 @@ Order responses appear as top-right notifications and are logged in the Tickets 
 
 ## Alpaca Autopilot
 
-The Autopilot tab scans the broader stock universe, builds trade candidates from scanner/news, momentum, volume, RSI, and SPY/QQQ trend checks, then applies risk limits before creating paper orders.
+The Autopilot tab scans the broader stock universe, builds trade candidates from scanner/news, optional social feeds, momentum, volume, RSI, and SPY/QQQ trend checks, then applies capped Kelly sizing before creating paper orders.
+
+Autopilot flow:
+
+1. News and social research feeds go into Agent 1: Sentiment.
+2. Alpaca account/order data and quote history go into Agent 2: Technical.
+3. Agent 3: Portfolio Manager combines sentiment, technical probability, open positions, and capped Kelly sizing.
+4. Agent 4: Executor submits eligible paper orders through Alpaca and records broker status/order IDs.
+5. Performance Report summarizes submitted, rejected, planned, and blocked orders.
+6. Telegram Alert is the notification channel; email is not used.
 
 Default risk settings live in `config/autopilot.json`:
 
@@ -101,7 +110,15 @@ Default risk settings live in `config/autopilot.json`:
 - `max_trade_usd`: dollar size for each paper order
 - `max_open_positions`: cap for planned open positions
 - `min_confidence`: minimum score before an order is planned
+- `scan_window_minutes`: short-window scan horizon, clamped to 1-30 minutes
+- `max_kelly_fraction`: cap on Kelly risk sizing
+- `min_probability`: minimum calibrated probability before an order is planned
+- `paper_trade_downtrend`: lets paper mode test small down-market probes; live mode still blocks downtrend buys
 - `allow_live`: must remain `false` until paper testing is stable
+
+Passive research can use public RSS/news by default and optional social feed templates from `.env`. Reddit RSS is opt-in with `BONEHAWK_REDDIT_RSS=true`; X/Twitter requires an allowed RSS/API bridge through `BONEHAWK_X_RSS_TEMPLATE`.
+
+The prediction agent will use an optional XGBoost model at `models/xgboost_short_window.json` when the `ml` extra is installed. Without that model, it uses the built-in transparent fallback.
 
 Live Alpaca autopilot is locked behind two gates: `mode=live` requires `LIVE_ALPACA_AUTOPILOT`, and `allow_live=true` requires `ALLOW_LIVE_ALPACA`.
 

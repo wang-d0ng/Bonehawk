@@ -75,6 +75,22 @@ def test_alpaca_client_snapshot_loads_account_summary() -> None:
     assert payload["buying_power"] == "1000"
 
 
+def test_alpaca_client_loads_open_positions() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://paper-api.alpaca.markets/v2/positions"
+        return httpx.Response(200, json=[{"symbol": "AAPL", "qty": "2", "avg_entry_price": "100"}])
+
+    client = AlpacaTradingClient(
+        AlpacaConfig(api_key="key", secret_key="secret", paper=True),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    payload = client.get_positions()
+
+    assert payload[0]["symbol"] == "AAPL"
+    assert payload[0]["qty"] == "2"
+
+
 def test_alpaca_client_snapshot_reports_account_error_safely() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, json={"message": "forbidden"})

@@ -8,9 +8,15 @@
   "max_open_positions": 3,
   "min_confidence": 55,
   "symbols_per_run": 40,
+  "scan_window_minutes": 15,
+  "max_kelly_fraction": 0.05,
+  "min_probability": 0.56,
+  "paper_trade_downtrend": true,
   "strategies": [
     "trend_following",
     "momentum_breakout",
+    "narrative_momentum",
+    "kelly_sizing",
     "risk_exit"
   ]
 }

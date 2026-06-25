@@ -13,11 +13,10 @@ def test_command_catalog_hides_argv_and_groups_commands() -> None:
     assert all("argv" not in command for command in payload["commands"])
 
 
-def test_run_command_validates_parameterized_inputs(tmp_path: Path) -> None:
-    payload = run_command(tmp_path, "robinhood-quote", inputs={"symbol": "BTC/USD"})
+def test_command_catalog_contains_current_cycle_commands() -> None:
+    ids = {command["id"] for command in command_catalog()["commands"]}
 
-    assert payload["ok"] is False
-    assert payload["status"] == "invalid_input"
+    assert {"paper-cycle", "paper-cycle-notify", "daily-loop"}.issubset(ids)
 
 
 def test_run_command_copy_creates_missing_target(tmp_path: Path) -> None:

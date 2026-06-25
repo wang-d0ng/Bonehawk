@@ -60,8 +60,8 @@ def market_universe_snapshot(path: Path, sample_limit: int = 120) -> dict[str, o
         "max_scan_symbols": max_scan_symbols,
         "sample_symbols": scan_symbols[:sample_limit],
         "execution": {
-            "robinhood_crypto_api": "stocks_not_supported",
-            "robinhood_agentic_mcp": "required_for_live_stock_orders",
+            "alpaca_trading_api": "stock_and_crypto_orders",
+            "alpaca_paper_trading": "default_order_path",
         },
     }
 
