@@ -626,6 +626,10 @@ def test_dashboard_service_background_autopilot_cycle_runs_scan_then_paper(tmp_p
     assert status["runs"] == 1
     assert status["paper_only"] is True
     assert status["last_result"]["execution"]["submitted"] == 1
+    assert status["last_result"]["display"]["orders"][0]["symbol"] == "MSFT"
+    assert status["last_result"]["display"]["executed"][0]["broker_order_id"] == "paper-loop-order"
+    assert status["last_result"]["display"]["background"]["scan_status"] == "scanned"
+    assert status["last_result"]["display"]["background"]["run_status"] == "submitted"
 
 
 def test_dashboard_service_background_autopilot_refuses_live_mode(tmp_path: Path) -> None:
@@ -956,6 +960,9 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "formatAutopilotOutput" in HTML
     assert "setAutopilotPaperDowntrend" in HTML
     assert "setAutopilotBackground" in HTML
+    assert "postBackgroundAutopilotResult" in HTML
+    assert "formatBackgroundAutopilotOutput" in HTML
+    assert "Background loop run" in HTML
     assert "10 seconds" in HTML
 
 

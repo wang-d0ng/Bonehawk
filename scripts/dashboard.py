@@ -298,6 +298,7 @@ class DashboardService:
                     "execution": _background_execution_summary(execution),
                     "message": "Background scan and paper execution cycle completed.",
                 }
+                result["display"] = _background_display_payload(scan, execution, result, self.autopilot())
         except Exception as error:
             result = {
                 "ok": False,
@@ -313,6 +314,8 @@ class DashboardService:
             with self._background_lock:
                 self._background_runs += 1
                 result["runs"] = self._background_runs
+                if isinstance(result.get("display"), dict):
+                    result["display"].setdefault("background", {})["runs"] = self._background_runs
                 self._background_last_finished_at = str(result.get("finished_at") or _utc_now())
                 self._background_last_error = str(result.get("error") or "")
                 self._background_last_result = result
@@ -1124,6 +1127,76 @@ def _background_execution_summary(execution: dict[str, Any]) -> dict[str, Any]:
         "message": summary.get("message") or execution.get("message") or execution.get("notice") or "",
         "order_ids": [str(item.get("broker_order_id")) for item in executed[:5] if item.get("broker_order_id")],
     }
+
+
+def _background_display_payload(scan: dict[str, Any], execution: dict[str, Any], result: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    source = execution or scan
+    execution_summary = execution.get("execution_summary") or {}
+    return {
+        "ok": bool(execution.get("ok")),
+        "status": execution.get("status", result.get("status", "unknown")),
+        "mode": execution.get("mode") or scan.get("mode") or "paper",
+        "config": source.get("config") or scan.get("config") or snapshot.get("config") or {},
+        "broker": snapshot.get("broker") or {},
+        "summary": source.get("summary") or scan.get("summary") or {},
+        "market_trend": source.get("market_trend") or scan.get("market_trend") or "unknown",
+        "agentic_scan": source.get("agentic_scan") or scan.get("agentic_scan") or {},
+        "orders": _compact_background_rows(source.get("orders") or scan.get("orders") or [], limit=12),
+        "blocked": _compact_background_rows(source.get("blocked") or scan.get("blocked") or [], limit=12),
+        "executed": _compact_background_rows(execution.get("executed") or [], limit=12),
+        "execution_summary": {
+            "submitted": execution_summary.get("submitted", result.get("execution", {}).get("submitted", 0)),
+            "rejected": execution_summary.get("rejected", result.get("execution", {}).get("rejected", 0)),
+            "planned": execution_summary.get("planned", result.get("execution", {}).get("planned", 0)),
+            "blocked": execution_summary.get("blocked", result.get("execution", {}).get("blocked", 0)),
+            "message": execution_summary.get("message", result.get("execution", {}).get("message", "")),
+        },
+        "data_sources": source.get("data_sources") or scan.get("data_sources") or {},
+        "telegram": source.get("telegram") or scan.get("telegram") or {},
+        "notice": source.get("notice") or scan.get("notice") or result.get("message", ""),
+        "background": {
+            "status": result.get("status", "unknown"),
+            "started_at": result.get("started_at", ""),
+            "finished_at": result.get("finished_at", ""),
+            "scan_status": result.get("scan", {}).get("status", "unknown"),
+            "run_status": result.get("execution", {}).get("status", "unknown"),
+            "scan_orders": result.get("scan", {}).get("orders", 0),
+            "submitted": result.get("execution", {}).get("submitted", 0),
+            "runs": result.get("runs", 0),
+        },
+    }
+
+
+def _compact_background_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    allowed = {
+        "symbol",
+        "side",
+        "action",
+        "current_price",
+        "confidence",
+        "probability_up",
+        "edge",
+        "expected_return_pct",
+        "notional",
+        "quantity_estimate",
+        "stop_loss",
+        "take_profit",
+        "kelly_fraction",
+        "reason",
+        "signals",
+        "status",
+        "broker_status",
+        "broker_order_id",
+        "fill_status",
+        "filled_quantity",
+        "filled_average_price",
+        "message",
+        "review_only",
+    }
+    compacted: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        compacted.append({key: value for key, value in row.items() if key in allowed})
+    return compacted
 
 
 HTML = """
@@ -2160,6 +2233,7 @@ HTML = """
     let chartPlotPoints = [];
     let pendingStockTicket = {symbol: '', side: 'BUY'};
     let setupDismissed = false;
+    let lastBackgroundRunRendered = 0;
     const ESSENTIAL_COMMAND_IDS = new Set(['telegram-test', 'telegram-autopilot-once', 'telegram-autopilot-loop', 'daily-loop', 'pytest']);
 
     async function getJson(url, options) {
@@ -2536,6 +2610,18 @@ HTML = """
         data.last_error ? `error ${data.last_error}` : ''
       ].filter(Boolean);
       detailNode.textContent = pieces.join(' · ');
+      postBackgroundAutopilotResult(data);
+    }
+    function postBackgroundAutopilotResult(data) {
+      const last = data.last_result || {};
+      const display = last.display || null;
+      const runNumber = Number(last.runs || data.runs || 0);
+      if (!display || !runNumber || runNumber === lastBackgroundRunRendered) return;
+      lastBackgroundRunRendered = runNumber;
+      renderAutopilotPlan(display);
+      document.getElementById('autopilot-output').textContent = formatBackgroundAutopilotOutput(last);
+      (display.executed || []).forEach(item => showOrderToast(item, 'Background paper order'));
+      setStatus(`Background loop posted run ${runNumber}: ${last.execution?.submitted || 0} paper order(s) submitted.`, last.ok ? 'ok' : 'muted');
     }
     function renderAutopilotAgents(data) {
       const agentic = data.agentic_scan || {};
@@ -2685,6 +2771,19 @@ HTML = """
         });
       }
       return lines.join('\\n');
+    }
+    function formatBackgroundAutopilotOutput(last) {
+      const display = last.display || {};
+      const scan = last.scan || {};
+      const execution = last.execution || {};
+      const header = [
+        `Background loop run #${last.runs || 0}`,
+        `Scan: ${scan.status || 'unknown'} · planned ${scan.orders ?? 0} · blocked ${scan.blocked ?? 0}`,
+        `Run Paper: ${execution.status || 'unknown'} · submitted ${execution.submitted ?? 0} · rejected ${execution.rejected ?? 0}`,
+        last.finished_at ? `Finished: ${last.finished_at}` : ''
+      ].filter(Boolean).join('\\n');
+      const detail = formatAutopilotOutput(display);
+      return `${header}\\n\\n${detail}`;
     }
     async function scanAutopilot() {
       await runAction('Scanning Alpaca autopilot setups...', async () => {
