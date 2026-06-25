@@ -124,6 +124,60 @@ class ProfitablePositionAlpacaClient(FakeAlpacaClient):
         ]
 
 
+class PartlyReservedPositionAlpacaClient(FakeAlpacaClient):
+    def get_positions(self) -> list[dict]:
+        return [
+            {
+                "symbol": "MSFT",
+                "qty": "2",
+                "qty_available": "1.25",
+                "avg_entry_price": "100",
+                "cost_basis": "200",
+                "current_price": "105",
+                "market_value": "210",
+                "unrealized_pl": "10",
+                "unrealized_plpc": "0.05",
+                "change_today": "0.01",
+            }
+        ]
+
+
+class HighPrecisionAvailablePositionAlpacaClient(FakeAlpacaClient):
+    def get_positions(self) -> list[dict]:
+        return [
+            {
+                "symbol": "MSFT",
+                "qty": "2",
+                "qty_available": "1.234567899",
+                "avg_entry_price": "100",
+                "cost_basis": "200",
+                "current_price": "105",
+                "market_value": "210",
+                "unrealized_pl": "10",
+                "unrealized_plpc": "0.05",
+                "change_today": "0.01",
+            }
+        ]
+
+
+class ReservedPositionAlpacaClient(FakeAlpacaClient):
+    def get_positions(self) -> list[dict]:
+        return [
+            {
+                "symbol": "MSFT",
+                "qty": "2",
+                "qty_available": "0",
+                "avg_entry_price": "100",
+                "cost_basis": "200",
+                "current_price": "105",
+                "market_value": "210",
+                "unrealized_pl": "10",
+                "unrealized_plpc": "0.05",
+                "change_today": "0.01",
+            }
+        ]
+
+
 class RejectingProfitablePositionAlpacaClient(ProfitablePositionAlpacaClient):
     def place_order(self, request, confirm: str = "") -> dict:
         self.orders.append((request, confirm))
@@ -185,6 +239,59 @@ def test_autopilot_profit_exit_sells_position_before_new_buys(tmp_path: Path) ->
     assert alpaca.orders[0][0].side == "sell"
     assert alpaca.orders[0][0].quantity == 2
     assert alpaca.orders[0][0].notional is None
+
+
+def test_autopilot_profit_exit_uses_qty_available_for_sell(tmp_path: Path) -> None:
+    alpaca = PartlyReservedPositionAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, scan_window_minutes=5),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=ProfitTakingQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["orders"][0]["quantity"] == 1.25
+    assert payload["orders"][0]["held_quantity"] == 2
+    assert payload["orders"][0]["available_quantity"] == 1.25
+    assert alpaca.orders[0][0].quantity == 1.25
+
+
+def test_autopilot_profit_exit_floors_qty_available_for_alpaca(tmp_path: Path) -> None:
+    alpaca = HighPrecisionAvailablePositionAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, scan_window_minutes=5),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=ProfitTakingQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["orders"][0]["available_quantity"] == 1.23456789
+    assert payload["orders"][0]["quantity"] == 1.23456789
+    assert alpaca.orders[0][0].quantity == 1.23456789
+
+
+def test_autopilot_profit_exit_blocks_when_qty_is_reserved(tmp_path: Path) -> None:
+    alpaca = ReservedPositionAlpacaClient()
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, scan_window_minutes=5),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=ProfitTakingQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["orders"] == []
+    assert payload["executed"] == []
+    assert any(item["status"] == "reserved" and item["symbol"] == "MSFT" for item in payload["blocked"])
+    assert alpaca.orders == []
 
 
 def test_autopilot_profit_exit_cooldown_blocks_duplicate_sell(tmp_path: Path) -> None:

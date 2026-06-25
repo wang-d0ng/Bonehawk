@@ -1180,6 +1180,8 @@ def _compact_background_rows(rows: list[dict[str, Any]], limit: int) -> list[dic
         "notional",
         "quantity",
         "quantity_estimate",
+        "held_quantity",
+        "available_quantity",
         "stop_loss",
         "take_profit",
         "kelly_fraction",
@@ -1197,6 +1199,7 @@ def _compact_background_rows(rows: list[dict[str, Any]], limit: int) -> list[dic
         "filled_quantity",
         "filled_average_price",
         "message",
+        "detail",
         "review_only",
     }
     compacted: list[dict[str, Any]] = []
@@ -2732,7 +2735,8 @@ HTML = """
           order.kelly_fraction ? `kelly ${(Number(order.kelly_fraction) * 100).toFixed(2)}%` : '',
           order.take_profit ? `target ${money(order.take_profit)}` : '',
           order.profit_target_pct !== undefined ? `profit target ${Number(order.profit_target_pct).toFixed(2)}%` : '',
-          order.unrealized_pnl_pct !== undefined ? `open ${Number(order.unrealized_pnl_pct).toFixed(2)}%` : ''
+          order.unrealized_pnl_pct !== undefined ? `open ${Number(order.unrealized_pnl_pct).toFixed(2)}%` : '',
+          order.held_quantity !== undefined ? `available ${Number(order.available_quantity || 0).toFixed(4)} / held ${Number(order.held_quantity || 0).toFixed(4)}` : ''
         ].filter(Boolean).join(' · ') || 'pass';
         return `
               <tr>

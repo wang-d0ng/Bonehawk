@@ -47,6 +47,8 @@ def _row(timestamp: str, source: str, idea: dict[str, Any]) -> dict[str, Any]:
         "status": idea.get("status"),
         "broker_status": idea.get("broker_status"),
         "broker_order_id": idea.get("broker_order_id"),
+        "detail": idea.get("detail"),
+        "request_id": idea.get("request_id"),
         "filled_quantity": idea.get("filled_quantity"),
         "filled_average_price": idea.get("filled_average_price"),
         "fill_status": idea.get("fill_status"),

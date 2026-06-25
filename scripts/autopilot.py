@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 
@@ -473,6 +474,8 @@ def _normalize_alpaca_position(row: dict[str, Any]) -> dict[str, Any] | None:
     quantity = abs(_safe_float(row.get("qty")))
     if not symbol or quantity < 0.000001:
         return None
+    raw_available = row.get("qty_available")
+    available_quantity = abs(_safe_float(raw_available, quantity)) if raw_available not in {None, ""} else quantity
     cost_basis = _safe_float(row.get("avg_entry_price"))
     current_price = _safe_float(row.get("current_price"), cost_basis)
     cost_value = _safe_float(row.get("cost_basis"), quantity * cost_basis)
@@ -483,6 +486,7 @@ def _normalize_alpaca_position(row: dict[str, Any]) -> dict[str, Any] | None:
     return {
         "symbol": symbol,
         "quantity": quantity,
+        "available_quantity": min(quantity, available_quantity),
         "cost_basis": cost_basis,
         "current_price": current_price,
         "market_value": market_value,
@@ -502,6 +506,7 @@ def _normalize_watchlist_position(position: Position) -> dict[str, Any]:
     return {
         "symbol": position.symbol.upper(),
         "quantity": quantity,
+        "available_quantity": quantity,
         "cost_basis": cost_basis,
         "current_price": cost_basis,
         "market_value": quantity * cost_basis,
@@ -527,14 +532,17 @@ def _build_exit_candidates(
     candidates: list[dict[str, Any]] = []
     for position in open_positions:
         symbol = str(position.get("symbol") or "").upper()
-        quantity = _safe_float(position.get("quantity"))
-        if not symbol or quantity < 0.000001:
+        held_quantity = _safe_float(position.get("quantity"))
+        available_quantity = _safe_float(position.get("available_quantity"), held_quantity)
+        safe_available_quantity = _floor_quantity(min(held_quantity, available_quantity))
+        if not symbol or held_quantity < 0.000001:
             continue
         quote = quotes.get(symbol)
         current_price = quote.price if quote else _safe_float(position.get("current_price"), _safe_float(position.get("cost_basis")))
         cost_basis = _safe_float(position.get("cost_basis"))
-        cost_value = quantity * cost_basis
-        market_value = quantity * current_price
+        cost_value = held_quantity * cost_basis
+        market_value = held_quantity * current_price
+        available_notional = safe_available_quantity * current_price
         unrealized_pnl = market_value - cost_value
         unrealized_pnl_pct = (unrealized_pnl / cost_value) * 100 if cost_value else _safe_float(position.get("unrealized_pnl_pct"))
         symbol_technicals = technicals.get(symbol, {})
@@ -547,6 +555,7 @@ def _build_exit_candidates(
             f"prob {probability_up * 100:.1f}%",
             f"window {config.scan_window_minutes}m",
             f"market {market_trend.lower()}",
+            f"available {safe_available_quantity:.8f}/{held_quantity:.8f}",
         ]
         if symbol_technicals:
             signals.extend(
@@ -556,12 +565,17 @@ def _build_exit_candidates(
                 ]
             )
         if unrealized_pnl_pct >= profit_target_pct:
+            if safe_available_quantity < 0.000001:
+                candidates.append(_reserved_exit_block(position, symbol, current_price, market_value, unrealized_pnl, unrealized_pnl_pct, profit_target_pct, stop_exit_pct, probability_up, signals, config))
+                continue
             candidates.append(
                 _exit_order(
                     symbol=symbol,
-                    quantity=quantity,
+                    quantity=safe_available_quantity,
+                    held_quantity=held_quantity,
+                    available_quantity=safe_available_quantity,
                     current_price=current_price,
-                    notional=market_value,
+                    notional=available_notional,
                     action="AUTO_SELL_PROFIT_TAKE",
                     confidence=_exit_confidence(unrealized_pnl_pct, profit_target_pct, probability_up),
                     probability_up=probability_up,
@@ -576,12 +590,17 @@ def _build_exit_candidates(
             )
             continue
         if unrealized_pnl_pct <= -abs(stop_exit_pct):
+            if safe_available_quantity < 0.000001:
+                candidates.append(_reserved_exit_block(position, symbol, current_price, market_value, unrealized_pnl, unrealized_pnl_pct, profit_target_pct, stop_exit_pct, probability_up, signals, config))
+                continue
             candidates.append(
                 _exit_order(
                     symbol=symbol,
-                    quantity=quantity,
+                    quantity=safe_available_quantity,
+                    held_quantity=held_quantity,
+                    available_quantity=safe_available_quantity,
                     current_price=current_price,
-                    notional=market_value,
+                    notional=available_notional,
                     action="AUTO_SELL_RISK_EXIT",
                     confidence=92,
                     probability_up=probability_up,
@@ -602,9 +621,11 @@ def _build_exit_candidates(
                 "action": "HOLD_POSITION",
                 "confidence": _exit_confidence(unrealized_pnl_pct, profit_target_pct, probability_up),
                 "current_price": round(current_price, 4),
-                "quantity": round(quantity, 6),
-                "quantity_estimate": round(quantity, 6),
-                "notional": round(market_value, 2),
+                "quantity": safe_available_quantity,
+                "quantity_estimate": safe_available_quantity,
+                "held_quantity": round(held_quantity, 6),
+                "available_quantity": safe_available_quantity,
+                "notional": round(available_notional, 2),
                 "probability_up": round(probability_up, 4),
                 "unrealized_pnl": round(unrealized_pnl, 2),
                 "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
@@ -625,6 +646,8 @@ def _exit_order(
     *,
     symbol: str,
     quantity: float,
+    held_quantity: float,
+    available_quantity: float,
     current_price: float,
     notional: float,
     action: str,
@@ -638,14 +661,18 @@ def _exit_order(
     signals: list[str],
     config: AutopilotConfig,
 ) -> dict[str, Any]:
+    safe_quantity = _floor_quantity(quantity)
+    safe_available_quantity = _floor_quantity(available_quantity)
     return {
         "symbol": symbol,
         "side": "sell",
         "action": action,
         "confidence": confidence,
         "current_price": round(current_price, 4),
-        "quantity": round(quantity, 6),
-        "quantity_estimate": round(quantity, 6),
+        "quantity": safe_quantity,
+        "quantity_estimate": safe_quantity,
+        "held_quantity": round(held_quantity, 6),
+        "available_quantity": safe_available_quantity,
         "notional": round(notional, 2),
         "probability_up": round(probability_up, 4),
         "edge_pct": round(max(0, unrealized_pnl_pct - profit_target_pct), 4),
@@ -658,6 +685,46 @@ def _exit_order(
         "source": "autopilot_exit",
         "sizing_method": "close_position_quantity",
         "reason": reason,
+        "signals": signals,
+        "review_only": True,
+    }
+
+
+def _reserved_exit_block(
+    position: dict[str, Any],
+    symbol: str,
+    current_price: float,
+    market_value: float,
+    unrealized_pnl: float,
+    unrealized_pnl_pct: float,
+    profit_target_pct: float,
+    stop_exit_pct: float,
+    probability_up: float,
+    signals: list[str],
+    config: AutopilotConfig,
+) -> dict[str, Any]:
+    held_quantity = _safe_float(position.get("quantity"))
+    return {
+        "symbol": symbol,
+        "side": "sell",
+        "action": "EXIT_RESERVED",
+        "confidence": _exit_confidence(unrealized_pnl_pct, profit_target_pct, probability_up),
+        "current_price": round(current_price, 4),
+        "quantity": 0,
+        "quantity_estimate": 0,
+        "held_quantity": round(held_quantity, 6),
+        "available_quantity": 0,
+        "notional": 0,
+        "probability_up": round(probability_up, 4),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+        "profit_target_pct": round(profit_target_pct, 2),
+        "stop_exit_pct": round(stop_exit_pct, 2),
+        "exit_window_minutes": config.scan_window_minutes,
+        "status": "reserved",
+        "source": "autopilot_exit",
+        "sizing_method": "qty_available_guard",
+        "reason": "Alpaca reports zero shares available; existing open orders may already reserve this position.",
         "signals": signals,
         "review_only": True,
     }
@@ -857,6 +924,8 @@ def _decision_from_execution(item: dict[str, Any]) -> dict[str, Any]:
         "broker_status": item.get("broker_status"),
         "broker_order_id": item.get("broker_order_id"),
         "quantity": item.get("quantity"),
+        "detail": item.get("detail"),
+        "request_id": item.get("request_id"),
         "filled_quantity": item.get("filled_quantity"),
         "filled_average_price": item.get("filled_average_price"),
         "fill_status": item.get("fill_status"),
@@ -894,3 +963,14 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _floor_quantity(value: Any, precision: int = 8) -> float:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        number = Decimal("0")
+    if number <= 0:
+        return 0.0
+    quantum = Decimal("1").scaleb(-precision)
+    return float(number.quantize(quantum, rounding=ROUND_DOWN))
