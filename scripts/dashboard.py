@@ -5,6 +5,8 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +30,7 @@ from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfo
 from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
 
 UI_THEME_VALUES = {"retro", "clean", "arcade", "classic", "algo-desk"}
+BACKGROUND_AUTOPILOT_INTERVAL_SECONDS = 10
 SETUP_SECRET_KEYS = {
     "ALPACA_API_KEY",
     "ALPACA_SECRET_KEY",
@@ -57,6 +60,16 @@ class DashboardService:
         self.quote_client = quote_client or getattr(self.intel_client, "quote_client", YahooQuoteClient())
         self.codex_config_path = codex_config_path
         self.alpaca_client = alpaca_client
+        self._background_lock = threading.RLock()
+        self._background_cycle_lock = threading.Lock()
+        self._background_stop = threading.Event()
+        self._background_thread: threading.Thread | None = None
+        self._background_runs = 0
+        self._background_last_result: dict[str, Any] | None = None
+        self._background_last_error = ""
+        self._background_started_at = ""
+        self._background_last_started_at = ""
+        self._background_last_finished_at = ""
 
     def status(self) -> dict[str, Any]:
         env = _read_env_presence(self.root / ".env")
@@ -196,6 +209,121 @@ class DashboardService:
 
     def autopilot_execute(self, confirm: str = "") -> dict[str, Any]:
         return self._with_autopilot_channels(self._autopilot_engine().execute(self._autopilot_watchlist(), confirm=confirm))
+
+    def autopilot_background_status(self) -> dict[str, Any]:
+        with self._background_lock:
+            running = bool(self._background_thread and self._background_thread.is_alive() and not self._background_stop.is_set())
+            return {
+                "ok": True,
+                "status": "running" if running else "stopped",
+                "enabled": running,
+                "running": running,
+                "paper_only": True,
+                "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
+                "runs": self._background_runs,
+                "in_cycle": self._background_cycle_lock.locked(),
+                "started_at": self._background_started_at,
+                "last_started_at": self._background_last_started_at,
+                "last_finished_at": self._background_last_finished_at,
+                "last_error": self._background_last_error,
+                "last_result": self._background_last_result,
+                "message": "Background autopilot scans and runs paper execution every 10 seconds while Bonehawk is open.",
+            }
+
+    def start_autopilot_background(self) -> dict[str, Any]:
+        with self._background_lock:
+            if self._background_thread and self._background_thread.is_alive() and not self._background_stop.is_set():
+                return {**self.autopilot_background_status(), "status": "already_running"}
+            self._background_stop.clear()
+            self._background_started_at = _utc_now()
+            self._background_thread = threading.Thread(target=self._autopilot_background_loop, name="bonehawk-autopilot-background", daemon=True)
+            self._background_thread.start()
+            return {**self.autopilot_background_status(), "status": "started"}
+
+    def stop_autopilot_background(self) -> dict[str, Any]:
+        with self._background_lock:
+            self._background_stop.set()
+            thread = self._background_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1)
+        return {**self.autopilot_background_status(), "status": "stopped"}
+
+    def run_autopilot_background_cycle(self) -> dict[str, Any]:
+        if not self._background_cycle_lock.acquire(blocking=False):
+            payload = {
+                "ok": False,
+                "status": "cycle_already_running",
+                "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
+                "paper_only": True,
+                "message": "Previous background paper cycle is still running.",
+            }
+            with self._background_lock:
+                self._background_last_result = payload
+            return payload
+
+        started_at = _utc_now()
+        result: dict[str, Any]
+        try:
+            with self._background_lock:
+                self._background_last_started_at = started_at
+                self._background_last_error = ""
+            config = load_autopilot_config(self.root / "config" / "autopilot.json")
+            if config.mode != "paper":
+                result = {
+                    "ok": False,
+                    "status": "paper_only",
+                    "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
+                    "paper_only": True,
+                    "message": "Background autopilot is paper-only and will not run while autopilot is in live mode.",
+                }
+            elif not config.enabled:
+                result = {
+                    "ok": False,
+                    "status": "disabled",
+                    "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
+                    "paper_only": True,
+                    "message": "Autopilot is disabled in config/autopilot.json.",
+                }
+            else:
+                scan = self.autopilot_scan()
+                execution = self.autopilot_execute(confirm="")
+                result = {
+                    "ok": True,
+                    "status": "cycle_completed",
+                    "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
+                    "paper_only": True,
+                    "started_at": started_at,
+                    "finished_at": _utc_now(),
+                    "scan": _background_scan_summary(scan),
+                    "execution": _background_execution_summary(execution),
+                    "message": "Background scan and paper execution cycle completed.",
+                }
+        except Exception as error:
+            result = {
+                "ok": False,
+                "status": "cycle_failed",
+                "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
+                "paper_only": True,
+                "started_at": started_at,
+                "finished_at": _utc_now(),
+                "message": "Background paper cycle failed.",
+                "error": str(error),
+            }
+        finally:
+            with self._background_lock:
+                self._background_runs += 1
+                result["runs"] = self._background_runs
+                self._background_last_finished_at = str(result.get("finished_at") or _utc_now())
+                self._background_last_error = str(result.get("error") or "")
+                self._background_last_result = result
+            self._background_cycle_lock.release()
+        return result
+
+    def _autopilot_background_loop(self) -> None:
+        while not self._background_stop.is_set():
+            self.run_autopilot_background_cycle()
+            if self._background_stop.wait(BACKGROUND_AUTOPILOT_INTERVAL_SECONDS):
+                break
 
     def set_autopilot_setting(self, setting: Any, value: Any, confirm: str = "") -> dict[str, Any]:
         path = self.root / "config" / "autopilot.json"
@@ -582,6 +710,8 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 self._send(*json_response(service.portfolio_sync()))
             elif path == "/api/autopilot":
                 self._send(*json_response(service.autopilot()))
+            elif path == "/api/autopilot-background":
+                self._send(*json_response(service.autopilot_background_status()))
             elif path == "/api/stocks":
                 self._send(*json_response(service.stocks()))
             elif path == "/api/scanner":
@@ -632,6 +762,15 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 result = service.autopilot_execute(confirm=str(payload.get("confirm", "")))
                 status = 200 if result.get("ok") else 409 if result.get("status") in {"disabled", "confirmation_required"} else 400
                 self._send(*json_response(result, status=status))
+            elif self.path == "/api/autopilot-background":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                enabled = str(payload.get("enabled", "")).strip().lower() in {"1", "true", "yes", "on"}
+                result = service.start_autopilot_background() if enabled else service.stop_autopilot_background()
+                self._send(*json_response(result))
             elif self.path == "/api/trading-mode":
                 try:
                     payload = self._read_json_body()
@@ -718,6 +857,18 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
             return payload
 
     return Handler
+
+
+class DashboardHTTPServer(ThreadingHTTPServer):
+    def __init__(self, server_address: tuple[str, int], service: DashboardService, *, start_background: bool = False) -> None:
+        self.service = service
+        super().__init__(server_address, make_handler(service))
+        if start_background:
+            self.service.start_autopilot_background()
+
+    def server_close(self) -> None:
+        self.service.stop_autopilot_background()
+        super().server_close()
 
 
 def _read_env_presence(path: Path) -> dict[str, str]:
@@ -936,6 +1087,43 @@ def _stock_order_request(symbol: Any, side: Any, quantity: Any) -> StockOrderTic
     if normalized_quantity <= 0 or normalized_quantity > 1_000_000:
         return {"ok": False, "status": "invalid_quantity", "message": "Quantity must be greater than 0."}
     return StockOrderTicket(symbol=normalized_symbol, side=normalized_side, quantity=normalized_quantity)
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _background_scan_summary(scan: dict[str, Any]) -> dict[str, Any]:
+    orders = scan.get("orders") or []
+    blocked = scan.get("blocked") or []
+    summary = scan.get("summary") or {}
+    return {
+        "ok": bool(scan.get("ok")),
+        "status": scan.get("status", "unknown"),
+        "orders": len(orders),
+        "blocked": len(blocked),
+        "symbols_scanned": summary.get("symbols_scanned", 0),
+        "top_symbols": [str(item.get("symbol", "")).upper() for item in orders[:5] if item.get("symbol")],
+    }
+
+
+def _background_execution_summary(execution: dict[str, Any]) -> dict[str, Any]:
+    executed = execution.get("executed") or []
+    blocked = execution.get("blocked") or []
+    orders = execution.get("orders") or []
+    summary = execution.get("execution_summary") or {}
+    submitted = int(summary.get("submitted") or len([item for item in executed if item.get("ok")]))
+    rejected = int(summary.get("rejected") or len([item for item in executed if not item.get("ok")]))
+    return {
+        "ok": bool(execution.get("ok")),
+        "status": execution.get("status", "unknown"),
+        "submitted": submitted,
+        "rejected": rejected,
+        "planned": int(summary.get("planned") or len(orders)),
+        "blocked": int(summary.get("blocked") or len(blocked)),
+        "message": summary.get("message") or execution.get("message") or execution.get("notice") or "",
+        "order_ids": [str(item.get("broker_order_id")) for item in executed[:5] if item.get("broker_order_id")],
+    }
 
 
 HTML = """
@@ -1502,6 +1690,8 @@ HTML = """
     .command-actions { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
     .command-card button { min-width: 82px; }
     .tabs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .loop-strip { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+    .loop-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; align-items: center; }
     .agent-grid, .pipeline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .agent-node { min-height: 128px; padding: 11px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.38); display: grid; gap: 8px; align-content: start; }
     .agent-node h2 { color: var(--ink); font-weight: 650; }
@@ -1662,6 +1852,17 @@ HTML = """
           </div>
           <div id="autopilot-panel" class="overview-compact">
             <div id="autopilot-metrics" class="metric-grid"></div>
+            <div class="panel-block loop-strip">
+              <div>
+                <h2>Background Paper Loop</h2>
+                <div id="autopilot-background-detail" class="panel-sub">Auto-runs Scan + Run Paper every 10 seconds while Bonehawk is open. Paper mode only.</div>
+              </div>
+              <div class="loop-actions">
+                <span id="autopilot-background-status" class="pill trim">Starting</span>
+                <button data-action onclick="setAutopilotBackground(true)">Start</button>
+                <button data-action onclick="setAutopilotBackground(false)">Stop</button>
+              </div>
+            </div>
             <div class="desk-grid">
               <div class="panel-block">
                 <div class="section-head">
@@ -2203,13 +2404,14 @@ HTML = """
     }
     async function refreshIntel() {
       setStatus('Refreshing market data...', 'muted');
-      const [data, trades, growth, sync, logs, tickets, stocks, autopilot] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/stocks'), getJson('/api/autopilot')]);
+      const [data, trades, growth, sync, logs, tickets, stocks, autopilot, background] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/stocks'), getJson('/api/autopilot'), getJson('/api/autopilot-background')]);
       renderPortfolio(data, trades, sync);
       renderTicker(trades);
       renderTradeIdeas(trades);
       renderGrowthCandidates(growth);
       renderStocks(stocks);
       renderAutopilot(autopilot);
+      renderAutopilotBackground(background);
       renderAutopilotSettings(autopilot);
       renderScanner(trades, data);
       renderNews(data);
@@ -2313,6 +2515,27 @@ HTML = """
       document.getElementById('autopilot-orders').innerHTML = empty('Run Scan to build a fresh paper plan.');
       renderRiskGuard(data);
       renderAutopilotAgents(data);
+    }
+    function renderAutopilotBackground(data) {
+      const statusNode = document.getElementById('autopilot-background-status');
+      const detailNode = document.getElementById('autopilot-background-detail');
+      if (!statusNode || !detailNode) return;
+      const running = Boolean(data.running || data.enabled);
+      const last = data.last_result || {};
+      const scan = last.scan || {};
+      const execution = last.execution || {};
+      const statusText = running ? 'Running' : 'Stopped';
+      statusNode.textContent = statusText;
+      statusNode.className = `pill ${running ? 'buy' : 'trim'}`;
+      const pieces = [
+        running ? `Auto-runs Scan + Run Paper every ${data.interval_seconds || 10} seconds.` : 'Background paper loop is stopped.',
+        `Runs: ${data.runs || 0}`,
+        last.status ? `Last: ${last.status}` : '',
+        scan.orders !== undefined ? `planned ${scan.orders}` : '',
+        execution.submitted !== undefined ? `submitted ${execution.submitted}` : '',
+        data.last_error ? `error ${data.last_error}` : ''
+      ].filter(Boolean);
+      detailNode.textContent = pieces.join(' · ');
     }
     function renderAutopilotAgents(data) {
       const agentic = data.agentic_scan || {};
@@ -2485,6 +2708,25 @@ HTML = """
         setStatus(data.ok ? 'Autopilot paper execution submitted.' : data.message || data.status || 'Autopilot did not submit orders.', data.ok ? 'ok' : 'error');
         await refreshTickets();
       }, true, false);
+    }
+    async function setAutopilotBackground(enabled) {
+      await runAction(enabled ? 'Starting background paper loop...' : 'Stopping background paper loop...', async () => {
+        const data = await getJson('/api/autopilot-background', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({enabled})
+        });
+        renderAutopilotBackground(data);
+        setStatus(enabled ? 'Background paper loop is running every 10 seconds.' : 'Background paper loop stopped.', data.running ? 'ok' : 'muted');
+      }, false, false);
+    }
+    async function refreshAutopilotBackgroundStatus() {
+      try {
+        const data = await getJson('/api/autopilot-background');
+        renderAutopilotBackground(data);
+      } catch {
+        return;
+      }
     }
     function renderScanner(trades, data) {
       document.getElementById('scanner').innerHTML = (trades.scans || []).map(scan => {
@@ -3048,6 +3290,7 @@ HTML = """
     }
     initSidebar();
     refreshAll();
+    window.setInterval(refreshAutopilotBackgroundStatus, 10000);
   </script>
 </body>
 </html>
@@ -3060,9 +3303,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(DashboardService()))
+    server = DashboardHTTPServer((args.host, args.port), DashboardService(), start_background=True)
     print(f"Dashboard running at http://{args.host}:{args.port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

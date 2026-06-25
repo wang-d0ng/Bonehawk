@@ -139,6 +139,8 @@ Passive research can use public RSS/news by default and optional social feed tem
 
 The prediction agent will use an optional XGBoost model at `models/xgboost_short_window.json` when the `ml` extra is installed. Without that model, it uses the built-in transparent fallback.
 
+When Bonehawk is open, the background paper loop auto-runs Scan + Run Paper every 10 seconds. This loop is paper-only, has Start/Stop controls in the AI Desk, and refuses to run if autopilot is switched to live mode.
+
 Live Alpaca autopilot is locked behind two gates: `mode=live` requires `LIVE_ALPACA_AUTOPILOT`, and `allow_live=true` requires `ALLOW_LIVE_ALPACA`.
 
 ## Desktop App

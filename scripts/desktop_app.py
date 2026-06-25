@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.dashboard import DashboardService, make_handler
+from scripts.dashboard import DashboardHTTPServer, DashboardService
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,7 @@ class DesktopAppConfig:
     width: int = 1440
     height: int = 960
     browser_fallback: bool = False
+    autopilot_background: bool = True
 
 
 def build_desktop_url(port: int, host: str = "127.0.0.1") -> str:
@@ -51,7 +52,11 @@ def resolve_project_root() -> Path:
 
 
 def start_dashboard_server(config: DesktopAppConfig) -> tuple[ThreadingHTTPServer, threading.Thread]:
-    server = ThreadingHTTPServer((config.host, config.port), make_handler(DashboardService(root=config.root)))
+    server = DashboardHTTPServer(
+        (config.host, config.port),
+        DashboardService(root=config.root),
+        start_background=config.autopilot_background,
+    )
     thread = threading.Thread(target=server.serve_forever, name="bonehawk-dashboard", daemon=True)
     thread.start()
     return server, thread
@@ -92,6 +97,7 @@ def _start_with_available_port(config: DesktopAppConfig) -> tuple[ThreadingHTTPS
             width=config.width,
             height=config.height,
             browser_fallback=config.browser_fallback,
+            autopilot_background=config.autopilot_background,
         )
         return start_dashboard_server(fallback)
 

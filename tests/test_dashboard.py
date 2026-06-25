@@ -7,7 +7,7 @@ from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from scripts.dashboard import DashboardService, HTML, json_response, make_handler
+from scripts.dashboard import BACKGROUND_AUTOPILOT_INTERVAL_SECONDS, DashboardService, HTML, json_response, make_handler
 from scripts.decision_log import record_decisions
 from scripts.market_intel import Watchlist
 
@@ -121,6 +121,28 @@ class FakeBrokenConfiguredAlpacaClient:
 
     def get_account(self):
         raise RuntimeError("bad key")
+
+
+class FakeBackgroundDashboardService(DashboardService):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root=root, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
+        self.background_calls = []
+
+    def autopilot_scan(self) -> dict:
+        self.background_calls.append("scan")
+        return {"ok": True, "status": "scanned", "orders": [{"symbol": "MSFT"}], "blocked": []}
+
+    def autopilot_execute(self, confirm: str = "") -> dict:
+        self.background_calls.append(f"run:{confirm}")
+        return {
+            "ok": True,
+            "status": "submitted",
+            "mode": "paper",
+            "orders": [{"symbol": "MSFT"}],
+            "blocked": [],
+            "executed": [{"ok": True, "symbol": "MSFT", "broker_order_id": "paper-loop-order"}],
+            "execution_summary": {"submitted": 1, "rejected": 0, "planned": 1, "blocked": 0, "message": "Submitted."},
+        }
 
 
 def test_json_response_encodes_payload() -> None:
@@ -585,6 +607,41 @@ def test_dashboard_service_autopilot_scan_and_execute_paper_order(tmp_path: Path
     assert (tmp_path / "logs" / "decision_log.jsonl").exists()
 
 
+def test_dashboard_service_background_autopilot_cycle_runs_scan_then_paper(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper"}))
+    service = FakeBackgroundDashboardService(root=tmp_path)
+
+    payload = service.run_autopilot_background_cycle()
+    status = service.autopilot_background_status()
+
+    assert payload["ok"] is True
+    assert payload["status"] == "cycle_completed"
+    assert payload["interval_seconds"] == BACKGROUND_AUTOPILOT_INTERVAL_SECONDS
+    assert payload["scan"]["status"] == "scanned"
+    assert payload["execution"]["status"] == "submitted"
+    assert payload["execution"]["submitted"] == 1
+    assert service.background_calls == ["scan", "run:"]
+    assert status["runs"] == 1
+    assert status["paper_only"] is True
+    assert status["last_result"]["execution"]["submitted"] == 1
+
+
+def test_dashboard_service_background_autopilot_refuses_live_mode(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "live", "allow_live": True}))
+    service = FakeBackgroundDashboardService(root=tmp_path)
+
+    payload = service.run_autopilot_background_cycle()
+
+    assert payload["ok"] is False
+    assert payload["status"] == "paper_only"
+    assert "paper" in payload["message"].lower()
+    assert service.background_calls == []
+
+
 def test_dashboard_service_autopilot_uses_alpaca_positions_not_watchlist_positions(tmp_path: Path) -> None:
     config = tmp_path / "config"
     config.mkdir()
@@ -747,6 +804,26 @@ def test_dashboard_handler_serves_post_routes(tmp_path: Path) -> None:
     assert json.loads(bad_body)["status"] == "bad_request"
 
 
+def test_dashboard_handler_serves_autopilot_background_routes(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper"}))
+    service = FakeBackgroundDashboardService(root=tmp_path)
+    handler = make_handler(service)
+
+    status_code, status_body = _http_request(handler, "GET", "/api/autopilot-background")
+    stop_code, stop_body = _http_request(handler, "POST", "/api/autopilot-background", {"enabled": False})
+    start_code, start_body = _http_request(handler, "POST", "/api/autopilot-background", {"enabled": True})
+    service.stop_autopilot_background()
+
+    assert status_code == 200
+    assert json.loads(status_body)["interval_seconds"] == BACKGROUND_AUTOPILOT_INTERVAL_SECONDS
+    assert stop_code == 200
+    assert json.loads(stop_body)["status"] == "stopped"
+    assert start_code == 200
+    assert json.loads(start_body)["status"] in {"started", "already_running"}
+
+
 def test_json_response_supports_custom_status() -> None:
     status, _headers, body = json_response({"error": "nope"}, status=404)
 
@@ -844,9 +921,12 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert 'id="autopilot-panel"' in HTML
     assert 'id="autopilot-settings"' in HTML
     assert 'id="autopilot-output"' in HTML
+    assert 'id="autopilot-background-status"' in HTML
+    assert 'id="autopilot-background-detail"' in HTML
     assert "/api/autopilot" in HTML
     assert "/api/autopilot-scan" in HTML
     assert "/api/autopilot-run" in HTML
+    assert "/api/autopilot-background" in HTML
     assert "/api/autopilot-settings" in HTML
     assert "/api/stocks" in HTML
     assert "renderTradeIdeas" in HTML
@@ -875,6 +955,8 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "Telegram Alert" in HTML
     assert "formatAutopilotOutput" in HTML
     assert "setAutopilotPaperDowntrend" in HTML
+    assert "setAutopilotBackground" in HTML
+    assert "10 seconds" in HTML
 
 
 def _http_request(handler, method: str, path: str, payload: dict | None = None, raw: str | None = None) -> tuple[int, str]:
