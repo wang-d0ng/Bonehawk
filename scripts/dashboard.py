@@ -1669,6 +1669,7 @@ HTML = """
     .tab-panel.active { display: grid; gap: 14px; }
     .overview-flow { display: grid; gap: 16px; }
     .overview-compact { display: grid; gap: 14px; }
+    .risk-news-rail { display: grid; gap: 14px; align-content: start; }
     .overview-actions { justify-content: flex-start; }
     .section-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
     .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -2034,21 +2035,19 @@ HTML = """
                 <h2>Market Scanner</h2>
                 <div id="scanner" class="data-list"></div>
               </div>
-              <div class="panel-block">
-                <h2>Risk Flags</h2>
-                <div id="risk" class="data-list"></div>
-              </div>
-            </div>
-          </div>
-          <div id="news-panel" class="overview-compact">
-            <div class="two-col">
-              <div class="panel-block">
-                <h2>News</h2>
-                <div id="news" class="data-list"></div>
-              </div>
-              <div class="panel-block">
-                <h2>Insider Filings</h2>
-                <div id="insiders" class="data-list"></div>
+              <div id="risk-news-rail" class="risk-news-rail">
+                <div class="panel-block">
+                  <h2>Risk Flags</h2>
+                  <div id="risk" class="data-list"></div>
+                </div>
+                <div id="news-panel" class="panel-block">
+                  <h2>News</h2>
+                  <div id="news" class="data-list"></div>
+                </div>
+                <div class="panel-block">
+                  <h2>Insider Filings</h2>
+                  <div id="insiders" class="data-list"></div>
+                </div>
               </div>
             </div>
           </div>

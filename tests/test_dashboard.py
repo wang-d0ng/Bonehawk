@@ -974,6 +974,15 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "10 seconds" in HTML
 
 
+def test_dashboard_overview_places_news_and_insiders_under_risk_flags() -> None:
+    right_rail_start = HTML.index('id="risk-news-rail"')
+    risk_index = HTML.index("<h2>Risk Flags</h2>", right_rail_start)
+    news_index = HTML.index('id="news-panel"', risk_index)
+    insider_index = HTML.index("<h2>Insider Filings</h2>", news_index)
+
+    assert right_rail_start < risk_index < news_index < insider_index
+
+
 def _http_request(handler, method: str, path: str, payload: dict | None = None, raw: str | None = None) -> tuple[int, str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
