@@ -111,13 +111,13 @@ Order responses appear as top-right notifications and are logged in the Tickets 
 
 ## Alpaca Autopilot
 
-The Autopilot tab scans the broader stock universe, builds trade candidates from scanner/news, optional social feeds, momentum, volume, RSI, and SPY/QQQ trend checks, then applies capped Kelly sizing before creating paper orders.
+The Overview tab shows portfolio, scanner, news, risk flags, and Alpaca autopilot state in one place. Autopilot scans the broader stock universe, builds trade candidates from scanner/news, optional social feeds, momentum, volume, RSI, and SPY/QQQ trend checks, then sizes paper orders from available Alpaca cash, stock price, calibrated probability, edge, and stop distance.
 
 Autopilot flow:
 
 1. News and social research feeds go into Agent 1: Sentiment.
 2. Alpaca account/order data and quote history go into Agent 2: Technical.
-3. Agent 3: Portfolio Manager combines sentiment, technical probability, open positions, and capped Kelly sizing.
+3. Agent 3: Portfolio Manager combines sentiment, technical probability, open positions, available cash, stock price, and dynamic Kelly-style risk sizing.
 4. Agent 4: Executor submits eligible paper orders through Alpaca and records broker status/order IDs.
 5. Performance Report summarizes submitted, rejected, planned, and blocked orders.
 6. Telegram Alert is the notification channel; email is not used.
@@ -126,12 +126,12 @@ Default risk settings live in `config/autopilot.json`:
 
 - `enabled`: whether Run Paper can submit paper orders
 - `mode`: `paper` by default
-- `max_trade_usd`: dollar size for each paper order
+- `max_trade_usd`: legacy fallback only; dynamic sizing does not use it as the trade decision
 - `max_open_positions`: cap for planned open positions
-- `min_confidence`: minimum score before an order is planned
+- `min_confidence`: safety gate before an order is planned
 - `scan_window_minutes`: short-window scan horizon, clamped to 1-30 minutes
-- `max_kelly_fraction`: cap on Kelly risk sizing
-- `min_probability`: minimum calibrated probability before an order is planned
+- `max_kelly_fraction`: safety ceiling; the bot still chooses the actual fraction from account and market data
+- `min_probability`: safety gate for calibrated probability before an order is planned
 - `paper_trade_downtrend`: lets paper mode test small down-market probes; live mode still blocks downtrend buys
 - `allow_live`: must remain `false` until paper testing is stable
 
@@ -157,12 +157,13 @@ python scripts/build_desktop_app.py
 
 The build output is `dist/Bonehawk.app`. The desktop app icon lives at `assets/app_icon.png`, with the macOS bundle icon generated at `assets/app_icon.icns`.
 
-## Command Center
+## Settings Commands
 
-The dashboard Command Center exposes setup, scanner, Telegram, paper cycle, desktop, daily alert, and test commands as buttons. It uses an allowlist instead of a free-form shell box, redacts likely sensitive output, and requires typed confirmation for guarded commands.
+The Settings tab exposes the operational commands you are likely to need from the app, including Telegram test, Telegram autopilot once, Telegram autopilot loop, daily loop, and tests. It uses an allowlist instead of a free-form shell box, redacts likely sensitive output, and requires typed confirmation for guarded commands.
 
 UI profiles are selectable in Settings:
 
+- `Clean`: simpler control desk profile and the default
 - `Arcade`: the neon cabinet profile
 - `Algo Desk`: black CRT trading terminal profile inspired by the arcade algo desk reference
 - `Classic`: quieter operational dashboard styling

@@ -185,12 +185,15 @@ def test_dashboard_service_apply_setup_writes_env_and_autopilot_config_without_l
     assert "ALPACA_ALLOW_LIVE=false" in env_text
     assert "BONEHAWK_SETUP_COMPLETE=true" in env_text
     assert (tmp_path / "config" / "autopilot.json").exists()
+    saved_config = json.loads((tmp_path / "config" / "autopilot.json").read_text())
+    assert saved_config["max_open_positions"] == 4
+    assert saved_config["max_trade_usd"] == 25
 
 
 def test_dashboard_service_apply_setup_rejects_invalid_risk_numbers(tmp_path: Path) -> None:
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient())
 
-    payload = service.apply_setup({"alpaca_api_key": "key", "alpaca_secret_key": "secret", "max_trade_usd": "nope"})
+    payload = service.apply_setup({"alpaca_api_key": "key", "alpaca_secret_key": "secret", "max_open_positions": "nope"})
 
     assert payload["ok"] is False
     assert payload["status"] == "invalid_setup"
@@ -237,12 +240,12 @@ def test_dashboard_service_updates_ui_theme(tmp_path: Path) -> None:
     env_file.write_text("ALPACA_API_KEY=secret\nBONEHAWK_UI_THEME=classic\n")
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient())
 
-    payload = service.set_ui_theme("algo-desk")
+    payload = service.set_ui_theme("retro")
 
     assert payload["ok"] is True
-    assert payload["theme"] == "algo-desk"
+    assert payload["theme"] == "retro"
     assert "ALPACA_API_KEY=secret" in env_file.read_text()
-    assert "BONEHAWK_UI_THEME=algo-desk" in env_file.read_text()
+    assert "BONEHAWK_UI_THEME=retro" in env_file.read_text()
 
 
 def test_dashboard_service_rejects_invalid_ui_theme(tmp_path: Path) -> None:
@@ -254,13 +257,21 @@ def test_dashboard_service_rejects_invalid_ui_theme(tmp_path: Path) -> None:
     assert payload["status"] == "invalid_theme"
 
 
-def test_dashboard_status_defaults_invalid_ui_theme_to_arcade(tmp_path: Path) -> None:
+def test_dashboard_status_defaults_invalid_ui_theme_to_clean(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("BONEHAWK_UI_THEME=rainbow\n")
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient())
 
     payload = service.status()
 
-    assert payload["ui_theme"] == "arcade"
+    assert payload["ui_theme"] == "clean"
+
+
+def test_dashboard_status_defaults_missing_ui_theme_to_retro(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient())
+
+    payload = service.status()
+
+    assert payload["ui_theme"] == "retro"
 
 
 def test_dashboard_service_command_catalog_exposes_readme_actions(tmp_path: Path) -> None:
@@ -766,9 +777,15 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "submitSetup" in HTML
     assert "arcade-grid" in HTML
     assert "/api/trading-mode" in HTML
-    assert 'id="command-center-panel"' in HTML
+    assert 'id="overview-panel"' in HTML
+    assert "showTab('overview-panel'" in HTML
+    assert 'id="command-center-panel"' not in HTML
+    assert "showTab('command-center-panel'" not in HTML
     assert "/api/commands" in HTML
     assert "renderCommands" in HTML
+    assert 'id="command-groups"' in HTML
+    assert 'id="command-output"' in HTML
+    assert "ESSENTIAL_COMMAND_IDS" in HTML
     assert 'id="growth-panel"' in HTML
     assert 'id="tickets-panel"' in HTML
     assert "/api/tickets" in HTML
@@ -783,12 +800,34 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert 'id="stock-ticket-quantity"' in HTML
     assert 'id="stock-ticket-confirm"' in HTML
     assert 'id="toast-stack"' in HTML
-    assert 'data-theme="arcade"' in HTML
+    assert 'data-theme="retro"' in HTML
+    assert 'class="theme-retro"' in HTML
+    assert 'class="titlebar"' in HTML
+    assert 'class="window-dots"' in HTML
+    assert 'class="status-strip"' in HTML
+    assert 'class="top-actions"' in HTML
+    assert 'class="page-head"' in HTML
+    assert 'class="command-line"' in HTML
+    assert 'id="commandText"' in HTML
+    assert "AI Desk" in HTML
+    assert "Agent Pipeline" in HTML
+    assert "Risk Guard" in HTML
+    assert "Opportunities" in HTML
+    assert "Live Readiness" in HTML
+    assert 'class="pipeline"' in HTML
+    assert 'class="risk-grid"' in HTML
+    assert 'class="readiness"' in HTML
+    assert 'class="nav-glyph"' in HTML
+    assert 'class="nav-kbd"' in HTML
     assert 'id="ui-theme-settings"' in HTML
     assert "/api/ui-theme" in HTML
     assert "setUiTheme" in HTML
+    assert "theme-retro" in HTML
+    assert "theme-clean" in HTML
     assert "theme-classic" in HTML
     assert "theme-algo-desk" in HTML
+    assert "Retro" in HTML
+    assert "Clean" in HTML
     assert "Algo Desk" in HTML
     assert "#39ff14" in HTML
     assert "showOrderToast" in HTML
@@ -815,6 +854,10 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "scanAutopilot" in HTML
     assert "runAutopilotPaper" in HTML
     assert "setAutopilotSetting" in HTML
+    assert "Dynamic sizing" in HTML
+    assert "setup-max-trade-usd" not in HTML
+    assert "setup-min-confidence" not in HTML
+    assert "Max dollars per trade" not in HTML
     assert "Agentic scan" in HTML
     assert "editAutopilotAgentic" in HTML
     assert "max_kelly_fraction" in HTML

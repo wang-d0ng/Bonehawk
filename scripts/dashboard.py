@@ -27,7 +27,7 @@ from scripts.portfolio_sync import portfolio_sync_snapshot
 from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfolio_performance
 from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
 
-UI_THEME_VALUES = {"arcade", "classic", "algo-desk"}
+UI_THEME_VALUES = {"retro", "clean", "arcade", "classic", "algo-desk"}
 SETUP_SECRET_KEYS = {
     "ALPACA_API_KEY",
     "ALPACA_SECRET_KEY",
@@ -95,7 +95,7 @@ class DashboardService:
     def set_ui_theme(self, theme: Any) -> dict[str, Any]:
         normalized = str(theme or "").strip().lower()
         if normalized not in UI_THEME_VALUES:
-            return {"ok": False, "status": "invalid_theme", "theme": _ui_theme_from_env(_read_env_presence(self.root / ".env")), "message": "UI style must be arcade, algo-desk, or classic."}
+            return {"ok": False, "status": "invalid_theme", "theme": _ui_theme_from_env(_read_env_presence(self.root / ".env")), "message": "UI style must be retro, clean, arcade, algo-desk, or classic."}
         _write_env_value(self.root / ".env", "BONEHAWK_UI_THEME", normalized)
         return {"ok": True, "status": "updated", "theme": normalized, "message": f"UI style switched to {normalized}."}
 
@@ -118,7 +118,7 @@ class DashboardService:
                 },
                 "autopilot": {
                     "status": "set" if autopilot_path.exists() else "missing",
-                    "message": "Autopilot config controls paper trade size and risk limits.",
+                    "message": "Autopilot config stores safety rails; trade size is decided dynamically from account and market data.",
                 },
                 "telegram": {
                     "status": "set" if env.get("TELEGRAM_BOT_TOKEN") == "set" and env.get("ALLOWED_CHAT_IDS") == "set" else "optional",
@@ -157,10 +157,10 @@ class DashboardService:
                 mode="paper",
                 broker="alpaca",
                 allow_live=False,
-                max_trade_usd=float(payload.get("max_trade_usd", existing.max_trade_usd)),
+                max_trade_usd=existing.max_trade_usd,
                 max_daily_loss_usd=existing.max_daily_loss_usd,
                 max_open_positions=int(float(payload.get("max_open_positions", existing.max_open_positions))),
-                min_confidence=int(float(payload.get("min_confidence", existing.min_confidence))),
+                min_confidence=existing.min_confidence,
                 symbols_per_run=existing.symbols_per_run,
                 strategies=existing.strategies,
             ),
@@ -725,7 +725,7 @@ def _read_env_presence(path: Path) -> dict[str, str]:
         "TELEGRAM_BOT_TOKEN": "missing",
         "ALLOWED_CHAT_IDS": "missing",
         "TRADING_MODE": "missing",
-        "BONEHAWK_UI_THEME": "arcade",
+        "BONEHAWK_UI_THEME": "retro",
         "ALPACA_API_KEY": "missing",
         "ALPACA_SECRET_KEY": "missing",
         "ALPACA_PAPER": "true",
@@ -747,8 +747,8 @@ def _read_env_presence(path: Path) -> dict[str, str]:
 
 
 def _ui_theme_from_env(env: dict[str, str]) -> str:
-    theme = str(env.get("BONEHAWK_UI_THEME") or "arcade").strip().lower()
-    return theme if theme in UI_THEME_VALUES else "arcade"
+    theme = str(env.get("BONEHAWK_UI_THEME") or "retro").strip().lower()
+    return theme if theme in UI_THEME_VALUES else "clean"
 
 
 def _validate_setup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -756,19 +756,15 @@ def _validate_setup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         value = payload.get(key)
         if value is not None and len(str(value)) > 4096:
             return {"ok": False, "status": "invalid_setup", "message": "A setup value is too long."}
-    for key in ("max_trade_usd", "max_open_positions", "min_confidence"):
+    for key in ("max_open_positions",):
         if key not in payload or payload.get(key) in {None, ""}:
             continue
         try:
             number = float(payload.get(key))
         except (TypeError, ValueError):
             return {"ok": False, "status": "invalid_setup", "message": f"{key} must be a number."}
-        if key == "max_trade_usd" and not 1 <= number <= 1000:
-            return {"ok": False, "status": "invalid_setup", "message": "Max trade size must be between $1 and $1000."}
         if key == "max_open_positions" and not 0 <= number <= 25:
             return {"ok": False, "status": "invalid_setup", "message": "Max open positions must be between 0 and 25."}
-        if key == "min_confidence" and not 35 <= number <= 95:
-            return {"ok": False, "status": "invalid_setup", "message": "Minimum confidence must be between 35 and 95."}
     return None
 
 
@@ -967,6 +963,10 @@ HTML = """
       --red: #ff5c64;
       --amber: #f6c453;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --font-display: "Chakra Petch", "Eurostile", "Bank Gothic", system-ui, sans-serif;
+      --side: 244px;
+      --title: 34px;
+      --radius: 6px;
     }
     * { box-sizing: border-box; }
     body {
@@ -978,6 +978,115 @@ HTML = """
       color: var(--ink);
       font-family: var(--mono);
       text-shadow: 0 0 8px rgba(244,244,245,0.12);
+    }
+    body.theme-retro {
+      --ink: #e6f2df;
+      --muted: #8a9987;
+      --page: #050607;
+      --panel: #0e1211;
+      --panel-raised: #151b18;
+      --line: rgba(152,255,182,0.20);
+      --line-soft: rgba(152,255,182,0.10);
+      --blue: #98ffb6;
+      --green: #98ffb6;
+      --red: #ff5c64;
+      --amber: #f3b35b;
+      background:
+        radial-gradient(circle at 15% 0%, rgba(152,255,182,0.15), transparent 30rem),
+        radial-gradient(circle at 85% 2%, rgba(243,179,91,0.12), transparent 24rem),
+        linear-gradient(135deg, #07100b, var(--page));
+      text-shadow: 0 0 10px rgba(152,255,182,0.12);
+    }
+    body.theme-retro::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      pointer-events: none;
+      background:
+        linear-gradient(rgba(255,255,255,0.025) 50%, rgba(0,0,0,0.045) 50%) 0 0 / 100% 4px,
+        radial-gradient(circle at center, transparent 58%, rgba(0,0,0,0.32));
+      mix-blend-mode: screen;
+      opacity: 0.58;
+    }
+    body.theme-retro .arcade-grid {
+      background:
+        linear-gradient(rgba(152,255,182,0.08) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(152,255,182,0.05) 1px, transparent 1px);
+      background-size: 36px 36px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,0.42), transparent 72%);
+    }
+    body.theme-retro h1,
+    body.theme-retro h2,
+    body.theme-retro .brand .sub {
+      color: var(--green);
+      text-shadow: 0 0 12px rgba(152,255,182,0.38);
+    }
+    body.theme-retro .brand,
+    body.theme-retro .topbar,
+    body.theme-retro .titlebar {
+      background: linear-gradient(90deg, rgba(152,255,182,0.08), rgba(5,6,7,0.92));
+    }
+    body.theme-retro .terminal-mark {
+      background: var(--green);
+      color: #041008;
+      box-shadow: 4px 4px 0 rgba(243,179,91,0.92), 0 0 22px rgba(152,255,182,0.32);
+    }
+    body.theme-retro button.primary,
+    body.theme-retro .mode-option.active,
+    body.theme-retro .range-control button.active {
+      background: var(--amber);
+      border-color: var(--amber);
+      color: #160d02;
+      box-shadow: 0 0 18px rgba(243,179,91,0.24), inset -2px -2px 0 rgba(0,0,0,0.38);
+    }
+    body.theme-retro .mode-option.live.active {
+      background: var(--red);
+      border-color: var(--red);
+      color: #fff7f7;
+    }
+    body.theme-retro aside,
+    body.theme-retro .topbar,
+    body.theme-retro .metric,
+    body.theme-retro .data-row,
+    body.theme-retro .panel-block,
+    body.theme-retro .command-card,
+    body.theme-retro .chart-drawer,
+    body.theme-retro .ticket-drawer,
+    body.theme-retro .toast,
+    body.theme-retro pre,
+    body.theme-retro .search-box,
+    body.theme-retro .market-state {
+      border-color: rgba(152,255,182,0.24);
+      box-shadow: 0 0 0 1px rgba(152,255,182,0.07), 0 20px 54px rgba(0,0,0,0.22), inset 0 0 18px rgba(152,255,182,0.025);
+    }
+    body.theme-retro .tab.active {
+      background: rgba(152,255,182,0.09);
+      color: var(--green);
+      border-color: rgba(152,255,182,0.58);
+      box-shadow: inset 4px 0 0 var(--amber), 0 0 18px rgba(152,255,182,0.16);
+    }
+    body.theme-retro .ticker strong,
+    body.theme-retro .metric-value,
+    body.theme-retro .symbol-link {
+      color: var(--green);
+    }
+    body.theme-retro .pill.buy,
+    body.theme-retro .pill.hold {
+      background: rgba(152,255,182,0.10);
+      color: var(--green);
+      border-color: rgba(152,255,182,0.42);
+    }
+    body.theme-retro .pill.sell {
+      background: rgba(255,92,100,0.10);
+      color: var(--red);
+      border-color: rgba(255,92,100,0.52);
+    }
+    body.theme-retro .pill.trim,
+    body.theme-retro .pill.watch {
+      background: rgba(243,179,91,0.10);
+      color: var(--amber);
+      border-color: rgba(243,179,91,0.52);
     }
     body.theme-arcade {
       --page: #080317;
@@ -1142,6 +1251,68 @@ HTML = """
       --red: #ff5c64;
       --amber: #f6c453;
     }
+    body.theme-clean {
+      --ink: #f5f7fb;
+      --muted: #9aa4b2;
+      --page: #090b10;
+      --panel: #11151c;
+      --panel-raised: #171c24;
+      --line: rgba(255,255,255,0.10);
+      --line-soft: rgba(255,255,255,0.06);
+      --blue: #8fb4ff;
+      --green: #42d88b;
+      --red: #f87171;
+      --amber: #fbbf24;
+      background:
+        linear-gradient(180deg, rgba(143,180,255,0.06), transparent 240px),
+        var(--page);
+      text-shadow: none;
+    }
+    body.theme-clean .arcade-grid {
+      display: none;
+    }
+    body.theme-clean aside,
+    body.theme-clean .topbar,
+    body.theme-clean .metric,
+    body.theme-clean .data-row,
+    body.theme-clean .command-card,
+    body.theme-clean .chart-drawer,
+    body.theme-clean .ticket-drawer,
+    body.theme-clean .toast,
+    body.theme-clean pre,
+    body.theme-clean .search-box,
+    body.theme-clean .market-state {
+      box-shadow: none;
+    }
+    body.theme-clean .brand,
+    body.theme-clean .topbar {
+      background: rgba(9,11,16,0.9);
+    }
+    body.theme-clean .terminal-mark {
+      background: var(--blue);
+      color: #07111f;
+      box-shadow: none;
+    }
+    body.theme-clean .tab.active {
+      background: rgba(143,180,255,0.11);
+      border-color: rgba(143,180,255,0.48);
+      box-shadow: inset 3px 0 0 var(--green);
+    }
+    body.theme-clean button {
+      box-shadow: none;
+    }
+    body.theme-clean button.primary,
+    body.theme-clean .mode-option.active,
+    body.theme-clean .range-control button.active {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #07111f;
+    }
+    body.theme-clean .mode-option.live.active {
+      background: var(--red);
+      border-color: var(--red);
+      color: #fff;
+    }
     body.menu-open { overflow: hidden; }
     .arcade-grid {
       position: fixed;
@@ -1154,62 +1325,94 @@ HTML = """
       background-size: 44px 44px;
       mask-image: linear-gradient(to bottom, rgba(0,0,0,0.2), transparent 56%);
     }
-    .app-shell { position: relative; z-index: 1; min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); }
-    aside { background: rgba(21,21,22,0.94); color: #ffffff; border-right: 2px solid var(--line); display: flex; flex-direction: column; box-shadow: 10px 0 0 rgba(0,0,0,0.2); }
+    .app-shell { position: relative; z-index: 1; min-height: 100vh; display: grid; grid-template-columns: var(--side) minmax(0, 1fr); grid-template-rows: var(--title) minmax(0, calc(100vh - var(--title))); }
+    .titlebar { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; height: var(--title); padding: 0 12px 0 14px; border-bottom: 1px solid var(--line); background: rgba(5,6,7,0.9); color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; }
+    .window-dots { display: flex; gap: 8px; align-items: center; }
+    .dot { width: 10px; height: 10px; border: 1px solid var(--line); border-radius: 50%; background: var(--panel); }
+    .dot:nth-child(1) { background: color-mix(in srgb, var(--red) 42%, var(--panel)); }
+    .dot:nth-child(2) { background: color-mix(in srgb, var(--amber) 42%, var(--panel)); }
+    .dot:nth-child(3) { background: color-mix(in srgb, var(--green) 38%, var(--panel)); }
+    .titlebar strong { color: var(--ink); font-family: var(--font-display); font-weight: 650; letter-spacing: 0.12em; }
+    aside { grid-column: 1; grid-row: 2; min-height: 0; padding: 18px 12px; background: linear-gradient(180deg, rgba(14,18,17,0.96), rgba(5,6,7,0.94)), repeating-linear-gradient(0deg, transparent 0 15px, rgba(255,255,255,0.02) 15px 16px); color: #ffffff; border-right: 1px solid var(--line); display: flex; flex-direction: column; overflow: auto; box-shadow: none; }
     body.sidebar-collapsed .app-shell { grid-template-columns: 1fr; }
-    body.sidebar-collapsed aside { position: fixed; inset: 0 auto 0 0; width: 240px; z-index: 70; transform: translateX(-104%); transition: transform 160ms ease; }
+    body.sidebar-collapsed aside { position: fixed; inset: var(--title) auto 0 0; width: var(--side); z-index: 70; transform: translateX(-104%); transition: transform 160ms ease; }
     body.sidebar-collapsed.menu-open aside { transform: translateX(0); }
     .sidebar-backdrop { position: fixed; inset: 0; z-index: 65; background: rgba(0,0,0,0.56); display: none; }
     body.menu-open .sidebar-backdrop { display: block; }
-    main { min-width: 0; padding: 0 24px 24px; }
-    h1 { font-size: 17px; line-height: 1.2; margin: 0; text-transform: uppercase; }
+    main { grid-column: 2; grid-row: 2; min-width: 0; min-height: 0; padding: 0; display: grid; grid-template-rows: 58px minmax(0, 1fr); background: linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px) 0 0 / 28px 28px, linear-gradient(90deg, rgba(255,255,255,0.014) 1px, transparent 1px) 0 0 / 28px 28px, transparent; }
+    body.sidebar-collapsed main { grid-column: 1; }
+    h1 { font-family: var(--font-display); font-size: clamp(34px, 4vw, 52px); line-height: 1; margin: 0; text-transform: uppercase; letter-spacing: 0; }
     h2 { font-size: 13px; margin: 0; text-transform: uppercase; color: var(--muted); letter-spacing: 0.08em; }
     h3 { font-size: 13px; margin: 0; }
-    button { min-height: 34px; border: 2px solid var(--line); background: var(--panel-raised); color: var(--ink); border-radius: 3px; padding: 0 12px; cursor: pointer; font-family: var(--mono); font-weight: 850; text-transform: uppercase; box-shadow: inset -2px -2px 0 rgba(0,0,0,0.38), inset 2px 2px 0 rgba(255,255,255,0.04); }
+    button { min-height: 34px; border: 1px solid var(--line); background: var(--panel-raised); color: var(--ink); border-radius: var(--radius); padding: 0 12px; cursor: pointer; font-family: var(--mono); font-weight: 850; text-transform: uppercase; letter-spacing: 0.07em; box-shadow: inset -2px -2px 0 rgba(0,0,0,0.28), inset 2px 2px 0 rgba(255,255,255,0.035); transition: 140ms ease; }
     button:hover { border-color: rgba(57,217,138,0.5); color: var(--green); }
     button:disabled { cursor: wait; opacity: 0.62; }
     button.primary { background: #f4f4f5; color: #111113; border-color: #f4f4f5; }
     a { color: var(--blue); text-decoration: none; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0d0d0e; color: #e5e7eb; border: 2px solid var(--line); border-radius: 3px; padding: 14px; margin: 10px 0 0; font-size: 12px; line-height: 1.5; }
-    .brand { height: 64px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--line); padding: 0 18px; }
+    .brand { min-height: 52px; display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: center; gap: 10px; border-bottom: 1px solid var(--line); padding: 0 6px 18px; }
     .brand-main { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+    .brand h1 { font-size: 19px; line-height: 1; letter-spacing: 0.06em; }
+    .brand-copy { min-width: 0; }
     .menu-pin { min-height: 26px; min-width: 42px; padding: 0 7px; font-size: 10px; }
-    .terminal-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 3px; background: #f4f4f5; color: #111113; font-family: var(--mono); font-weight: 900; box-shadow: 3px 3px 0 rgba(57,217,138,0.22); }
-    .brand .sub { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; }
-    .nav { display: grid; gap: 4px; padding: 14px 12px; }
-    .tab { width: 100%; text-align: left; background: transparent; color: var(--muted); border-color: transparent; box-shadow: none; }
-    .tab.active { background: #262628; color: var(--ink); border-color: rgba(122,162,255,0.72); box-shadow: inset 3px 0 0 var(--green), 0 0 18px rgba(122,162,255,0.16); }
-    .rail-status { margin-top: auto; border-top: 2px solid var(--line); padding: 14px 18px; display: grid; gap: 8px; color: var(--muted); font-size: 12px; }
-    .topbar { position: sticky; top: 0; z-index: 20; display: grid; grid-template-columns: minmax(260px, 1fr) auto; grid-template-areas: "search toolbar" "title market"; align-items: center; gap: 10px 14px; min-height: 64px; padding: 10px 0; background: rgba(10,10,11,0.9); border-bottom: 2px solid var(--line); backdrop-filter: blur(10px); }
-    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .terminal-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 0; border: 1px solid var(--line); background: var(--panel-raised); color: var(--green); font-family: var(--font-display); font-weight: 900; box-shadow: inset 0 0 18px rgba(152,255,182,0.14); }
+    .brand .sub { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 5px; }
+    .nav-section { margin-top: 18px; }
+    .nav-label { margin: 0 6px 8px; color: var(--muted); opacity: 0.7; font-size: 10px; letter-spacing: 0.09em; text-transform: uppercase; }
+    .nav { display: grid; gap: 5px; padding: 0; }
+    .tab { width: 100%; min-height: 36px; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 0 9px; text-align: left; background: transparent; color: var(--muted); border-color: transparent; box-shadow: none; }
+    .tab:hover, .tab.active { border-color: var(--line); color: var(--ink); background: rgba(255,255,255,0.04); }
+    .tab.active { box-shadow: inset 3px 0 0 var(--green); }
+    .nav-glyph { width: 18px; height: 18px; display: grid; place-items: center; border: 1px solid var(--line); color: var(--muted); font-size: 9px; line-height: 1; }
+    .tab.active .nav-glyph { border-color: var(--green); color: var(--green); }
+    .nav-kbd { color: var(--muted); font-size: 10px; letter-spacing: 0.05em; }
+    .rail-status { margin-top: auto; border-top: 1px solid var(--line); padding: 14px 6px 0; display: grid; gap: 8px; color: var(--muted); font-size: 12px; }
+    .topbar { min-height: 58px; z-index: 20; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 22px; background: rgba(14,18,17,0.72); border-bottom: 1px solid var(--line); backdrop-filter: blur(16px); }
+    .toolbar, .top-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; align-items: center; }
+    .status-strip { display: flex; align-items: center; gap: 10px; min-width: 0; flex-wrap: wrap; }
+    .status { display: inline-flex; align-items: center; gap: 7px; min-height: 28px; padding: 0 10px; border: 1px solid var(--line); border-radius: 999px; background: rgba(5,6,7,0.45); color: var(--muted); font-size: 11px; letter-spacing: 0.03em; white-space: nowrap; }
+    .status b { color: var(--ink); font-weight: 550; }
+    .led { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 14px rgba(152,255,182,0.65); }
+    .led.warn { background: var(--amber); box-shadow: 0 0 14px rgba(243,179,91,0.55); }
+    .btn { min-height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 0 12px; }
+    .btn.danger { border-color: rgba(255,92,100,0.52); color: color-mix(in srgb, var(--red) 84%, white); }
+    .btn.icon { width: 34px; padding: 0; }
     .menu-toggle { min-width: 40px; padding: 0 10px; }
     .search-box { height: 36px; border: 2px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 3px; display: flex; align-items: center; padding: 0 12px; gap: 8px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03); }
     .search-box input { width: 100%; background: transparent; border: 0; outline: 0; color: var(--ink); font-family: var(--mono); font-size: 13px; }
-    .view-heading { grid-area: title; min-width: 0; }
-    .search-box { grid-area: search; }
-    .toolbar { grid-area: toolbar; }
-    .market-state { justify-self: end; border: 2px solid var(--line); background: var(--panel); border-radius: 3px; padding: 8px 13px; font-size: 12px; color: var(--muted); }
-    .market-state { grid-area: market; }
+    .view-heading { min-width: 0; }
+    .market-state { border: 1px solid var(--line); background: rgba(14,18,17,0.66); border-radius: var(--radius); padding: 8px 13px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
     .status-line { min-height: 22px; font-size: 12px; color: var(--muted); }
-    .ticker-tape { display: flex; gap: 24px; overflow-x: auto; border-bottom: 2px solid var(--line); padding: 10px 0; margin-bottom: 22px; scrollbar-width: none; }
+    .workspace { min-height: 0; overflow: auto; padding: 20px 22px 26px; }
+    .page-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: end; margin-bottom: 16px; }
+    .head-tools { display: grid; gap: 8px; justify-items: end; min-width: min(430px, 42vw); }
+    .eyebrow { margin-bottom: 8px; color: var(--amber); font-size: 11px; text-transform: uppercase; letter-spacing: 0.09em; }
+    .subtitle { max-width: 76ch; margin: 10px 0 0; color: var(--muted); line-height: 1.55; }
+    .command-line { display: flex; align-items: center; width: 100%; min-width: 0; height: 38px; padding: 0 12px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(14,18,17,0.82); color: var(--muted); font-size: 12px; }
+    .command-line span { color: var(--green); margin-right: 8px; }
+    .command-line code { color: var(--muted); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ticker-tape { display: flex; gap: 24px; overflow-x: auto; border-bottom: 1px solid var(--line); padding: 10px 0; margin-bottom: 22px; scrollbar-width: none; }
     .ticker-tape::-webkit-scrollbar { display: none; }
     .ticker { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; font-family: var(--mono); font-size: 12px; }
     .ticker strong { color: var(--ink); }
     .tab-panel { display: none; }
     .tab-panel.active { display: grid; gap: 14px; }
+    .overview-flow { display: grid; gap: 16px; }
+    .overview-compact { display: grid; gap: 14px; }
+    .overview-actions { justify-content: flex-start; }
     .section-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .metric { background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 16px; min-height: 114px; display: grid; align-content: space-between; box-shadow: inset -3px -3px 0 rgba(0,0,0,0.28); }
-    .metric-label { color: var(--muted); font-size: 12px; }
-    .metric-value { font-family: var(--mono); font-size: 25px; font-weight: 760; margin-top: 8px; overflow-wrap: anywhere; }
-    .metric-note { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .metric { background: linear-gradient(180deg, rgba(21,27,24,0.92), rgba(14,18,17,0.92)); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; min-height: 112px; display: flex; flex-direction: column; justify-content: space-between; box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
+    .metric-label, .panel-title, th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .metric-value { font-family: var(--font-display); font-size: 30px; line-height: 1; letter-spacing: 0; font-weight: 760; margin-top: 8px; overflow-wrap: anywhere; }
+    .metric-note { color: var(--muted); opacity: 0.72; font-size: 12px; margin-top: 8px; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .data-list { display: grid; gap: 8px; }
-    .data-row { background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 13px 15px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; transition: background 140ms ease, border-color 140ms ease; }
+    .data-row { background: rgba(5,6,7,0.38); border: 1px solid var(--line); border-radius: var(--radius); padding: 11px 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; transition: background 140ms ease, border-color 140ms ease; }
     .data-row:hover { background: var(--panel-raised); border-color: rgba(255,255,255,0.14); }
     .data-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-weight: 720; min-width: 0; }
     .data-sub { color: var(--muted); font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
     .right-stack { display: grid; justify-items: end; gap: 5px; white-space: nowrap; }
-    .pill { border-radius: 4px; padding: 2px 6px; background: #2a2a2c; color: var(--muted); border: 1px solid var(--line); font-family: var(--mono); font-size: 10px; font-weight: 800; text-transform: uppercase; }
+    .pill { display: inline-flex; align-items: center; min-height: 24px; border-radius: 999px; padding: 2px 8px; background: rgba(5,6,7,0.48); color: var(--muted); border: 1px solid var(--line); font-family: var(--mono); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.07em; white-space: nowrap; }
     .pill.buy, .pill.hold { background: rgba(57,217,138,0.12); color: var(--green); border-color: rgba(57,217,138,0.3); }
     .pill.sell { background: rgba(255,92,100,0.12); color: var(--red); border-color: rgba(255,92,100,0.32); }
     .pill.trim, .pill.watch { background: rgba(246,196,83,0.12); color: var(--amber); border-color: rgba(246,196,83,0.34); }
@@ -1225,8 +1428,20 @@ HTML = """
     .muted { color: var(--muted); font-size: 12px; }
     .ok { color: var(--green); }
     .error { color: var(--red); }
-    .two-col { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 0.55fr); gap: 14px; align-items: start; }
-    .panel-block { display: grid; gap: 10px; }
+    .two-col { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 0.55fr); gap: 12px; align-items: start; }
+    .desk-grid { display: grid; grid-template-columns: minmax(0, 1.24fr) minmax(340px, 0.76fr); gap: 12px; }
+    .panel-block { min-width: 0; display: grid; gap: 10px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(180deg, rgba(21,27,24,0.88), rgba(14,18,17,0.88)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
+    .panel-block h2 { color: var(--ink); font-weight: 650; }
+    .panel-sub { margin-top: 4px; color: var(--muted); opacity: 0.72; font-size: 12px; line-height: 1.4; }
+    .risk-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .risk-cell { min-height: 70px; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.40); }
+    .risk-cell span { display: block; color: var(--muted); opacity: 0.72; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .risk-cell b { display: block; margin-top: 9px; color: var(--ink); font-family: var(--font-display); font-size: 20px; letter-spacing: 0; }
+    .readiness { display: grid; gap: 8px; }
+    .check { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 38px; padding: 0 10px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.42); color: var(--muted); font-size: 12px; }
+    .check::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 11px rgba(152,255,182,0.50); }
+    .check.warn::before { background: var(--amber); box-shadow: 0 0 11px rgba(243,179,91,0.48); }
+    .check b { color: var(--ink); font-weight: 550; }
     .empty { padding: 18px; color: var(--muted); background: var(--panel); border: 2px dashed var(--line); border-radius: 3px; }
     .symbol-cloud { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
     .symbol-chip { min-width: 58px; border: 2px solid var(--line); background: var(--panel); border-radius: 3px; padding: 6px 8px; font-family: var(--mono); font-size: 11px; font-weight: 800; text-align: center; }
@@ -1277,126 +1492,283 @@ HTML = """
     .chart-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .chart-stat { border: 2px solid var(--line-soft); background: rgba(255,255,255,0.03); padding: 9px; border-radius: 3px; }
     .command-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .settings-command-groups { display: grid; gap: 12px; }
+    .settings-command-groups .command-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .settings-command-groups .command-card { min-height: 132px; }
+    .command-section { display: grid; gap: 8px; }
     .command-card { background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 14px; display: grid; gap: 10px; align-content: space-between; min-height: 176px; }
     .command-card.danger { border-color: rgba(255,92,100,0.38); }
     .command-code { color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
     .command-actions { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
     .command-card button { min-width: 82px; }
-    .agent-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-    @media (max-width: 1080px) {
-      .app-shell { grid-template-columns: 1fr; }
-      aside { position: static; }
-      .nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .topbar { grid-template-columns: 1fr; grid-template-areas: "search" "title" "market" "toolbar"; padding: 12px 0; }
-      .market-state { justify-self: start; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .agent-grid, .pipeline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .agent-node { min-height: 128px; padding: 11px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.38); display: grid; gap: 8px; align-content: start; }
+    .agent-node h2 { color: var(--ink); font-weight: 650; }
+    .bar { height: 5px; margin-top: 12px; border: 1px solid var(--line); background: rgba(0,0,0,0.32); overflow: hidden; }
+    .bar > i { display: block; height: 100%; width: var(--w); background: linear-gradient(90deg, var(--green), var(--amber)); }
+    .opportunity-table { overflow: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+    .opportunity-table table { width: 100%; min-width: 900px; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    .opportunity-table th, .opportunity-table td { padding: 10px 11px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+    .opportunity-table th { position: sticky; top: 0; z-index: 1; background: rgba(14,18,17,0.98); }
+    .opportunity-table td { color: var(--muted); font-size: 12px; }
+    .opportunity-table tr:last-child td { border-bottom: 0; }
+    .opportunity-table .market { max-width: 310px; color: var(--ink); font-weight: 560; line-height: 1.35; }
+    .opportunity-table .num { color: var(--ink); text-align: right; white-space: nowrap; }
+    @media (max-width: 1180px) {
+      :root { --side: 82px; }
+      .brand { grid-template-columns: 1fr; justify-items: center; padding-inline: 0; }
+      .brand-copy, .nav-label, .nav-text, .nav-kbd, .menu-pin, .rail-status { display: none; }
+      .tab { grid-template-columns: 1fr; justify-items: center; padding: 0; }
+      .nav-glyph { width: 28px; height: 28px; font-size: 10px; }
       .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .two-col { grid-template-columns: 1fr; }
-      .command-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .agent-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .desk-grid, .two-col { grid-template-columns: 1fr; }
+      .agent-grid, .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .command-grid, .settings-command-groups .command-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .page-head { grid-template-columns: 1fr; }
+      .head-tools { justify-items: stretch; min-width: 0; }
     }
-    @media (max-width: 640px) {
-      main { padding: 14px; }
-      .topbar { align-items: stretch; flex-direction: column; }
-      .toolbar { justify-content: flex-start; }
-      .metric-grid { grid-template-columns: 1fr; }
+    @media (max-width: 760px) {
+      body { overflow: auto; }
+      .app-shell { display: block; min-height: 100vh; }
+      .titlebar { position: sticky; top: 0; z-index: 75; }
+      aside { position: fixed; inset: var(--title) auto 0 0; width: 244px; z-index: 70; transform: translateX(-104%); transition: transform 160ms ease; }
+      body.menu-open aside { transform: translateX(0); }
+      body.sidebar-collapsed aside { width: 244px; }
+      main { min-height: calc(100vh - var(--title)); display: grid; grid-template-rows: auto minmax(0, 1fr); }
+      .topbar { align-items: stretch; flex-direction: column; padding: 12px; }
+      .status-strip, .top-actions, .toolbar, .tabs { justify-content: flex-start; }
+      .workspace { padding: 14px; overflow: visible; }
+      .page-head { gap: 12px; }
+      h1 { font-size: 36px; }
+      .metric-grid, .agent-grid, .pipeline, .risk-grid, .command-grid, .settings-command-groups .command-grid { grid-template-columns: 1fr; }
       .data-row { grid-template-columns: 1fr; }
       .right-stack { justify-items: start; white-space: normal; }
-      .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .command-grid { grid-template-columns: 1fr; }
-      .agent-grid { grid-template-columns: 1fr; }
       .chart-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .ticket-drawer { left: 22px; }
+      .ticket-drawer { left: 14px; right: 14px; bottom: 14px; width: auto; }
+      .chart-drawer { left: 14px; right: 14px; bottom: 14px; width: auto; }
       .toast-stack { left: 14px; right: 14px; width: auto; }
       .setup-grid, .setup-steps { grid-template-columns: 1fr; }
     }
   </style>
 </head>
-<body data-theme="arcade" class="theme-arcade">
+<body data-theme="retro" class="theme-retro">
   <div class="arcade-grid" aria-hidden="true"></div>
   <div class="sidebar-backdrop" onclick="closeSidebar()" aria-hidden="true"></div>
   <div class="app-shell">
+    <header class="titlebar">
+      <div class="window-dots" aria-hidden="true">
+        <span class="dot"></span>
+        <span class="dot"></span>
+        <span class="dot"></span>
+      </div>
+      <strong>Bonehawk Trader</strong>
+      <span id="titlebar-session">Session 01 / Alpaca</span>
+    </header>
     <aside>
       <div class="brand">
-        <div class="brand-main">
-          <div class="terminal-mark">B</div>
-          <div>
-            <h1>bonehawk</h1>
-            <div class="sub">AI trading terminal</div>
-          </div>
+        <div class="terminal-mark">BH</div>
+        <div class="brand-copy">
+          <h1>bonehawk</h1>
+          <div class="sub">AI trading terminal</div>
         </div>
-        <button class="menu-pin" onclick="expandSidebar()">Pin</button>
       </div>
-      <nav class="nav" aria-label="Dashboard sections">
-        <button class="tab active" onclick="showTab('portfolio-panel', this)">Portfolio</button>
-        <button class="tab" onclick="showTab('command-center-panel', this)">Commands</button>
-        <button class="tab" onclick="showTab('ideas-panel', this)">Trade Ideas</button>
-        <button class="tab" onclick="showTab('growth-panel', this)">Growth</button>
-        <button class="tab" onclick="showTab('stocks-panel', this)">Stocks</button>
-        <button class="tab" onclick="showTab('autopilot-panel', this)">Autopilot</button>
-        <button class="tab" onclick="showTab('scanner-panel', this)">Scanner</button>
-        <button class="tab" onclick="showTab('news-panel', this)">News</button>
-        <button class="tab" onclick="showTab('tickets-panel', this)">Tickets</button>
-        <button class="tab" onclick="showTab('logs-panel', this)">Logs</button>
-        <button class="tab" onclick="showTab('settings-panel', this)">Settings</button>
-      </nav>
+      <button class="menu-pin" onclick="expandSidebar()">Lock rail</button>
+      <div class="nav-section">
+        <div class="nav-label">Trading</div>
+        <nav class="nav" aria-label="Trading sections">
+          <button class="tab active" data-title="AI Desk" onclick="showTab('overview-panel', this)"><span class="nav-glyph">AI</span><span class="nav-text">AI Desk</span><span class="nav-kbd">01</span></button>
+          <button class="tab" data-title="Signals" onclick="showTab('ideas-panel', this)"><span class="nav-glyph">SG</span><span class="nav-text">Signals</span><span class="nav-kbd">02</span></button>
+          <button class="tab" data-title="Growth" onclick="showTab('growth-panel', this)"><span class="nav-glyph">GR</span><span class="nav-text">Growth</span><span class="nav-kbd">03</span></button>
+          <button class="tab" data-title="Stocks" onclick="showTab('stocks-panel', this)"><span class="nav-glyph">ST</span><span class="nav-text">Stocks</span><span class="nav-kbd">04</span></button>
+          <button class="tab" data-title="Tickets" onclick="showTab('tickets-panel', this)"><span class="nav-glyph">TK</span><span class="nav-text">Tickets</span><span class="nav-kbd">05</span></button>
+        </nav>
+      </div>
+      <div class="nav-section">
+        <div class="nav-label">System</div>
+        <nav class="nav" aria-label="System sections">
+          <button class="tab" data-title="Logs" onclick="showTab('logs-panel', this)"><span class="nav-glyph">LG</span><span class="nav-text">Logs</span><span class="nav-kbd">06</span></button>
+          <button class="tab" data-title="Settings" onclick="showTab('settings-panel', this)"><span class="nav-glyph">⚙</span><span class="nav-text">Settings</span><span class="nav-kbd">07</span></button>
+        </nav>
+      </div>
       <div class="rail-status">
         <div id="rail-mode">Mode loading</div>
-        <div id="rail-updated">Waiting for market data</div>
+        <div id="rail-updated-side">Waiting for market data</div>
       </div>
     </aside>
     <main>
       <div class="topbar">
-        <div class="search-box">
-          <span class="muted">Search</span>
-          <input id="symbol-search" type="text" placeholder="Search symbols, e.g. NVDA, BTC, SPY..." oninput="filterVisibleRows(this.value)" onkeydown="openTypedSymbol(event)">
+        <div class="status-strip">
+          <span class="status"><i class="led"></i><b>Backend</b><span id="backend-state">Online</span></span>
+          <span class="status"><i class="led"></i><b>Alpaca</b><span id="broker-state">Paper</span></span>
+          <span class="status"><i class="led warn"></i><b>Live</b><span id="liveState">Disarmed</span></span>
+          <span class="status"><b>Updated</b><span id="rail-updated">Waiting</span></span>
         </div>
-        <div class="view-heading">
-          <h1 id="view-title">Portfolio</h1>
-          <div id="ui-status" class="status-line">Loading market data...</div>
-        </div>
-        <div id="market-state" class="market-state">Market data live</div>
-        <div class="toolbar">
-          <button id="menu-toggle" class="menu-toggle" data-action onclick="toggleSidebar(event)" title="Toggle menu">☰</button>
+        <div class="top-actions">
+          <button id="menu-toggle" class="btn icon menu-toggle" data-action onclick="toggleSidebar(event)" title="Toggle menu">☰</button>
           <div class="mode-switch" role="group" aria-label="Trading mode">
             <button data-action data-mode-option="paper" class="mode-option" onclick="setTradingMode('paper')">Paper</button>
             <button data-action data-mode-option="live" class="mode-option live" onclick="setTradingMode('live')">Live</button>
           </div>
-          <button data-action onclick="refreshAll()">Refresh</button>
-          <button data-action class="primary" onclick="runPaper(false)">Run Paper Agent</button>
-          <button data-action onclick="runPaper(true)">Paper + Telegram</button>
-          <button data-action onclick="sendScannerAlerts()">Scanner Alerts</button>
-          <button data-action onclick="sendTradeIdeas()">Trade Ideas Telegram</button>
+          <button class="btn" data-action onclick="runPaper(false)">Paper AI</button>
+          <button class="btn danger" data-action onclick="setTradingMode('live')">Live Alpaca</button>
+          <button class="btn icon" data-action onclick="setTradingMode('paper')" title="Disarm live trading">□</button>
+          <button class="btn primary" data-action onclick="scanAutopilot()">Run Scan</button>
         </div>
       </div>
-      <div id="ticker-tape" class="ticker-tape"></div>
-
-      <section id="portfolio-panel" class="tab-panel active">
-        <div class="section-head">
-          <h2>Portfolio</h2>
-          <div id="symbols" class="muted"></div>
-        </div>
-        <div id="metric-grid" class="metric-grid"></div>
-        <div class="two-col">
-          <div class="panel-block">
-            <h2>Positions</h2>
-            <div id="position-list" class="data-list"></div>
+      <div class="workspace">
+        <div class="page-head">
+          <div>
+            <div class="eyebrow">Observe-only intelligence / dynamic account sizing</div>
+            <h1 id="view-title">AI Desk</h1>
+            <p class="subtitle">Autopilot weighs market data, news, model probability, account cash, price, edge, and risk before it plans paper trades.</p>
+            <div id="ui-status" class="status-line">Loading market data...</div>
           </div>
-          <div class="panel-block">
-            <h2>Sync</h2>
-            <div id="portfolio-sync" class="data-list"></div>
+          <div class="head-tools">
+            <div class="command-line"><span>&gt;</span><code id="commandText">scan --broker alpaca --mode paper --risk dynamic</code></div>
+            <div class="search-box">
+              <span class="muted">Search</span>
+              <input id="symbol-search" type="text" placeholder="NVDA, BTC, SPY..." oninput="filterVisibleRows(this.value)" onkeydown="openTypedSymbol(event)">
+            </div>
           </div>
         </div>
-      </section>
+        <div id="market-state" class="market-state">Market data live</div>
+        <div id="ticker-tape" class="ticker-tape"></div>
 
-      <section id="command-center-panel" class="tab-panel">
+      <section id="overview-panel" class="tab-panel active">
         <div class="section-head">
-          <h2>Command Center</h2>
-          <div id="command-status" class="muted"></div>
+          <div>
+            <h2>Overview</h2>
+            <div id="symbols" class="muted"></div>
+          </div>
+          <div class="toolbar overview-actions">
+            <button data-action onclick="scanAutopilot()">Scan</button>
+            <button data-action class="primary" onclick="runAutopilotPaper()">Run Paper</button>
+          </div>
         </div>
-        <div id="command-groups" class="panel-block"></div>
-        <div class="panel-block">
-          <h2>Output</h2>
-          <pre id="command-output">No command run yet.</pre>
+        <div class="overview-flow">
+          <div id="portfolio-panel" class="overview-compact">
+            <div id="metric-grid" class="metric-grid"></div>
+            <div class="two-col">
+              <div class="panel-block">
+                <h2>Positions</h2>
+                <div id="position-list" class="data-list"></div>
+              </div>
+              <div class="panel-block">
+                <h2>Sync</h2>
+                <div id="portfolio-sync" class="data-list"></div>
+              </div>
+            </div>
+          </div>
+          <div id="autopilot-panel" class="overview-compact">
+            <div id="autopilot-metrics" class="metric-grid"></div>
+            <div class="desk-grid">
+              <div class="panel-block">
+                <div class="section-head">
+                  <div>
+                    <h2>Agent Pipeline</h2>
+                    <div id="autopilot-context" class="panel-sub">Market, narrative, prediction, and risk agents update this desk before orders are planned.</div>
+                  </div>
+                </div>
+                <div class="pipeline">
+                  <div class="agent-node">
+                    <h2>News Data</h2>
+                    <div id="agent-scan" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 76%"></i></div>
+                  </div>
+                  <div class="agent-node">
+                    <h2>Agent 1: Sentiment</h2>
+                    <div id="agent-research" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 68%"></i></div>
+                  </div>
+                  <div class="agent-node">
+                    <h2>Agent 2: Technical</h2>
+                    <div id="agent-prediction" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 72%"></i></div>
+                  </div>
+                  <div class="agent-node">
+                    <h2>Agent 3: Portfolio Manager</h2>
+                    <div id="agent-risk" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 62%"></i></div>
+                  </div>
+                  <div class="agent-node">
+                    <h2>Agent 4: Executor</h2>
+                    <div id="agent-execution" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 50%"></i></div>
+                  </div>
+                  <div class="agent-node">
+                    <h2>Post-Mortem Agents</h2>
+                    <div id="agent-postmortem" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 35%"></i></div>
+                  </div>
+                  <div class="agent-node">
+                    <h2>Performance Report</h2>
+                    <div id="agent-performance" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 58%"></i></div>
+                  </div>
+                  <div class="agent-node">
+                    <h2>Telegram Alert</h2>
+                    <div id="agent-telegram" class="data-list"></div>
+                    <div class="bar" aria-hidden="true"><i style="--w: 46%"></i></div>
+                  </div>
+                </div>
+              </div>
+              <div class="panel-block">
+                <h2>Risk Guard</h2>
+                <div class="panel-sub">Sizing is decided from cash, buying power, stock price, projected probability, edge, and stop distance.</div>
+                <div class="risk-grid">
+                  <div class="risk-cell"><span>Account Cash</span><b id="risk-cash">...</b></div>
+                  <div class="risk-cell"><span>Buying Power</span><b id="risk-buying-power">...</b></div>
+                  <div class="risk-cell"><span>Max Kelly</span><b id="risk-kelly">...</b></div>
+                  <div class="risk-cell"><span>Open Slots</span><b id="risk-slots">...</b></div>
+                </div>
+                <h2>Live Readiness</h2>
+                <div id="autopilot-risk" class="readiness"></div>
+              </div>
+            </div>
+            <div class="panel-block">
+              <div class="section-head">
+                <div>
+                  <h2>Opportunities</h2>
+                  <div class="panel-sub">Paper tickets planned by the current scan, ranked by model score and guardrails.</div>
+                </div>
+                <div class="tabs" aria-label="Opportunity filters">
+                  <span class="pill buy">Stocks</span>
+                  <span class="pill quiet">1-30m</span>
+                  <span class="pill trim">Telegram</span>
+                </div>
+              </div>
+              <div id="autopilot-orders" class="opportunity-table"></div>
+            </div>
+            <div class="panel-block">
+              <h2>Execution Output</h2>
+              <pre id="autopilot-output">No autopilot run yet.</pre>
+            </div>
+          </div>
+          <div id="scanner-panel" class="overview-compact">
+            <div class="two-col">
+              <div class="panel-block">
+                <h2>Market Scanner</h2>
+                <div id="scanner" class="data-list"></div>
+              </div>
+              <div class="panel-block">
+                <h2>Risk Flags</h2>
+                <div id="risk" class="data-list"></div>
+              </div>
+            </div>
+          </div>
+          <div id="news-panel" class="overview-compact">
+            <div class="two-col">
+              <div class="panel-block">
+                <h2>News</h2>
+                <div id="news" class="data-list"></div>
+              </div>
+              <div class="panel-block">
+                <h2>Insider Filings</h2>
+                <div id="insiders" class="data-list"></div>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -1431,91 +1803,6 @@ HTML = """
           <div class="panel-block">
             <h2>Execution</h2>
             <div id="stock-execution" class="data-list"></div>
-          </div>
-        </div>
-      </section>
-
-      <section id="autopilot-panel" class="tab-panel">
-        <div class="section-head">
-          <h2>Alpaca Autopilot</h2>
-          <div class="toolbar">
-            <button data-action onclick="scanAutopilot()">Scan</button>
-            <button data-action class="primary" onclick="runAutopilotPaper()">Run Paper</button>
-          </div>
-        </div>
-        <div id="autopilot-metrics" class="metric-grid"></div>
-        <div class="agent-grid">
-          <div class="panel-block">
-            <h2>Data Sources</h2>
-            <div id="agent-scan" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Agent 1: Sentiment</h2>
-            <div id="agent-research" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Agent 2: Technical</h2>
-            <div id="agent-prediction" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Agent 3: Portfolio Manager</h2>
-            <div id="agent-risk" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Agent 4: Executor</h2>
-            <div id="agent-execution" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Post-Mortem Agents</h2>
-            <div id="agent-postmortem" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Performance Report</h2>
-            <div id="agent-performance" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Telegram Alert</h2>
-            <div id="agent-telegram" class="data-list"></div>
-          </div>
-        </div>
-        <div class="two-col">
-          <div class="panel-block">
-            <h2>Planned Orders</h2>
-            <div id="autopilot-orders" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Alpaca / Risk</h2>
-            <div id="autopilot-risk" class="data-list"></div>
-          </div>
-        </div>
-        <div class="panel-block">
-          <h2>Execution Output</h2>
-          <pre id="autopilot-output">No autopilot run yet.</pre>
-        </div>
-      </section>
-
-      <section id="scanner-panel" class="tab-panel">
-        <div class="two-col">
-          <div class="panel-block">
-            <h2>Market Scanner</h2>
-            <div id="scanner" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Risk Flags</h2>
-            <div id="risk" class="data-list"></div>
-          </div>
-        </div>
-      </section>
-
-      <section id="news-panel" class="tab-panel">
-        <div class="two-col">
-          <div class="panel-block">
-            <h2>News</h2>
-            <div id="news" class="data-list"></div>
-          </div>
-          <div class="panel-block">
-            <h2>Insider Filings</h2>
-            <div id="insiders" class="data-list"></div>
           </div>
         </div>
       </section>
@@ -1556,11 +1843,21 @@ HTML = """
             <div id="ui-theme-settings" class="data-list"></div>
           </div>
           <div class="panel-block">
+            <h2>App Commands</h2>
+            <div id="command-status" class="muted"></div>
+            <div id="command-groups" class="settings-command-groups"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Command Output</h2>
+            <pre id="command-output">No command run yet.</pre>
+          </div>
+          <div class="panel-block">
             <h2>Capabilities</h2>
             <div id="capabilities" class="data-list"></div>
           </div>
         </div>
       </section>
+      </div>
     </main>
   </div>
   <div id="setup-modal" class="setup-modal" hidden>
@@ -1584,16 +1881,8 @@ HTML = """
             <input id="setup-alpaca-secret-key" type="password" autocomplete="off" placeholder="Paper secret key">
           </label>
           <label class="setup-field">
-            Max dollars per trade
-            <input id="setup-max-trade-usd" type="number" min="1" max="1000" step="1" value="25">
-          </label>
-          <label class="setup-field">
             Max open positions
             <input id="setup-max-open-positions" type="number" min="0" max="25" step="1" value="3">
-          </label>
-          <label class="setup-field">
-            Minimum confidence
-            <input id="setup-min-confidence" type="number" min="35" max="95" step="1" value="55">
           </label>
           <label class="setup-field">
             Telegram bot token
@@ -1670,6 +1959,7 @@ HTML = """
     let chartPlotPoints = [];
     let pendingStockTicket = {symbol: '', side: 'BUY'};
     let setupDismissed = false;
+    const ESSENTIAL_COMMAND_IDS = new Set(['telegram-test', 'telegram-autopilot-once', 'telegram-autopilot-loop', 'daily-loop', 'pytest']);
 
     async function getJson(url, options) {
       const res = await fetch(url, options);
@@ -1728,7 +2018,7 @@ HTML = """
       return `<div class="data-row"><div><div class="data-title">${title}</div>${sub ? `<div class="data-sub">${sub}</div>` : ''}</div>${right ? `<div class="right-stack">${right}</div>` : ''}</div>`;
     }
     function settingSwitch(options, activeValue, handler) {
-      return `<div class="mode-switch">${options.map(option => `<button data-action class="mode-option ${option.danger ? 'live' : ''} ${option.value === activeValue ? 'active' : ''}" onclick="${handler}('${escapeHtml(option.value)}')">${escapeHtml(option.label)}</button>`).join('')}</div>`;
+      return `<div class="mode-switch" style="--switch-count: ${options.length}">${options.map(option => `<button data-action class="mode-option ${option.danger ? 'live' : ''} ${option.value === activeValue ? 'active' : ''}" onclick="${handler}('${escapeHtml(option.value)}')">${escapeHtml(option.label)}</button>`).join('')}</div>`;
     }
     function empty(text) {
       return `<div class="empty">${escapeHtml(text)}</div>`;
@@ -1784,8 +2074,23 @@ HTML = """
       document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
       document.getElementById(id).classList.add('active');
       button.classList.add('active');
-      document.getElementById('view-title').textContent = button.textContent;
+      const title = button.dataset.title || button.textContent.trim();
+      document.getElementById('view-title').textContent = title;
+      const commandText = document.getElementById('commandText');
+      if (commandText) commandText.textContent = commandForView(id);
       closeSidebar();
+    }
+    function commandForView(id) {
+      const commands = {
+        'overview-panel': 'scan --broker alpaca --mode paper --risk dynamic',
+        'ideas-panel': 'signals --window 1-30m --rank edge',
+        'growth-panel': 'growth --new --fast-moving --paper-only',
+        'stocks-panel': 'universe --alpaca --available',
+        'tickets-panel': 'tickets --orders --broker-response',
+        'logs-panel': 'logs --decisions --execution',
+        'settings-panel': 'settings --connectors --telegram'
+      };
+      return commands[id] || 'bonehawk --status';
     }
     function initSidebar() {
       const collapsed = window.localStorage.getItem('bonehawk-sidebar-collapsed') === 'true';
@@ -1803,14 +2108,14 @@ HTML = """
         window.localStorage.setItem('bonehawk-sidebar-collapsed', 'true');
         return;
       }
+      if (overlayMode) {
+        document.body.classList.add('menu-open');
+        document.body.classList.add('sidebar-collapsed');
+        window.localStorage.setItem('bonehawk-sidebar-collapsed', 'true');
+        return;
+      }
       if (collapsed) {
-        if (overlayMode) {
-          document.body.classList.add('menu-open');
-          document.body.classList.add('sidebar-collapsed');
-          window.localStorage.setItem('bonehawk-sidebar-collapsed', 'true');
-        } else {
-          expandSidebar();
-        }
+        expandSidebar();
         return;
       }
       document.body.classList.add('sidebar-collapsed');
@@ -1828,10 +2133,14 @@ HTML = """
     async function refreshStatus() {
       const data = await getJson('/api/status');
       const setup = await getJson('/api/setup-status');
-      document.getElementById('rail-mode').textContent = `Mode ${data.mode || 'unknown'}`;
-      document.getElementById('market-state').textContent = `Mode ${String(data.mode || 'unknown').toUpperCase()}`;
+      const mode = String(data.mode || 'unknown');
+      document.getElementById('rail-mode').textContent = `Mode ${mode}`;
+      document.getElementById('market-state').textContent = `Market data live · mode ${mode.toUpperCase()}`;
+      document.getElementById('broker-state').textContent = mode.toLowerCase() === 'live' ? 'Live' : 'Paper';
+      document.getElementById('liveState').textContent = mode.toLowerCase() === 'live' ? 'Armed' : 'Disarmed';
+      document.getElementById('titlebar-session').textContent = `Session 01 / ${mode.toUpperCase()}`;
       setModeButtons(data.mode || 'missing');
-      applyUiTheme(data.ui_theme || data.env?.BONEHAWK_UI_THEME || 'arcade');
+      applyUiTheme(data.ui_theme || data.env?.BONEHAWK_UI_THEME || 'retro');
       document.getElementById('status').innerHTML = Object.entries(data.env).map(([k,v]) => row(escapeHtml(k), '', pill(v))).join('');
       renderUiThemeSettings(data);
       renderSetupModal(setup);
@@ -1866,9 +2175,7 @@ HTML = """
         telegram_bot_token: document.getElementById('setup-telegram-token').value,
         allowed_chat_ids: document.getElementById('setup-chat-ids').value,
         autopilot_enabled: true,
-        max_trade_usd: document.getElementById('setup-max-trade-usd').value,
-        max_open_positions: document.getElementById('setup-max-open-positions').value,
-        min_confidence: document.getElementById('setup-min-confidence').value
+        max_open_positions: document.getElementById('setup-max-open-positions').value
       };
       await runAction('Saving setup...', async () => {
         const data = await getJson('/api/setup', {
@@ -1909,7 +2216,9 @@ HTML = """
       renderLogs(logs);
       renderTickets(tickets);
       renderSettings(data);
-      document.getElementById('rail-updated').textContent = new Date().toLocaleTimeString();
+      const updated = new Date().toLocaleTimeString();
+      document.getElementById('rail-updated').textContent = updated;
+      document.getElementById('rail-updated-side').textContent = `Updated ${updated}`;
       setStatus(`Updated. Scanner checked ${trades.summary?.symbols_scanned || 0} symbols. Market trend: ${trades.market_trend || 'unknown'}.`, 'ok');
     }
     function renderTicker(trades) {
@@ -1997,17 +2306,12 @@ HTML = """
       document.getElementById('autopilot-metrics').innerHTML = [
         metric('Status', humanize(data.status), `Mode ${escapeHtml(config.mode || 'paper')}`),
         metric('Broker', 'Alpaca', humanize(broker.status || 'unknown')),
-        metric('Trade size', money(config.max_trade_usd || 0), `${config.max_open_positions || 0} max open positions`),
-        metric('Agent window', `${escapeHtml(config.scan_window_minutes || 15)}m`, `Kelly cap ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}%`),
+        metric('Sizing', 'Dynamic', `${config.max_open_positions || 0} max open positions`),
+        metric('Agent window', `${escapeHtml(config.scan_window_minutes || 15)}m`, 'Cash, price, probability, and edge'),
         metric('Live gate', config.live_ready ? 'Ready' : 'Locked', config.allow_live ? 'Live permission on' : 'Paper-first')
       ].join('');
       document.getElementById('autopilot-orders').innerHTML = empty('Run Scan to build a fresh paper plan.');
-      document.getElementById('autopilot-risk').innerHTML = [
-        row('Alpaca API key', '', pill(broker.api_key || 'missing', broker.api_key === 'set' ? 'buy' : 'trim')),
-        row('Alpaca secret', '', pill(broker.secret_key || 'missing', broker.secret_key === 'set' ? 'buy' : 'trim')),
-        row('Paper mode', 'Paper execution uses Alpaca paper trading.', pill(String(broker.paper ?? true), 'quiet')),
-        row('Guardrail', escapeHtml(data.notice || ''), pill('risk', 'trim'))
-      ].join('');
+      renderRiskGuard(data);
       renderAutopilotAgents(data);
     }
     function renderAutopilotAgents(data) {
@@ -2036,7 +2340,7 @@ HTML = """
       ].join('');
       document.getElementById('agent-risk').innerHTML = [
         row('Portfolio rule', `${orders.length} planned · ${blocked.length} blocked`, pill(agentic.summary?.top_symbol || 'none', 'quiet')),
-        row('Kelly sizing', escapeHtml(agents.risk?.method || 'waiting'), pill(agents.risk?.max_kelly_fraction ? `${Number(agents.risk.max_kelly_fraction * 100).toFixed(1)}% cap` : 'idle', 'quiet')),
+        row('Dynamic sizing', escapeHtml(agents.risk?.method || 'waiting'), pill(agents.risk?.safety_ceiling_fraction ? `${Number(agents.risk.safety_ceiling_fraction * 100).toFixed(1)}% safety` : 'idle', 'quiet')),
         row('Bankroll', money(agents.risk?.bankroll_usd || 0), pill(`${orders.length} planned`, orders.length ? 'buy' : 'quiet'))
       ].join('');
       document.getElementById('agent-execution').innerHTML = [
@@ -2056,30 +2360,74 @@ HTML = """
         row('Setup', escapeHtml(telegram.message || 'Add Telegram setup values to enable alerts.'), pill(telegram.chat_ids === 'set' ? 'chat set' : 'chat missing', telegram.chat_ids === 'set' ? 'buy' : 'quiet'))
       ].join('');
     }
+    function renderRiskGuard(data) {
+      const config = data.config || {};
+      const broker = data.broker || {};
+      const agentic = data.agentic_scan || {};
+      const risk = agentic.agents?.risk || {};
+      const orders = data.orders || [];
+      const blocked = [...(data.blocked || []), ...(agentic.blocked || [])];
+      const bankroll = Number(risk.bankroll_usd || data.account?.cash || data.account?.buying_power || 0);
+      const buyingPower = Number(risk.buying_power_usd || data.account?.buying_power || bankroll || 0);
+      const maxKelly = Number(risk.safety_ceiling_fraction || config.max_kelly_fraction || 0);
+      const slots = Math.max(0, Number(config.max_open_positions || 0) - orders.length);
+      document.getElementById('risk-cash').textContent = bankroll ? money(bankroll) : 'Waiting';
+      document.getElementById('risk-buying-power').textContent = buyingPower ? money(buyingPower) : 'Waiting';
+      document.getElementById('risk-kelly').textContent = maxKelly ? `${(maxKelly * 100).toFixed(1)}%` : 'Locked';
+      document.getElementById('risk-slots').textContent = Number.isFinite(slots) ? String(slots) : '...';
+      document.getElementById('autopilot-risk').innerHTML = [
+        checkRow('Alpaca key', broker.api_key === 'set' ? 'Trading connector can authenticate.' : 'Add paper keys in setup.', pill(broker.api_key || 'missing', broker.api_key === 'set' ? 'buy' : 'trim'), broker.api_key === 'set' ? '' : 'warn'),
+        checkRow('Paper mode', 'Default execution stays in Alpaca paper trading.', pill(String(broker.paper ?? true), 'quiet')),
+        checkRow('Live gate', config.live_ready ? 'Live mode is available but still guarded.' : 'Live trading remains locked.', pill(config.live_ready ? 'ready' : 'locked', config.live_ready ? 'buy' : 'trim'), config.live_ready ? '' : 'warn'),
+        checkRow('Blocked ideas', `${blocked.length} setup${blocked.length === 1 ? '' : 's'} rejected by guardrails.`, pill(`${blocked.length}`, blocked.length ? 'trim' : 'buy'), blocked.length ? 'warn' : '')
+      ].join('');
+    }
+    function checkRow(label, detail, badge, tone = '') {
+      return `<div class="check ${tone}"><div><b>${escapeHtml(label)}</b><div class="data-sub">${escapeHtml(detail)}</div></div>${badge}</div>`;
+    }
     function renderAutopilotPlan(data) {
       const orders = data.orders || [];
       const agentic = data.agentic_scan || {};
       const blocked = [...(data.blocked || []), ...(agentic.blocked || [])];
-      const sources = agentic.agents?.research?.sources || {};
-      const sourceText = Object.entries(sources).map(([source, count]) => `${source} ${count}`).join(' · ') || 'rss/news only';
-      const postmortems = agentic.postmortems || [];
-      document.getElementById('autopilot-orders').innerHTML = orders.map(order => {
+      document.getElementById('autopilot-orders').innerHTML = orders.length ? `
+        <table>
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Side</th>
+              <th>Price</th>
+              <th>Probability</th>
+              <th>Edge</th>
+              <th>Size</th>
+              <th>Guardrail</th>
+              <th>Ticket</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${orders.map(order => {
+        const symbol = escapeHtml(order.symbol || 'UNKNOWN');
+        const side = String(order.side || order.action || 'BUY').toUpperCase();
         const score = Math.max(0, Math.min(100, Number(order.confidence || 0)));
-        const stops = [order.current_price ? `price ${money(order.current_price)}` : '', order.stop_loss ? `stop ${money(order.stop_loss)}` : '', order.take_profit ? `target ${money(order.take_profit)}` : '', order.notional ? `size ${money(order.notional)}` : '', order.probability_up ? `prob ${pct(Number(order.probability_up) * 100)}` : '', order.kelly_fraction ? `kelly ${pct(Number(order.kelly_fraction) * 100)}` : ''].filter(Boolean).join(' · ');
-        return row(
-          `${stockSymbolControls(order.symbol)}${pill(order.side || order.action, actionClass(order.side || order.action))}`,
-          `${escapeHtml(order.reason || '')} · ${stops}<div class="data-sub">${(order.signals || []).map(signal => pill(signal, 'quiet')).join('')}</div>`,
-          `<div>${score}/100</div><div class="scorebar"><span style="width:${score}%"></span></div>`
-        );
-      }).join('') || empty('No autopilot orders met the risk rules.');
-      document.getElementById('autopilot-risk').innerHTML = [
-        row('Market trend', escapeHtml(data.market_trend || 'unknown'), pill(data.mode || 'paper', data.mode === 'live' ? 'sell' : 'buy')),
-        row('Symbols scanned', String(data.summary?.symbols_scanned || 0), pill(`${orders.length} planned`, orders.length ? 'buy' : 'quiet')),
-        row('Research agents', sourceText, pill(`${agentic.summary?.opportunities || 0} opps`, agentic.summary?.opportunities ? 'buy' : 'quiet')),
-        row('Prediction / risk', `Model ${escapeHtml(agentic.agents?.prediction?.model || 'n/a')} · ${escapeHtml(agentic.agents?.risk?.method || 'n/a')}`, pill(`${escapeHtml(agentic.window_minutes || 15)}m`, 'quiet')),
-        ...postmortems.slice(0, 3).map(item => row(`Post-mortem ${escapeHtml(item.symbol || '')}`, `${escapeHtml(String(item.realized_pnl || ''))} realized P&L`, pill('loss review', 'trim'))),
-        ...blocked.slice(0, 8).map(item => row(`${escapeHtml(item.symbol || 'blocked')}`, escapeHtml(item.reason || ''), pill('blocked', 'trim')))
-      ].join('');
+        const probability = order.probability_up ? pct(Number(order.probability_up) * 100) : `${score}/100`;
+        const edge = order.edge ? pct(Number(order.edge) * 100) : (order.expected_return_pct ? pct(Number(order.expected_return_pct)) : 'n/a');
+        const size = order.notional ? money(order.notional) : (order.quantity_estimate ? `${Number(order.quantity_estimate).toFixed(4)} sh` : 'n/a');
+        const guardrail = [order.stop_loss ? `stop ${money(order.stop_loss)}` : '', order.kelly_fraction ? `kelly ${(Number(order.kelly_fraction) * 100).toFixed(2)}%` : '', order.take_profit ? `target ${money(order.take_profit)}` : ''].filter(Boolean).join(' · ') || 'pass';
+        return `
+              <tr>
+                <td class="market">${stockSymbolControls(symbol)}<div class="data-sub">${escapeHtml(order.reason || '')}</div></td>
+                <td>${pill(side, actionClass(side))}</td>
+                <td class="num">${order.current_price ? money(order.current_price) : 'n/a'}</td>
+                <td class="num">${probability}</td>
+                <td class="num">${edge}</td>
+                <td class="num">${size}</td>
+                <td>${escapeHtml(guardrail)}</td>
+                <td>${stockActionButtons(symbol)}</td>
+              </tr>`;
+      }).join('')}
+          </tbody>
+        </table>
+      ` : empty('No autopilot orders met the risk rules.');
+      renderRiskGuard(data);
       renderAutopilotAgents(data);
     }
     function formatAutopilotOutput(data) {
@@ -2414,23 +2762,25 @@ HTML = """
       document.getElementById('capabilities').innerHTML = Object.entries(data.capabilities || {}).map(([key, value]) => row(escapeHtml(key), escapeHtml(value))).join('');
     }
     function normalizeUiTheme(theme) {
-      const value = String(theme || 'arcade').toLowerCase();
-      return ['arcade', 'algo-desk', 'classic'].includes(value) ? value : 'arcade';
+      const value = String(theme || 'retro').toLowerCase();
+      return ['retro', 'clean', 'arcade', 'algo-desk', 'classic'].includes(value) ? value : 'clean';
     }
     function applyUiTheme(theme) {
       const nextTheme = normalizeUiTheme(theme);
       document.body.dataset.theme = nextTheme;
+      document.body.classList.toggle('theme-retro', nextTheme === 'retro');
+      document.body.classList.toggle('theme-clean', nextTheme === 'clean');
       document.body.classList.toggle('theme-arcade', nextTheme === 'arcade');
       document.body.classList.toggle('theme-algo-desk', nextTheme === 'algo-desk');
       document.body.classList.toggle('theme-classic', nextTheme === 'classic');
     }
     function renderUiThemeSettings(status) {
       const env = status.env || {};
-      const theme = normalizeUiTheme(status.ui_theme || env.BONEHAWK_UI_THEME || 'arcade');
+      const theme = normalizeUiTheme(status.ui_theme || env.BONEHAWK_UI_THEME || 'retro');
       document.getElementById('ui-theme-settings').innerHTML = row(
         'UI style',
-        'Arcade is neon cabinet, Algo Desk is black-market terminal, Classic keeps the quiet dashboard look.',
-        settingSwitch([{label: 'Arcade', value: 'arcade'}, {label: 'Algo Desk', value: 'algo-desk'}, {label: 'Classic', value: 'classic'}], theme, 'setUiTheme')
+        'Retro matches the schematic. Clean keeps the earlier quieter control desk available.',
+        settingSwitch([{label: 'Retro', value: 'retro'}, {label: 'Clean', value: 'clean'}, {label: 'Arcade', value: 'arcade'}, {label: 'Algo Desk', value: 'algo-desk'}, {label: 'Classic', value: 'classic'}], theme, 'setUiTheme')
       );
     }
     function renderAutopilotSettings(data) {
@@ -2452,13 +2802,13 @@ HTML = """
           settingSwitch([{label: 'Off', value: 'false'}, {label: 'On', value: 'true', danger: true}], String(Boolean(config.allow_live)), 'setAutopilotAllowLive')
         ),
         row(
-          'Risk numbers',
-          `Trade size ${money(config.max_trade_usd || 0)} · max positions ${escapeHtml(config.max_open_positions || 0)} · minimum score ${escapeHtml(config.min_confidence || 0)}`,
-          '<button data-action onclick="editAutopilotRisk()">Edit</button>'
+          'Dynamic sizing',
+          `Bot decides dollars from Alpaca cash, buying power, stock price, probability, edge, and stop distance. Safety rail: ${escapeHtml(config.max_open_positions || 0)} max open positions.`,
+          '<button data-action onclick="editAutopilotRisk()">Edit Safety</button>'
         ),
         row(
           'Agentic scan',
-          `Window ${escapeHtml(config.scan_window_minutes || 15)}m · Kelly cap ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}% · min probability ${Number((config.min_probability || 0.56) * 100).toFixed(1)}%`,
+          `Window ${escapeHtml(config.scan_window_minutes || 15)}m · safety ceiling ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}% · min probability ${Number((config.min_probability || 0.56) * 100).toFixed(1)}%`,
           '<button data-action onclick="editAutopilotAgentic()">Edit</button>'
         ),
         row(
@@ -2469,22 +2819,22 @@ HTML = """
       ].join('');
     }
     function renderCommands(data) {
-      const commands = data.commands || [];
+      const commands = (data.commands || []).filter(command => ESSENTIAL_COMMAND_IDS.has(command.id));
       const groups = commands.reduce((acc, command) => {
         const group = command.group || 'Commands';
         acc[group] = acc[group] || [];
         acc[group].push(command);
         return acc;
       }, {});
-      document.getElementById('command-status').textContent = `${commands.length} README actions loaded`;
+      document.getElementById('command-status').textContent = `${commands.length} app actions ready`;
       document.getElementById('command-groups').innerHTML = Object.entries(groups).map(([group, items]) => `
-        <div class="panel-block">
+        <div class="command-section">
           <h2>${escapeHtml(group)}</h2>
           <div class="command-grid">
             ${items.map(commandCard).join('')}
           </div>
         </div>
-      `).join('');
+      `).join('') || empty('No Settings commands are available.');
     }
     function commandCard(command) {
       const danger = command.requires_confirmation ? 'danger' : '';
@@ -2605,7 +2955,7 @@ HTML = """
       await setTradingMode(mode);
     }
     async function setUiTheme(theme) {
-      const value = String(theme || 'arcade').toLowerCase();
+      const value = String(theme || 'retro').toLowerCase();
       await runAction(`Switching UI style to ${value.toUpperCase()}...`, async () => {
         const data = await getJson('/api/ui-theme', {
           method: 'POST',
@@ -2646,22 +2996,16 @@ HTML = """
     async function editAutopilotRisk() {
       const snapshot = await getJson('/api/autopilot');
       const config = snapshot.config || {};
-      const maxTrade = window.prompt('Max dollars per autopilot trade', config.max_trade_usd || 25);
-      if (maxTrade === null) return;
       const maxPositions = window.prompt('Max open positions', config.max_open_positions || 3);
       if (maxPositions === null) return;
-      const minConfidence = window.prompt('Minimum confidence score', config.min_confidence || 55);
-      if (minConfidence === null) return;
-      await setAutopilotSetting('max_trade_usd', maxTrade, '', false);
-      await setAutopilotSetting('max_open_positions', maxPositions, '', false);
-      await setAutopilotSetting('min_confidence', minConfidence, '', true);
+      await setAutopilotSetting('max_open_positions', maxPositions, '', true);
     }
     async function editAutopilotAgentic() {
       const snapshot = await getJson('/api/autopilot');
       const config = snapshot.config || {};
       const windowMinutes = window.prompt('Scan window in minutes (1-30)', config.scan_window_minutes || 15);
       if (windowMinutes === null) return;
-      const kellyPct = window.prompt('Max Kelly risk fraction (%)', Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1));
+      const kellyPct = window.prompt('Kelly safety ceiling (%)', Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1));
       if (kellyPct === null) return;
       const minProbabilityPct = window.prompt('Minimum prediction probability (%)', Number((config.min_probability || 0.56) * 100).toFixed(1));
       if (minProbabilityPct === null) return;

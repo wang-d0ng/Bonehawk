@@ -61,11 +61,17 @@ class DowntrendQuoteClient(FakeQuoteClient):
 
 
 class FakeAlpacaClient:
-    def __init__(self) -> None:
+    def __init__(self, cash: float = 1000, buying_power: float | None = None, portfolio_value: float | None = None) -> None:
         self.orders = []
+        self.cash = cash
+        self.buying_power = cash if buying_power is None else buying_power
+        self.portfolio_value = cash if portfolio_value is None else portfolio_value
 
     def snapshot(self) -> dict:
         return {"status": "configured", "paper": True}
+
+    def get_account(self) -> dict:
+        return {"cash": str(self.cash), "buying_power": str(self.buying_power), "portfolio_value": str(self.portfolio_value)}
 
     def place_order(self, request, confirm: str = "") -> dict:
         self.orders.append((request, confirm))
@@ -105,7 +111,7 @@ def test_load_autopilot_config_clamps_risky_values(tmp_path: Path) -> None:
 
 
 def test_autopilot_scan_generates_paper_buy_plan(tmp_path: Path) -> None:
-    config = AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40)
+    config = AutopilotConfig(enabled=True, mode="paper", max_trade_usd=1, min_confidence=40)
     engine = AutopilotEngine(
         root=tmp_path,
         config=config,
@@ -120,10 +126,14 @@ def test_autopilot_scan_generates_paper_buy_plan(tmp_path: Path) -> None:
     assert payload["mode"] == "paper"
     assert payload["orders"][0]["symbol"] == "MSFT"
     assert payload["orders"][0]["side"] == "buy"
-    assert 0 < payload["orders"][0]["notional"] <= 25
+    assert payload["orders"][0]["notional"] > 1
+    assert payload["orders"][0]["notional"] <= payload["account_state"]["available_cash"]
+    assert payload["orders"][0]["sizing_method"] == "dynamic_account_probability"
+    assert payload["orders"][0]["quantity_estimate"] > 0
     assert payload["orders"][0]["review_only"] is True
     assert payload["agentic_scan"]["opportunities"]
     assert "kelly" in " ".join(payload["orders"][0]["signals"]).lower()
+    assert "available_cash" in payload["agentic_scan"]["opportunities"][0]
 
 
 def test_autopilot_execute_places_paper_orders_and_records_decisions(tmp_path: Path) -> None:
@@ -145,6 +155,26 @@ def test_autopilot_execute_places_paper_orders_and_records_decisions(tmp_path: P
     assert alpaca.orders[0][0].take_profit is None
     assert payload["orders"][0]["stop_loss"] is not None
     assert (tmp_path / "logs" / "decision_log.jsonl").exists()
+
+
+def test_autopilot_dynamic_sizing_allocates_available_cash_across_orders(tmp_path: Path) -> None:
+    alpaca = FakeAlpacaClient(cash=30, buying_power=300, portfolio_value=1000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=1, min_confidence=40, max_open_positions=5),
+        intel_client=FakeIntelClient(["MSFT", "NVDA", "AAPL"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.scan(Watchlist(symbols=["MSFT", "NVDA", "AAPL"], positions=[], risk={}, aliases={}))
+    total_notional = sum(order["notional"] for order in payload["orders"])
+
+    assert payload["account_state"]["available_cash"] == 30
+    assert payload["orders"]
+    assert total_notional <= 30
+    assert all(order["notional"] <= 30 for order in payload["orders"])
+    assert all(order["sizing_method"] == "dynamic_account_probability" for order in payload["orders"])
 
 
 def test_autopilot_paper_mode_can_submit_downtrend_probe_orders(tmp_path: Path) -> None:

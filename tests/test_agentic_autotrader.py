@@ -46,7 +46,7 @@ def test_run_agentic_scan_ranks_narrative_price_dislocation_and_kelly_size() -> 
         quotes=quotes,
         technicals=technicals,
         snapshot=snapshot,
-        config=AgenticScanConfig(bankroll_usd=1000, max_trade_usd=125, max_kelly_fraction=0.05, window_minutes=15),
+        config=AgenticScanConfig(bankroll_usd=1000, max_trade_usd=1, max_kelly_fraction=0.05, window_minutes=15),
     )
 
     assert payload["agents"]["research"]["sources"]["reddit"] == 1
@@ -56,7 +56,11 @@ def test_run_agentic_scan_ranks_narrative_price_dislocation_and_kelly_size() -> 
     assert payload["opportunities"][0]["probability_up"] > 0.55
     assert payload["opportunities"][0]["edge_pct"] > 0
     assert 0 < payload["opportunities"][0]["kelly_fraction"] <= 0.05
-    assert payload["opportunities"][0]["suggested_notional"] <= 50
+    assert payload["opportunities"][0]["suggested_notional"] > 1
+    assert payload["opportunities"][0]["suggested_notional"] <= 950
+    assert payload["opportunities"][0]["sizing_method"] == "dynamic_account_probability"
+    assert payload["opportunities"][0]["available_cash"] == 1000
+    assert payload["opportunities"][0]["quantity_estimate"] > 0
     assert any("narrative" in reason.lower() for reason in payload["opportunities"][0]["reasons"])
 
 

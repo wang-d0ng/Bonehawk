@@ -98,6 +98,11 @@ class RiskSignal:
     loss_pct: float
     kelly_fraction: float
     suggested_notional: float
+    available_cash: float
+    risk_budget: float
+    adaptive_cap_fraction: float
+    quantity_estimate: float
+    sizing_method: str
 
 
 @dataclass(frozen=True)
@@ -166,9 +171,9 @@ def run_agentic_scan(
             },
             "risk": {
                 "status": "ready",
-                "method": "kelly_criterion_capped",
+                "method": "dynamic_account_probability",
                 "bankroll_usd": round(normalized.bankroll_usd, 2),
-                "max_kelly_fraction": round(normalized.max_kelly_fraction, 4),
+                "safety_ceiling_fraction": round(normalized.max_kelly_fraction, 4),
             },
             "postmortem": {
                 "status": "ready",
@@ -331,6 +336,11 @@ def _decision(
         "loss_pct": round(risk.loss_pct, 4),
         "kelly_fraction": round(risk.kelly_fraction, 4),
         "suggested_notional": round(risk.suggested_notional, 2),
+        "available_cash": round(risk.available_cash, 2),
+        "risk_budget": round(risk.risk_budget, 2),
+        "adaptive_cap_fraction": round(risk.adaptive_cap_fraction, 4),
+        "quantity_estimate": round(risk.quantity_estimate, 6),
+        "sizing_method": risk.sizing_method,
         "stop_loss": round(price * (1 - risk.loss_pct / 100), 4),
         "take_profit": round(price * (1 + risk.reward_pct / 100), 4),
         "sentiment_score": round(research.sentiment_score, 4),
@@ -341,7 +351,7 @@ def _decision(
         "reasons": [
             f"Narrative score {research.sentiment_score:.2f} across {research.item_count} item(s).",
             f"Market price is {quote.change_pct:.2f}% today versus short-window narrative.",
-            f"Kelly-capped size is ${risk.suggested_notional:.2f}.",
+            f"Account-aware size is ${risk.suggested_notional:.2f} from ${risk.available_cash:.2f} available cash.",
         ],
         "signals": signals,
         "review_only": True,
@@ -372,17 +382,43 @@ def _predict_symbol(
 
 
 def _kelly_size(symbol: str, quote: Quote, technicals: dict[str, float], prediction: PredictionSignal, config: AgenticScanConfig) -> RiskSignal:
+    price = max(0.01, _safe_float(quote.price, 0.01))
+    available_cash = max(0, _safe_float(config.bankroll_usd, 0))
     volume_ratio = _safe_float(technicals.get("volume_ratio"), 1)
     reward_pct = _clamp(0.35 + min(volume_ratio, 4) * 0.22, 0.35, 2.5)
     loss_pct = max(0.25, reward_pct / max(config.reward_to_risk, 0.5))
     edge_pct = (prediction.probability_up * reward_pct) - ((1 - prediction.probability_up) * loss_pct)
     reward_to_loss = reward_pct / loss_pct if loss_pct else 0
     raw_kelly = ((reward_to_loss * prediction.probability_up) - (1 - prediction.probability_up)) / reward_to_loss if reward_to_loss else 0
-    kelly_fraction = _clamp(raw_kelly, 0, config.max_kelly_fraction)
-    suggested = min(config.max_trade_usd, config.bankroll_usd * kelly_fraction)
+    probability_strength = _clamp((prediction.probability_up - config.min_probability) / max(0.01, 0.95 - config.min_probability), 0, 1)
+    price_to_cash = price / max(available_cash, price)
+    price_penalty = _clamp(1 - price_to_cash * 0.5, 0.25, 1)
+    volatility_penalty = _clamp(1 - (loss_pct / 5), 0.35, 1)
+    account_scale = _clamp(math.log10(available_cash + 10) / 4, 0.25, 1)
+    adaptive_cap = _clamp((0.01 + probability_strength * 0.11) * price_penalty * volatility_penalty * account_scale, 0.0025, config.max_kelly_fraction)
+    kelly_fraction = _clamp(raw_kelly, 0, adaptive_cap)
+    kelly_dollar_ceiling = available_cash * kelly_fraction
+    risk_based_notional = kelly_dollar_ceiling / (loss_pct / 100) if loss_pct > 0 else 0
+    exposure_fraction = _clamp(kelly_fraction * (0.35 + probability_strength * 0.45) * price_penalty, 0, 0.12)
+    account_based_notional = available_cash * exposure_fraction
+    suggested = min(available_cash * 0.95, risk_based_notional, account_based_notional)
     if suggested < 1:
         suggested = 0
-    return RiskSignal(symbol, edge_pct, reward_pct, loss_pct, kelly_fraction, suggested)
+    risk_budget = suggested * (loss_pct / 100)
+    quantity_estimate = suggested / price if price > 0 else 0
+    return RiskSignal(
+        symbol,
+        edge_pct,
+        reward_pct,
+        loss_pct,
+        kelly_fraction,
+        suggested,
+        available_cash,
+        risk_budget,
+        adaptive_cap,
+        quantity_estimate,
+        "dynamic_account_probability",
+    )
 
 
 def _research_signals(snapshot: dict[str, Any], scan_result: dict[str, Any]) -> dict[str, ResearchSignal]:

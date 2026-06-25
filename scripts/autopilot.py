@@ -162,6 +162,7 @@ class AutopilotEngine:
     def _build_scan(self, watchlist: Watchlist) -> dict[str, Any]:
         symbols = _autopilot_symbols(self.root, watchlist, self.config.symbols_per_run)
         active_watchlist = replace(watchlist, symbols=symbols)
+        account_state = self._account_state()
         snapshot = self.intel_client.snapshot(active_watchlist)
         scan_result = scan_market(active_watchlist, snapshot)
         quote_symbols = list(dict.fromkeys([*symbols[: self.config.symbols_per_run], "SPY", "QQQ"]))
@@ -171,14 +172,13 @@ class AutopilotEngine:
         market_trend = build_market_trend(technicals)
         ideas = build_trade_ideas(scan_result, quotes, active_watchlist.positions, active_watchlist.risk, technicals=technicals, market_trend=market_trend, max_ideas=12)
         growth = build_growth_candidates(scan_result, quotes, technicals, market_trend=market_trend, max_candidates=12)
-        bankroll_usd = self._bankroll_usd()
         agentic_scan = run_agentic_scan(
             scan_result=scan_result,
             quotes=quotes,
             technicals=technicals,
             snapshot={**snapshot, "market_trend": market_trend},
             config=AgenticScanConfig(
-                bankroll_usd=bankroll_usd,
+                bankroll_usd=account_state["available_cash"],
                 max_trade_usd=self.config.max_trade_usd,
                 max_kelly_fraction=self.config.max_kelly_fraction,
                 window_minutes=self.config.scan_window_minutes,
@@ -196,6 +196,7 @@ class AutopilotEngine:
             "ideas": ideas,
             "growth_candidates": growth,
             "agentic_scan": agentic_scan,
+            "account_state": account_state,
         }
 
     def _build_orders(self, scan_payload: dict[str, Any], watchlist: Watchlist) -> dict[str, list[dict[str, Any]]]:
@@ -203,6 +204,7 @@ class AutopilotEngine:
         orders: list[dict[str, Any]] = []
         blocked: list[dict[str, Any]] = []
         open_slots = max(0, self.config.max_open_positions - len(held_symbols))
+        remaining_cash = _safe_float((scan_payload.get("account_state") or {}).get("available_cash"), 0)
 
         ranked = _rank_candidate_orders(
             scan_payload.get("ideas", []),
@@ -220,30 +222,58 @@ class AutopilotEngine:
             if candidate["symbol"] in held_symbols:
                 blocked.append({**candidate, "status": "blocked", "reason": "Already in configured positions."})
                 continue
+            notional = _order_notional(candidate, remaining_cash)
+            if notional <= 0:
+                blocked.append({**candidate, "status": "blocked", "reason": "Dynamic sizing found no available cash after price, probability, and risk checks."})
+                continue
             order = {
                 **candidate,
                 "side": "buy",
-                "notional": round(_order_notional(candidate, self.config), 2),
+                "notional": round(notional, 2),
+                "quantity_estimate": round(notional / _safe_float(candidate.get("current_price"), 1), 6) if _safe_float(candidate.get("current_price"), 0) > 0 else 0,
+                "sizing_method": candidate.get("sizing_method") or "dynamic_account_probability",
                 "status": "planned",
                 "source": "autopilot",
                 "review_only": True,
             }
             orders.append(order)
+            remaining_cash = max(0, remaining_cash - notional)
         return {"orders": orders, "blocked": blocked}
 
-    def _bankroll_usd(self) -> float:
-        fallback = max(self.config.max_trade_usd, self.config.max_trade_usd * max(1, self.config.max_open_positions))
+    def _account_state(self) -> dict[str, float | str]:
+        fallback = max(1, self.config.max_trade_usd * max(1, self.config.max_open_positions))
         if not self.alpaca_client or not hasattr(self.alpaca_client, "get_account"):
-            return fallback
+            return {
+                "source": "config_fallback",
+                "cash": fallback,
+                "buying_power": fallback,
+                "portfolio_value": fallback,
+                "available_cash": fallback,
+            }
         try:
             account = self.alpaca_client.get_account()
         except Exception:
-            return fallback
+            return {
+                "source": "config_fallback",
+                "cash": fallback,
+                "buying_power": fallback,
+                "portfolio_value": fallback,
+                "available_cash": fallback,
+            }
         cash = _safe_float(account.get("cash"))
         buying_power = _safe_float(account.get("buying_power"))
         portfolio_value = _safe_float(account.get("portfolio_value"))
-        candidates = [value for value in (cash, buying_power, portfolio_value) if value > 0]
-        return min(candidates) if candidates else fallback
+        if cash > 0 and buying_power > 0:
+            available_cash = min(cash, buying_power)
+        else:
+            available_cash = max(cash, buying_power, portfolio_value, fallback)
+        return {
+            "source": "alpaca",
+            "cash": cash,
+            "buying_power": buying_power,
+            "portfolio_value": portfolio_value,
+            "available_cash": available_cash,
+        }
 
 
 def load_autopilot_config(path: Path) -> AutopilotConfig:
@@ -338,6 +368,11 @@ def _rank_candidate_orders(ideas: list[dict[str, Any]], growth: list[dict[str, A
             "stop_loss": opportunity.get("stop_loss"),
             "take_profit": opportunity.get("take_profit"),
             "suggested_notional": opportunity.get("suggested_notional"),
+            "available_cash": opportunity.get("available_cash"),
+            "risk_budget": opportunity.get("risk_budget"),
+            "adaptive_cap_fraction": opportunity.get("adaptive_cap_fraction"),
+            "quantity_estimate": opportunity.get("quantity_estimate"),
+            "sizing_method": opportunity.get("sizing_method"),
             "probability_up": opportunity.get("probability_up"),
             "edge_pct": opportunity.get("edge_pct"),
             "kelly_fraction": opportunity.get("kelly_fraction"),
@@ -386,9 +421,23 @@ def _rank_candidate_orders(ideas: list[dict[str, Any]], growth: list[dict[str, A
     return ranked[: max(1, config.max_open_positions + 4)]
 
 
-def _order_notional(candidate: dict[str, Any], config: AutopilotConfig) -> float:
-    suggested = _safe_float(candidate.get("suggested_notional"), config.max_trade_usd)
-    return max(1, min(config.max_trade_usd, suggested))
+def _order_notional(candidate: dict[str, Any], remaining_cash: float) -> float:
+    suggested = _safe_float(candidate.get("suggested_notional"), 0)
+    if suggested <= 0:
+        confidence = _safe_float(candidate.get("confidence"), 0)
+        price = _safe_float(candidate.get("current_price"), 0)
+        if confidence <= 0 or price <= 0:
+            return 0
+        strength = _clamp_float((confidence - 40) / 60, 0, 1, 0)
+        price_to_cash = price / max(price, remaining_cash)
+        price_penalty = _clamp_float(1 - price_to_cash * 0.5, 0.25, 1, 0.5)
+        suggested = remaining_cash * (0.03 + strength * 0.12) * price_penalty
+        if confidence >= 50 and remaining_cash >= 1:
+            suggested = max(1, suggested)
+    if suggested <= 0 or remaining_cash <= 0:
+        return 0
+    notional = min(suggested, remaining_cash)
+    return notional if notional >= 1 else 0
 
 
 def _broker_bracket_prices(order: dict[str, Any], config: AutopilotConfig) -> dict[str, float | None]:
