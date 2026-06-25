@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "mode": "paper",
+  "broker": "alpaca",
+  "allow_live": false,
+  "max_trade_usd": 25,
+  "max_daily_loss_usd": 20,
+  "max_open_positions": 3,
+  "min_confidence": 55,
+  "symbols_per_run": 40,
+  "strategies": [
+    "trend_following",
+    "momentum_breakout",
+    "risk_exit"
+  ]
+}

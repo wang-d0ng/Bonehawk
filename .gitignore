@@ -1,0 +1,17 @@
+.coverage
+.env
+.pytest_cache/
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+build/
+dist/
+logs/
+state/
+.DS_Store
+DAILY-SUMMARY.md
+config/autopilot.json
+config/daily_schedule.json
+config/market_universe.json
+config/watchlist.json

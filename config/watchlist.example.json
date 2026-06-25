@@ -1,0 +1,21 @@
+{
+  "symbols": ["AAPL", "MSFT", "NVDA", "TSLA", "BTC-USD"],
+  "aliases": {
+    "AAPL": ["APPLE INC"],
+    "MSFT": ["MICROSOFT CORP"],
+    "NVDA": ["NVIDIA CORP"],
+    "TSLA": ["TESLA INC"]
+  },
+  "positions": [
+    {
+      "symbol": "AAPL",
+      "quantity": 1,
+      "cost_basis": 190
+    }
+  ],
+  "risk": {
+    "max_single_position_pct": 25,
+    "max_total_crypto_pct": 20,
+    "daily_loss_alert_pct": 3
+  }
+}

@@ -1,0 +1,2552 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.alpaca_connector import AlpacaConfig, AlpacaTradingClient
+from scripts.autopilot import AutopilotConfig, AutopilotEngine, load_autopilot_config, save_autopilot_config, update_autopilot_config
+from scripts.command_center import command_catalog, run_command
+from scripts.decision_log import latest_decisions, record_decisions
+from scripts.growth_scanner import build_growth_candidates, build_growth_candidates_message
+from scripts.market_intel import MarketIntelClient, load_watchlist
+from scripts.market_scanner import build_alert_message, scan_market
+from scripts.market_universe import combine_symbols, load_market_universe, market_universe_snapshot
+from scripts.portfolio_sync import portfolio_sync_snapshot
+from scripts.quotes import CHART_RANGES, YahooQuoteClient
+from scripts.robinhood import RobinhoodConfig, RobinhoodCryptoClient
+from scripts.robinhood_agentic import AgenticTradingConfig, agentic_trading_snapshot
+from scripts.robinhood_integration import robinhood_snapshot
+from scripts.robinhood_stock_connector import RobinhoodStockOrderConnector, StockConnectorConfig, StockOrderRequest
+from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
+
+STOCK_SETTING_SPECS = {
+    "BONEHAWK_STOCK_TRADING_MODE": {
+        "values": {"review", "paper", "live"},
+        "confirm_value": "live",
+        "confirm_phrase": "LIVE_STOCK_MODE",
+    },
+    "BONEHAWK_STOCK_ORDER_CONNECTOR": {
+        "values": {"disabled", "codex_mcp"},
+        "confirm_value": "codex_mcp",
+        "confirm_phrase": "ENABLE_STOCK_CONNECTOR",
+    },
+}
+
+UI_THEME_VALUES = {"arcade", "classic"}
+SETUP_SECRET_KEYS = {
+    "ALPACA_API_KEY",
+    "ALPACA_SECRET_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "ALLOWED_CHAT_IDS",
+    "ROBINHOOD_API_KEY",
+    "ROBINHOOD_PRIVATE_KEY_BASE64",
+    "ROBINHOOD_ACCOUNT_NUMBER",
+}
+
+
+class DashboardService:
+    def __init__(
+        self,
+        root: Path = ROOT,
+        intel_client: MarketIntelClient | None = None,
+        quote_client: YahooQuoteClient | None = None,
+        codex_config_path: Path | None = None,
+        stock_connector: Any | None = None,
+        alpaca_client: Any | None = None,
+    ) -> None:
+        self.root = root
+        self.intel_client = intel_client or MarketIntelClient()
+        self.quote_client = quote_client or getattr(self.intel_client, "quote_client", YahooQuoteClient())
+        self.codex_config_path = codex_config_path
+        self.stock_connector = stock_connector
+        self.alpaca_client = alpaca_client
+
+    def status(self) -> dict[str, Any]:
+        env = _read_env_presence(self.root / ".env")
+        return {
+            "mode": env.get("TRADING_MODE", "missing"),
+            "ui_theme": _ui_theme_from_env(env),
+            "env": env,
+            "guardrails": [
+                "Autopilot runs paper-first through Alpaca.",
+                "Stock live trading requires Alpaca live permission or Robinhood Agentic Trading/MCP connector.",
+                "Crypto live trading is blocked unless TRADING_MODE=live.",
+                "Dashboard live stock orders require explicit confirmation gates.",
+            ],
+        }
+
+    def set_trading_mode(self, mode: Any, confirm: str = "") -> dict[str, Any]:
+        normalized = str(mode or "").strip().lower()
+        current_mode = _read_env_presence(self.root / ".env").get("TRADING_MODE", "missing")
+        if normalized not in {"paper", "live"}:
+            return {"ok": False, "status": "invalid_mode", "mode": current_mode, "message": "Trading mode must be paper or live."}
+        if normalized == "live" and confirm != "LIVE":
+            return {
+                "ok": False,
+                "status": "confirmation_required",
+                "mode": current_mode,
+                "message": "Live trading mode requires confirmation.",
+            }
+        _write_env_value(self.root / ".env", "TRADING_MODE", normalized)
+        return {
+            "ok": True,
+            "status": "updated",
+            "mode": normalized,
+            "message": f"Trading mode switched to {normalized}.",
+        }
+
+    def set_stock_setting(self, setting: Any, value: Any, confirm: str = "") -> dict[str, Any]:
+        key = str(setting or "").strip()
+        spec = STOCK_SETTING_SPECS.get(key)
+        if not spec:
+            return {"ok": False, "status": "invalid_setting", "message": "Unknown stock setting."}
+        normalized_value = str(value or "").strip().lower()
+        if normalized_value not in spec["values"]:
+            return {"ok": False, "status": "invalid_value", "setting": key, "message": "Choose a valid setting value."}
+        current = _read_env_presence(self.root / ".env").get(key, "missing")
+        if normalized_value == spec["confirm_value"] and confirm != spec["confirm_phrase"]:
+            return {
+                "ok": False,
+                "status": "confirmation_required",
+                "setting": key,
+                "value": current,
+                "confirm_phrase": spec["confirm_phrase"],
+                "message": f"{key} requires confirmation.",
+            }
+        _write_env_value(self.root / ".env", key, normalized_value)
+        return {
+            "ok": True,
+            "status": "updated",
+            "setting": key,
+            "value": normalized_value,
+            "message": f"{key} set to {normalized_value}.",
+        }
+
+    def set_ui_theme(self, theme: Any) -> dict[str, Any]:
+        normalized = str(theme or "").strip().lower()
+        if normalized not in UI_THEME_VALUES:
+            return {"ok": False, "status": "invalid_theme", "theme": _ui_theme_from_env(_read_env_presence(self.root / ".env")), "message": "UI style must be arcade or classic."}
+        _write_env_value(self.root / ".env", "BONEHAWK_UI_THEME", normalized)
+        return {"ok": True, "status": "updated", "theme": normalized, "message": f"UI style switched to {normalized}."}
+
+    def command_catalog(self) -> dict[str, Any]:
+        return command_catalog()
+
+    def setup_status(self) -> dict[str, Any]:
+        env = _read_env_presence(self.root / ".env")
+        autopilot_path = self.root / "config" / "autopilot.json"
+        alpaca_ready = env.get("ALPACA_API_KEY") == "set" and env.get("ALPACA_SECRET_KEY") == "set"
+        complete = alpaca_ready and autopilot_path.exists() and env.get("BONEHAWK_SETUP_COMPLETE") == "true"
+        return {
+            "ok": True,
+            "required": not complete,
+            "complete": complete,
+            "steps": {
+                "alpaca": {
+                    "status": "set" if alpaca_ready else "missing",
+                    "message": "Alpaca paper keys are required for autopilot paper orders.",
+                },
+                "autopilot": {
+                    "status": "set" if autopilot_path.exists() else "missing",
+                    "message": "Autopilot config controls paper trade size and risk limits.",
+                },
+                "telegram": {
+                    "status": "set" if env.get("TELEGRAM_BOT_TOKEN") == "set" and env.get("ALLOWED_CHAT_IDS") == "set" else "optional",
+                    "message": "Telegram alerts are optional.",
+                },
+                "robinhood": {
+                    "status": "set" if env.get("ROBINHOOD_API_KEY") == "set" and env.get("ROBINHOOD_PRIVATE_KEY_BASE64") == "set" else "optional",
+                    "message": "Robinhood remains optional for crypto and MCP stock tickets.",
+                },
+            },
+            "env": {key: env.get(key, "missing") for key in sorted(env) if key in SETUP_SECRET_KEYS or key.startswith("ALPACA_") or key == "BONEHAWK_SETUP_COMPLETE"},
+        }
+
+    def apply_setup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        validation = _validate_setup_payload(payload)
+        if validation:
+            return validation
+        env_path = self.root / ".env"
+        secret_updates = {
+            "ALPACA_API_KEY": payload.get("alpaca_api_key"),
+            "ALPACA_SECRET_KEY": payload.get("alpaca_secret_key"),
+            "TELEGRAM_BOT_TOKEN": payload.get("telegram_bot_token"),
+            "ALLOWED_CHAT_IDS": payload.get("allowed_chat_ids"),
+            "ROBINHOOD_API_KEY": payload.get("robinhood_api_key"),
+            "ROBINHOOD_PRIVATE_KEY_BASE64": payload.get("robinhood_private_key_base64"),
+            "ROBINHOOD_ACCOUNT_NUMBER": payload.get("robinhood_account_number"),
+        }
+        for key, value in secret_updates.items():
+            normalized = str(value or "").strip()
+            if normalized:
+                _write_env_value(env_path, key, normalized)
+        _write_env_value(env_path, "ALPACA_PAPER", "true" if _setup_bool(payload.get("alpaca_paper"), default=True) else "false")
+        _write_env_value(env_path, "ALPACA_ALLOW_LIVE", "false")
+        _write_env_value(env_path, "TRADING_MODE", "paper")
+        _write_env_value(env_path, "BONEHAWK_STOCK_TRADING_MODE", "review")
+        _write_env_value(env_path, "BONEHAWK_STOCK_ORDER_CONNECTOR", "disabled")
+        _write_env_value(env_path, "BONEHAWK_SETUP_COMPLETE", "true")
+
+        autopilot_path = self.root / "config" / "autopilot.json"
+        existing = load_autopilot_config(autopilot_path)
+        save_autopilot_config(
+            autopilot_path,
+            AutopilotConfig(
+                enabled=_setup_bool(payload.get("autopilot_enabled"), default=existing.enabled or True),
+                mode="paper",
+                broker="alpaca",
+                allow_live=False,
+                max_trade_usd=float(payload.get("max_trade_usd", existing.max_trade_usd)),
+                max_daily_loss_usd=existing.max_daily_loss_usd,
+                max_open_positions=int(float(payload.get("max_open_positions", existing.max_open_positions))),
+                min_confidence=int(float(payload.get("min_confidence", existing.min_confidence))),
+                symbols_per_run=existing.symbols_per_run,
+                strategies=existing.strategies,
+            ),
+        )
+        return {"ok": True, "status": "saved", "message": "Bonehawk setup saved locally.", "setup": self.setup_status()}
+
+    def run_command(self, command_id: str, inputs: dict[str, Any] | None = None, confirm: str = "") -> dict[str, Any]:
+        return run_command(self.root, command_id, inputs=inputs, confirm=confirm)
+
+    def market_intel(self) -> dict[str, Any]:
+        watchlist = self.watchlist()
+        return self.intel_client.snapshot(watchlist)
+
+    def portfolio_sync(self) -> dict[str, Any]:
+        crypto_client = None
+        try:
+            crypto_client = RobinhoodCryptoClient(RobinhoodConfig.from_env(self.root / ".env"))
+        except Exception:
+            crypto_client = None
+        return portfolio_sync_snapshot(self.watchlist(), crypto_client=crypto_client)
+
+    def robinhood(self) -> dict[str, Any]:
+        config = RobinhoodConfig.from_env(self.root / ".env")
+        client = None
+        try:
+            client = RobinhoodCryptoClient(config)
+        except Exception:
+            client = None
+        return robinhood_snapshot(config, client)
+
+    def agentic_trading(self) -> dict[str, Any]:
+        config = AgenticTradingConfig.from_env(codex_config_path=self.codex_config_path)
+        payload = agentic_trading_snapshot(config)
+        payload["stock_order_connector"] = self._stock_connector().snapshot()
+        return payload
+
+    def stock_connector_diagnostics(self) -> dict[str, Any]:
+        return self._stock_connector().diagnose()
+
+    def autopilot(self) -> dict[str, Any]:
+        return self._autopilot_engine().snapshot()
+
+    def autopilot_scan(self) -> dict[str, Any]:
+        return self._autopilot_engine().scan(self.scanner_watchlist())
+
+    def autopilot_execute(self, confirm: str = "") -> dict[str, Any]:
+        return self._autopilot_engine().execute(self.scanner_watchlist(), confirm=confirm)
+
+    def set_autopilot_setting(self, setting: Any, value: Any, confirm: str = "") -> dict[str, Any]:
+        path = self.root / "config" / "autopilot.json"
+        config = load_autopilot_config(path)
+        next_config, payload = update_autopilot_config(config, setting, value, confirm=confirm)
+        if payload.get("ok"):
+            save_autopilot_config(path, next_config)
+            payload["config"] = next_config.snapshot()
+        else:
+            payload["config"] = config.snapshot()
+        return payload
+
+    def stocks(self) -> dict[str, Any]:
+        universe_path = self.root / "config" / "market_universe.json"
+        if not universe_path.exists():
+            universe_path = self.root / "config" / "market_universe.example.json"
+        return market_universe_snapshot(universe_path)
+
+    def scanner(self) -> dict[str, Any]:
+        watchlist = self.scanner_watchlist()
+        snapshot = self.intel_client.snapshot(watchlist)
+        return scan_market(watchlist, snapshot)
+
+    def trade_ideas(self) -> dict[str, Any]:
+        watchlist = self.scanner_watchlist()
+        snapshot = self.intel_client.snapshot(watchlist)
+        scan_result = scan_market(watchlist, snapshot)
+        symbols = _trade_quote_symbols(scan_result, watchlist.positions)
+        quotes = self.quote_client.get_quotes(symbols)
+        history_symbols = list(dict.fromkeys([*symbols, "SPY", "QQQ"]))
+        histories = self.quote_client.get_histories(history_symbols)
+        technicals = {symbol: history.technicals() for symbol, history in histories.items()}
+        market_trend = build_market_trend(technicals)
+        ideas = build_trade_ideas(scan_result, quotes, watchlist.positions, watchlist.risk, technicals=technicals, market_trend=market_trend)
+        record_decisions(self.root / "logs" / "decision_log.jsonl", "dashboard", ideas)
+        return {
+            "summary": scan_result["summary"],
+            "market_trend": market_trend,
+            "scans": scan_result["scans"],
+            "alerts": scan_result["alerts"],
+            "ideas": ideas,
+            "notice": "Trade ideas are review signals only. No live stock order was placed.",
+        }
+
+    def growth_candidates(self) -> dict[str, Any]:
+        watchlist = self.scanner_watchlist()
+        snapshot = self.intel_client.snapshot(watchlist)
+        scan_result = scan_market(watchlist, snapshot)
+        symbols = _trade_quote_symbols(scan_result, watchlist.positions, limit=40)
+        quotes = self.quote_client.get_quotes(symbols)
+        history_symbols = list(dict.fromkeys([*symbols, "SPY", "QQQ"]))
+        histories = self.quote_client.get_histories(history_symbols)
+        technicals = {symbol: history.technicals() for symbol, history in histories.items()}
+        market_trend = build_market_trend(technicals)
+        candidates = build_growth_candidates(scan_result, quotes, technicals, market_trend=market_trend)
+        record_decisions(self.root / "logs" / "decision_log.jsonl", "growth", candidates)
+        return {
+            "summary": scan_result["summary"],
+            "market_trend": market_trend,
+            "candidates": candidates,
+            "message": build_growth_candidates_message(candidates),
+            "notice": "Growth candidates are review-only quick-return signals. No live order was placed.",
+        }
+
+    def stock_chart(self, symbol: Any, range_key: Any = "1d") -> dict[str, Any]:
+        normalized_symbol = _normalize_stock_symbol(symbol)
+        if not normalized_symbol:
+            return {"ok": False, "status": "invalid_symbol", "message": "Choose a valid stock symbol."}
+        normalized_range = str(range_key or "1d").strip().lower()
+        if normalized_range not in CHART_RANGES:
+            normalized_range = "1d"
+        try:
+            chart = self.quote_client.get_stock_chart(normalized_symbol, normalized_range)
+        except Exception as error:
+            return {"ok": False, "status": "chart_unavailable", "symbol": normalized_symbol, "message": str(error)}
+        closes = [point.close for point in chart.points]
+        return {
+            "ok": True,
+            "symbol": chart.symbol,
+            "range": chart.range_key,
+            "interval": chart.interval,
+            "latest_price": round(chart.latest_price, 4),
+            "change_pct": round(chart.change_pct, 2),
+            "points": [
+                {"timestamp": point.timestamp, "close": round(point.close, 4), "volume": point.volume}
+                for point in chart.points
+            ],
+            "summary": {
+                "point_count": len(chart.points),
+                "high": round(max(closes), 4),
+                "low": round(min(closes), 4),
+            },
+            "review_only": True,
+            "notice": "Chart data is for review only. No order was placed.",
+        }
+
+    def stock_order_intent(self, symbol: Any, side: Any, quantity: Any) -> dict[str, Any]:
+        request_or_error = _stock_order_request(symbol, side, quantity)
+        if isinstance(request_or_error, dict):
+            return request_or_error
+        request = request_or_error
+        quote = self.quote_client.get_quotes([request.symbol]).get(request.symbol)
+        current_price = round(quote.price, 4) if quote else None
+        reason = f"{request.side} intent captured from dashboard. No live stock order was placed."
+        intent = {
+            "symbol": request.symbol,
+            "action": f"{request.side}_INTENT",
+            "confidence": None,
+            "current_price": current_price,
+            "quantity": request.quantity,
+            "status": "recorded",
+            "reason": reason,
+            "signals": [f"quantity {request.quantity:g}", "stock order intent", "review only"],
+            "review_only": True,
+        }
+        record_decisions(self.root / "logs" / "decision_log.jsonl", "stock_order_intent", [intent])
+        return {
+            "ok": True,
+            "status": "recorded",
+            "symbol": request.symbol,
+            "side": request.side,
+            "quantity": request.quantity,
+            "current_price": current_price,
+            "review_only": True,
+            "message": f"{request.side} ticket recorded for {request.quantity:g} {request.symbol}. No live stock order was placed.",
+        }
+
+    def stock_order(self, symbol: Any, side: Any, quantity: Any, confirm: str = "") -> dict[str, Any]:
+        request_or_error = _stock_order_request(symbol, side, quantity)
+        if isinstance(request_or_error, dict):
+            return request_or_error
+        request = request_or_error
+        result = self._stock_connector().place_order(request, confirm=confirm)
+        record_decisions(
+            self.root / "logs" / "decision_log.jsonl",
+            "live_stock_order" if result.get("ok") else "stock_order_attempt",
+            [
+                {
+                    "symbol": result.get("symbol") or request.symbol,
+                    "action": f"{result.get('side') or request.side}_{'LIVE' if result.get('ok') else 'BLOCKED'}",
+                    "confidence": None,
+                    "current_price": None,
+                    "quantity": result.get("quantity", request.quantity),
+                    "status": result.get("status"),
+                    "broker_order_id": result.get("broker_order_id"),
+                    "reason": result.get("message"),
+                    "signals": [f"quantity {result.get('quantity', request.quantity)}", f"broker_order_id {result.get('broker_order_id') or 'unknown'}"],
+                    "review_only": bool(result.get("review_only", False)),
+                }
+            ],
+        )
+        return result
+
+    def tickets(self) -> dict[str, Any]:
+        rows = latest_decisions(self.root / "logs" / "decision_log.jsonl", limit=200)
+        tickets = [_ticket_from_decision(row) for row in rows]
+        tickets = [ticket for ticket in tickets if ticket is not None]
+        return {"tickets": tickets, "summary": {"count": len(tickets)}}
+
+    def _stock_connector(self) -> Any:
+        if self.stock_connector is not None:
+            return self.stock_connector
+        return RobinhoodStockOrderConnector(StockConnectorConfig.from_project_env(self.root / ".env", codex_config_path=self.codex_config_path))
+
+    def _alpaca_client(self) -> Any:
+        if self.alpaca_client is not None:
+            return self.alpaca_client
+        return AlpacaTradingClient(AlpacaConfig.from_env(self.root / ".env"))
+
+    def _autopilot_engine(self) -> AutopilotEngine:
+        return AutopilotEngine(
+            root=self.root,
+            config=load_autopilot_config(self.root / "config" / "autopilot.json"),
+            intel_client=self.intel_client,
+            quote_client=self.quote_client,
+            alpaca_client=self._alpaca_client(),
+        )
+
+    def decision_log(self) -> dict[str, Any]:
+        rows = latest_decisions(self.root / "logs" / "decision_log.jsonl")
+        return {"decisions": rows, "summary": {"count": len(rows)}}
+
+    def trade_idea_alerts(self) -> dict[str, Any]:
+        payload = self.trade_ideas()
+        record_decisions(self.root / "logs" / "decision_log.jsonl", "telegram", payload["ideas"])
+        message = build_trade_ideas_message(payload["ideas"])
+        result = subprocess.run(
+            ["bash", str(self.root / "scripts" / "telegram.sh"), message],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "message": message,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+
+    def scanner_alerts(self) -> dict[str, Any]:
+        scan_result = self.scanner()
+        message = build_alert_message(scan_result)
+        result = subprocess.run(
+            ["bash", str(self.root / "scripts" / "telegram.sh"), message],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "message": message,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+
+    def watchlist(self):
+        watchlist_path = self.root / "config" / "watchlist.json"
+        if not watchlist_path.exists():
+            watchlist_path = self.root / "config" / "watchlist.example.json"
+        return load_watchlist(watchlist_path)
+
+    def scanner_watchlist(self):
+        watchlist = self.watchlist()
+        universe_path = self.root / "config" / "market_universe.json"
+        if not universe_path.exists():
+            universe_path = self.root / "config" / "market_universe.example.json"
+        universe = load_market_universe(universe_path)
+        symbols = combine_symbols(watchlist.symbols, universe, limit=len(watchlist.symbols) + len(universe))
+        return type(watchlist)(symbols=symbols, positions=watchlist.positions, risk=watchlist.risk, aliases=watchlist.aliases)
+
+    def paper_cycle(self, notify: bool = False) -> dict[str, Any]:
+        args = [str(self.root / ".venv" / "bin" / "python"), str(self.root / "scripts" / "paper_cycle.py")]
+        if notify:
+            args.append("--notify")
+        if not Path(args[0]).exists():
+            args[0] = "python3"
+        result = subprocess.run(args, cwd=self.root, text=True, capture_output=True, check=False)
+        return {
+            "ok": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+
+
+def json_response(payload: Any, status: int = 200) -> tuple[int, dict[str, str], bytes]:
+    return status, {"Content-Type": "application/json"}, json.dumps(payload, indent=2).encode("utf-8")
+
+
+def html_response() -> tuple[int, dict[str, str], bytes]:
+    return 200, {"Content-Type": "text/html; charset=utf-8"}, HTML.encode("utf-8")
+
+
+def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            if path == "/":
+                self._send(*html_response())
+            elif path == "/api/status":
+                self._send(*json_response(service.status()))
+            elif path == "/api/setup-status":
+                self._send(*json_response(service.setup_status()))
+            elif path == "/api/market-intel":
+                self._send(*json_response(service.market_intel()))
+            elif path == "/api/portfolio-sync":
+                self._send(*json_response(service.portfolio_sync()))
+            elif path == "/api/robinhood":
+                self._send(*json_response(service.robinhood()))
+            elif path == "/api/agentic-trading":
+                self._send(*json_response(service.agentic_trading()))
+            elif path == "/api/autopilot":
+                self._send(*json_response(service.autopilot()))
+            elif path == "/api/stock-connector-diagnostics":
+                self._send(*json_response(service.stock_connector_diagnostics()))
+            elif path == "/api/stocks":
+                self._send(*json_response(service.stocks()))
+            elif path == "/api/scanner":
+                self._send(*json_response(service.scanner()))
+            elif path == "/api/trade-ideas":
+                self._send(*json_response(service.trade_ideas()))
+            elif path == "/api/growth-candidates":
+                self._send(*json_response(service.growth_candidates()))
+            elif path == "/api/stock-chart":
+                payload = service.stock_chart(_first_query_value(query, "symbol"), _first_query_value(query, "range") or "1d")
+                status = 200 if payload.get("ok") else 400
+                self._send(*json_response(payload, status=status))
+            elif path == "/api/decision-log":
+                self._send(*json_response(service.decision_log()))
+            elif path == "/api/tickets":
+                self._send(*json_response(service.tickets()))
+            elif path == "/api/commands":
+                self._send(*json_response(service.command_catalog()))
+            else:
+                self._send(*json_response({"error": "not found"}, status=404))
+
+        def do_POST(self) -> None:
+            if self.path == "/api/paper-cycle":
+                self._send(*json_response(service.paper_cycle(notify=False)))
+            elif self.path == "/api/setup":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.apply_setup(payload)
+                status = 200 if result.get("ok") else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/paper-cycle-notify":
+                self._send(*json_response(service.paper_cycle(notify=True)))
+            elif self.path == "/api/scanner-alerts":
+                self._send(*json_response(service.scanner_alerts()))
+            elif self.path == "/api/trade-idea-alerts":
+                self._send(*json_response(service.trade_idea_alerts()))
+            elif self.path == "/api/autopilot-scan":
+                self._send(*json_response(service.autopilot_scan()))
+            elif self.path == "/api/autopilot-run":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.autopilot_execute(confirm=str(payload.get("confirm", "")))
+                status = 200 if result.get("ok") else 409 if result.get("status") in {"disabled", "confirmation_required"} else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/trading-mode":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.set_trading_mode(payload.get("mode"), confirm=str(payload.get("confirm", "")))
+                status = 200 if result.get("ok") else 409 if result.get("status") == "confirmation_required" else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/stock-settings":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.set_stock_setting(payload.get("setting"), payload.get("value"), confirm=str(payload.get("confirm", "")))
+                status = 200 if result.get("ok") else 409 if result.get("status") == "confirmation_required" else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/autopilot-settings":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.set_autopilot_setting(payload.get("setting"), payload.get("value"), confirm=str(payload.get("confirm", "")))
+                status = 200 if result.get("ok") else 409 if result.get("status") == "confirmation_required" else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/ui-theme":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.set_ui_theme(payload.get("theme"))
+                status = 200 if result.get("ok") else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/commands/run":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                inputs = payload.get("inputs", {})
+                if not isinstance(inputs, dict):
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": "inputs must be an object."}, status=400))
+                    return
+                result = service.run_command(str(payload.get("id", "")), inputs=inputs, confirm=str(payload.get("confirm", "")))
+                status = 200 if result.get("ok") else 409 if result.get("status") == "confirmation_required" else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/stock-order-intent":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.stock_order_intent(payload.get("symbol"), payload.get("side"), payload.get("quantity"))
+                status = 200 if result.get("ok") else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/stock-order":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.stock_order(payload.get("symbol"), payload.get("side"), payload.get("quantity"), confirm=str(payload.get("confirm", "")))
+                status = 200 if result.get("ok") else 409 if result.get("status") in {"confirmation_required", "connector_disabled", "mcp_not_configured", "app_not_live", "stock_mode_not_live"} else 400
+                self._send(*json_response(result, status=status))
+            else:
+                self._send(*json_response({"error": "not found"}, status=404))
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def _send(self, status: int, headers: dict[str, str], body: bytes) -> None:
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json_body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length > 16384:
+                raise ValueError("Request body is too large.")
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as error:
+                raise ValueError("Request body must be JSON.") from error
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object.")
+            return payload
+
+    return Handler
+
+
+def _read_env_presence(path: Path) -> dict[str, str]:
+    keys = {
+        "ROBINHOOD_API_KEY": "missing",
+        "ROBINHOOD_PRIVATE_KEY_BASE64": "missing",
+        "ROBINHOOD_ACCOUNT_NUMBER": "missing",
+        "TELEGRAM_BOT_TOKEN": "missing",
+        "ALLOWED_CHAT_IDS": "missing",
+        "TRADING_MODE": "missing",
+        "BONEHAWK_STOCK_TRADING_MODE": "missing",
+        "BONEHAWK_STOCK_ORDER_CONNECTOR": "missing",
+        "BONEHAWK_UI_THEME": "arcade",
+        "ALPACA_API_KEY": "missing",
+        "ALPACA_SECRET_KEY": "missing",
+        "ALPACA_PAPER": "true",
+        "ALPACA_ALLOW_LIVE": "false",
+        "BONEHAWK_SETUP_COMPLETE": "false",
+    }
+    if not path.exists():
+        return keys
+    for line in path.read_text().splitlines():
+        if "=" not in line or line.strip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in keys:
+            keys[key] = "set" if value.strip() else "blank"
+            if key in {"TRADING_MODE", "BONEHAWK_STOCK_TRADING_MODE", "BONEHAWK_STOCK_ORDER_CONNECTOR", "BONEHAWK_UI_THEME", "ALPACA_PAPER", "ALPACA_ALLOW_LIVE", "BONEHAWK_SETUP_COMPLETE"} and value.strip():
+                keys[key] = value.strip()
+    return keys
+
+
+def _ui_theme_from_env(env: dict[str, str]) -> str:
+    theme = str(env.get("BONEHAWK_UI_THEME") or "arcade").strip().lower()
+    return theme if theme in UI_THEME_VALUES else "arcade"
+
+
+def _validate_setup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("alpaca_api_key", "alpaca_secret_key", "telegram_bot_token", "allowed_chat_ids", "robinhood_api_key", "robinhood_private_key_base64", "robinhood_account_number"):
+        value = payload.get(key)
+        if value is not None and len(str(value)) > 4096:
+            return {"ok": False, "status": "invalid_setup", "message": "A setup value is too long."}
+    for key in ("max_trade_usd", "max_open_positions", "min_confidence"):
+        if key not in payload or payload.get(key) in {None, ""}:
+            continue
+        try:
+            number = float(payload.get(key))
+        except (TypeError, ValueError):
+            return {"ok": False, "status": "invalid_setup", "message": f"{key} must be a number."}
+        if key == "max_trade_usd" and not 1 <= number <= 1000:
+            return {"ok": False, "status": "invalid_setup", "message": "Max trade size must be between $1 and $1000."}
+        if key == "max_open_positions" and not 0 <= number <= 25:
+            return {"ok": False, "status": "invalid_setup", "message": "Max open positions must be between 0 and 25."}
+        if key == "min_confidence" and not 35 <= number <= 95:
+            return {"ok": False, "status": "invalid_setup", "message": "Minimum confidence must be between 35 and 95."}
+    return None
+
+
+def _setup_bool(value: Any, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ticket_from_decision(row: dict[str, Any]) -> dict[str, Any] | None:
+    source = str(row.get("source") or "")
+    action = str(row.get("action") or "")
+    ticket_sources = {"stock_order_intent", "live_stock_order", "stock_order_attempt", "autopilot_order"}
+    if source not in ticket_sources and "_INTENT" not in action and "_LIVE" not in action and "_ALPACA" not in action:
+        return None
+    status = str(row.get("status") or "").strip().lower()
+    if not status:
+        if source == "stock_order_intent" or "_INTENT" in action:
+            status = "recorded"
+        elif row.get("broker_order_id"):
+            status = "submitted"
+        else:
+            status = "unknown"
+    side = "SELL" if "SELL" in action.upper() else "BUY" if "BUY" in action.upper() else "ORDER"
+    return {
+        "timestamp": row.get("timestamp"),
+        "source": source,
+        "symbol": row.get("symbol"),
+        "side": side,
+        "action": action,
+        "quantity": _ticket_quantity(row),
+        "current_price": row.get("current_price"),
+        "status": status,
+        "broker_order_id": row.get("broker_order_id"),
+        "message": row.get("reason"),
+        "review_only": row.get("review_only", True),
+    }
+
+
+def _ticket_quantity(row: dict[str, Any]) -> float | None:
+    quantity = row.get("quantity")
+    if quantity is not None:
+        try:
+            return float(quantity)
+        except (TypeError, ValueError):
+            return None
+    for signal in row.get("signals") or []:
+        text = str(signal)
+        if text.startswith("quantity "):
+            try:
+                return float(text.split(" ", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _write_env_value(path: Path, key: str, value: str) -> None:
+    lines = path.read_text().splitlines() if path.exists() else []
+    updated: list[str] = []
+    replaced = False
+    for line in lines:
+        if "=" not in line or line.strip().startswith("#"):
+            updated.append(line)
+            continue
+        current_key, _current_value = line.split("=", 1)
+        if current_key.strip() == key and not replaced:
+            updated.append(f"{key}={value}")
+            replaced = True
+        elif current_key.strip() == key:
+            continue
+        else:
+            updated.append(line)
+    if not replaced:
+        if updated and updated[-1].strip():
+            updated.append("")
+        updated.append(f"{key}={value}")
+    path.write_text("\n".join(updated) + "\n")
+
+
+def _trade_quote_symbols(scan_result: dict[str, Any], positions: list[Any], limit: int = 30) -> list[str]:
+    symbols: list[str] = []
+    for position in positions:
+        if not position.symbol.endswith("-USD"):
+            symbols.append(position.symbol)
+    for scan in scan_result.get("scans", []):
+        symbol = str(scan.get("symbol", "")).upper()
+        if symbol and not symbol.endswith("-USD"):
+            symbols.append(symbol)
+        if len(dict.fromkeys(symbols)) >= limit:
+            break
+    return list(dict.fromkeys(symbols))[:limit]
+
+
+def _first_query_value(query: dict[str, list[str]], key: str) -> str:
+    values = query.get(key, [])
+    return values[0] if values else ""
+
+
+def _normalize_stock_symbol(symbol: Any) -> str:
+    value = str(symbol or "").strip().upper()
+    if not value or len(value) > 12:
+        return ""
+    if not all(character.isalnum() or character in {".", "-"} for character in value):
+        return ""
+    return value
+
+
+def _stock_order_request(symbol: Any, side: Any, quantity: Any) -> StockOrderRequest | dict[str, Any]:
+    normalized_symbol = _normalize_stock_symbol(symbol)
+    if not normalized_symbol:
+        return {"ok": False, "status": "invalid_symbol", "message": "Choose a valid stock symbol."}
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side not in {"BUY", "SELL"}:
+        return {"ok": False, "status": "invalid_side", "message": "Choose Buy or Sell."}
+    try:
+        normalized_quantity = float(quantity)
+    except (TypeError, ValueError):
+        return {"ok": False, "status": "invalid_quantity", "message": "Quantity must be a number."}
+    if normalized_quantity <= 0 or normalized_quantity > 1_000_000:
+        return {"ok": False, "status": "invalid_quantity", "message": "Quantity must be greater than 0."}
+    return StockOrderRequest(symbol=normalized_symbol, side=normalized_side, quantity=normalized_quantity)
+
+
+HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bonehawk</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --ink: #f4f4f5;
+      --muted: #9ca3af;
+      --page: #0a0a0b;
+      --panel: #151516;
+      --panel-raised: #1a1a1c;
+      --line: rgba(255,255,255,0.09);
+      --line-soft: rgba(255,255,255,0.06);
+      --black: #0f0f10;
+      --blue: #7aa2ff;
+      --green: #39d98a;
+      --red: #ff5c64;
+      --amber: #f6c453;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, rgba(122,162,255,0.05), transparent 28%),
+        repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 4px),
+        var(--page);
+      color: var(--ink);
+      font-family: var(--mono);
+      text-shadow: 0 0 8px rgba(244,244,245,0.12);
+    }
+    body.theme-arcade {
+      --page: #080317;
+      --panel: #160d2b;
+      --panel-raised: #21123f;
+      --line: rgba(255, 49, 214, 0.34);
+      --line-soft: rgba(0, 229, 255, 0.2);
+      --blue: #00e5ff;
+      --green: #00ff9c;
+      --red: #ff2f87;
+      --amber: #ffe14d;
+      background:
+        radial-gradient(circle at 50% -18%, rgba(255,49,214,0.24), transparent 34%),
+        radial-gradient(circle at 88% 10%, rgba(0,229,255,0.13), transparent 26%),
+        linear-gradient(180deg, rgba(16,3,43,0.9), rgba(5,2,14,0.98)),
+        var(--page);
+    }
+    body.theme-arcade::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      pointer-events: none;
+      background: repeating-linear-gradient(to bottom, rgba(255,255,255,0.035) 0 1px, rgba(0,0,0,0.11) 1px 3px, transparent 3px 5px);
+      mix-blend-mode: soft-light;
+    }
+    body.theme-arcade h1, body.theme-arcade h2, body.theme-arcade .brand .sub {
+      color: var(--blue);
+      text-shadow: 0 0 8px rgba(0,229,255,0.72), 0 0 22px rgba(255,49,214,0.28);
+    }
+    body.theme-arcade .brand, body.theme-arcade .topbar {
+      background: linear-gradient(90deg, rgba(255,49,214,0.12), rgba(0,229,255,0.05));
+    }
+    body.theme-arcade .terminal-mark {
+      background: var(--red);
+      color: #14031d;
+      box-shadow: 4px 4px 0 var(--blue), 0 0 22px rgba(255,47,135,0.55);
+    }
+    body.theme-arcade aside,
+    body.theme-arcade .metric,
+    body.theme-arcade .data-row,
+    body.theme-arcade .command-card,
+    body.theme-arcade .chart-drawer,
+    body.theme-arcade .ticket-drawer,
+    body.theme-arcade .toast {
+      box-shadow: 0 0 0 1px rgba(0,229,255,0.11), 0 0 24px rgba(255,49,214,0.13), inset 0 0 18px rgba(0,229,255,0.04);
+    }
+    body.theme-arcade .tab.active,
+    body.theme-arcade .mode-option.active,
+    body.theme-arcade .range-control button.active {
+      box-shadow: 0 0 18px rgba(0,255,156,0.34), inset 0 0 0 1px rgba(255,255,255,0.18);
+    }
+    body.theme-classic {
+      --ink: #f4f4f5;
+      --muted: #9ca3af;
+      --page: #0a0a0b;
+      --panel: #151516;
+      --panel-raised: #1a1a1c;
+      --line: rgba(255,255,255,0.09);
+      --line-soft: rgba(255,255,255,0.06);
+      --blue: #7aa2ff;
+      --green: #39d98a;
+      --red: #ff5c64;
+      --amber: #f6c453;
+    }
+    body.menu-open { overflow: hidden; }
+    .arcade-grid {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      background:
+        linear-gradient(rgba(57,217,138,0.08) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(122,162,255,0.07) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,0.2), transparent 56%);
+    }
+    .app-shell { position: relative; z-index: 1; min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); }
+    aside { background: rgba(21,21,22,0.94); color: #ffffff; border-right: 2px solid var(--line); display: flex; flex-direction: column; box-shadow: 10px 0 0 rgba(0,0,0,0.2); }
+    body.sidebar-collapsed .app-shell { grid-template-columns: 1fr; }
+    body.sidebar-collapsed aside { position: fixed; inset: 0 auto 0 0; width: 240px; z-index: 70; transform: translateX(-104%); transition: transform 160ms ease; }
+    body.sidebar-collapsed.menu-open aside { transform: translateX(0); }
+    .sidebar-backdrop { position: fixed; inset: 0; z-index: 65; background: rgba(0,0,0,0.56); display: none; }
+    body.menu-open .sidebar-backdrop { display: block; }
+    main { min-width: 0; padding: 0 24px 24px; }
+    h1 { font-size: 17px; line-height: 1.2; margin: 0; text-transform: uppercase; }
+    h2 { font-size: 13px; margin: 0; text-transform: uppercase; color: var(--muted); letter-spacing: 0.08em; }
+    h3 { font-size: 13px; margin: 0; }
+    button { min-height: 34px; border: 2px solid var(--line); background: var(--panel-raised); color: var(--ink); border-radius: 3px; padding: 0 12px; cursor: pointer; font-family: var(--mono); font-weight: 850; text-transform: uppercase; box-shadow: inset -2px -2px 0 rgba(0,0,0,0.38), inset 2px 2px 0 rgba(255,255,255,0.04); }
+    button:hover { border-color: rgba(57,217,138,0.5); color: var(--green); }
+    button:disabled { cursor: wait; opacity: 0.62; }
+    button.primary { background: #f4f4f5; color: #111113; border-color: #f4f4f5; }
+    a { color: var(--blue); text-decoration: none; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0d0d0e; color: #e5e7eb; border: 2px solid var(--line); border-radius: 3px; padding: 14px; margin: 10px 0 0; font-size: 12px; line-height: 1.5; }
+    .brand { height: 64px; display: flex; align-items: center; gap: 10px; border-bottom: 2px solid var(--line); padding: 0 18px; }
+    .brand-main { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+    .menu-pin { min-height: 26px; min-width: 42px; padding: 0 7px; font-size: 10px; }
+    .terminal-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 3px; background: #f4f4f5; color: #111113; font-family: var(--mono); font-weight: 900; box-shadow: 3px 3px 0 rgba(57,217,138,0.22); }
+    .brand .sub { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; }
+    .nav { display: grid; gap: 4px; padding: 14px 12px; }
+    .tab { width: 100%; text-align: left; background: transparent; color: var(--muted); border-color: transparent; box-shadow: none; }
+    .tab.active { background: #262628; color: var(--ink); border-color: rgba(122,162,255,0.72); box-shadow: inset 3px 0 0 var(--green), 0 0 18px rgba(122,162,255,0.16); }
+    .rail-status { margin-top: auto; border-top: 2px solid var(--line); padding: 14px 18px; display: grid; gap: 8px; color: var(--muted); font-size: 12px; }
+    .topbar { position: sticky; top: 0; z-index: 20; display: grid; grid-template-columns: minmax(260px, 1fr) auto; grid-template-areas: "search toolbar" "title market"; align-items: center; gap: 10px 14px; min-height: 64px; padding: 10px 0; background: rgba(10,10,11,0.9); border-bottom: 2px solid var(--line); backdrop-filter: blur(10px); }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .menu-toggle { min-width: 40px; padding: 0 10px; }
+    .search-box { height: 36px; border: 2px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 3px; display: flex; align-items: center; padding: 0 12px; gap: 8px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03); }
+    .search-box input { width: 100%; background: transparent; border: 0; outline: 0; color: var(--ink); font-family: var(--mono); font-size: 13px; }
+    .view-heading { grid-area: title; min-width: 0; }
+    .search-box { grid-area: search; }
+    .toolbar { grid-area: toolbar; }
+    .market-state { justify-self: end; border: 2px solid var(--line); background: var(--panel); border-radius: 3px; padding: 8px 13px; font-size: 12px; color: var(--muted); }
+    .market-state { grid-area: market; }
+    .status-line { min-height: 22px; font-size: 12px; color: var(--muted); }
+    .ticker-tape { display: flex; gap: 24px; overflow-x: auto; border-bottom: 2px solid var(--line); padding: 10px 0; margin-bottom: 22px; scrollbar-width: none; }
+    .ticker-tape::-webkit-scrollbar { display: none; }
+    .ticker { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; font-family: var(--mono); font-size: 12px; }
+    .ticker strong { color: var(--ink); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: grid; gap: 14px; }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 16px; min-height: 114px; display: grid; align-content: space-between; box-shadow: inset -3px -3px 0 rgba(0,0,0,0.28); }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .metric-value { font-family: var(--mono); font-size: 25px; font-weight: 760; margin-top: 8px; overflow-wrap: anywhere; }
+    .metric-note { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .data-list { display: grid; gap: 8px; }
+    .data-row { background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 13px 15px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; transition: background 140ms ease, border-color 140ms ease; }
+    .data-row:hover { background: var(--panel-raised); border-color: rgba(255,255,255,0.14); }
+    .data-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-weight: 720; min-width: 0; }
+    .data-sub { color: var(--muted); font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
+    .right-stack { display: grid; justify-items: end; gap: 5px; white-space: nowrap; }
+    .pill { border-radius: 4px; padding: 2px 6px; background: #2a2a2c; color: var(--muted); border: 1px solid var(--line); font-family: var(--mono); font-size: 10px; font-weight: 800; text-transform: uppercase; }
+    .pill.buy, .pill.hold { background: rgba(57,217,138,0.12); color: var(--green); border-color: rgba(57,217,138,0.3); }
+    .pill.sell { background: rgba(255,92,100,0.12); color: var(--red); border-color: rgba(255,92,100,0.32); }
+    .pill.trim, .pill.watch { background: rgba(246,196,83,0.12); color: var(--amber); border-color: rgba(246,196,83,0.34); }
+    .pill.quiet, .pill.no { background: rgba(255,255,255,0.04); color: var(--muted); }
+    .mode-switch { display: inline-grid; grid-template-columns: 1fr 1fr; border: 2px solid var(--line); border-radius: 3px; background: #0d0d0e; padding: 3px; gap: 3px; }
+    .mode-option { min-height: 28px; min-width: 68px; border-color: transparent; background: transparent; color: var(--muted); box-shadow: none; }
+    .mode-option.active { background: var(--green); color: #07130c; border-color: var(--green); }
+    .mode-option.live.active { background: var(--red); color: #fff7f7; border-color: var(--red); }
+    .scorebar { width: 126px; height: 6px; background: #2a2a2c; border-radius: 999px; overflow: hidden; }
+    .scorebar span { display: block; height: 100%; background: var(--green); border-radius: inherit; }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    .muted { color: var(--muted); font-size: 12px; }
+    .ok { color: var(--green); }
+    .error { color: var(--red); }
+    .two-col { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 0.55fr); gap: 14px; align-items: start; }
+    .panel-block { display: grid; gap: 10px; }
+    .empty { padding: 18px; color: var(--muted); background: var(--panel); border: 2px dashed var(--line); border-radius: 3px; }
+    .symbol-cloud { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+    .symbol-chip { min-width: 58px; border: 2px solid var(--line); background: var(--panel); border-radius: 3px; padding: 6px 8px; font-family: var(--mono); font-size: 11px; font-weight: 800; text-align: center; }
+    .symbol-link { min-height: 24px; border: 0; background: transparent; color: var(--ink); padding: 0; box-shadow: none; text-decoration: underline; text-decoration-color: rgba(57,217,138,0.45); text-underline-offset: 4px; }
+    .symbol-link:hover { color: var(--green); border: 0; }
+    .stock-controls { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+    .stock-actions { display: inline-flex; gap: 4px; align-items: center; }
+    .trade-btn { min-height: 23px; min-width: 38px; padding: 0 6px; font-size: 10px; border-width: 1px; }
+    .trade-btn.buy { color: var(--green); border-color: rgba(57,217,138,0.45); }
+    .trade-btn.sell { color: var(--red); border-color: rgba(255,92,100,0.45); }
+    .chart-drawer { position: fixed; right: 22px; bottom: 22px; z-index: 40; width: min(680px, calc(100vw - 44px)); max-height: calc(100vh - 44px); overflow: auto; background: rgba(21,21,22,0.98); border: 2px solid rgba(122,162,255,0.65); border-radius: 3px; box-shadow: 0 20px 70px rgba(0,0,0,0.55), 0 0 28px rgba(57,217,138,0.14); padding: 14px; display: grid; gap: 12px; }
+    .chart-drawer[hidden] { display: none; }
+    .ticket-drawer { position: fixed; left: 262px; bottom: 22px; z-index: 41; width: min(360px, calc(100vw - 44px)); background: rgba(21,21,22,0.98); border: 2px solid rgba(57,217,138,0.58); border-radius: 3px; box-shadow: 0 18px 54px rgba(0,0,0,0.48); padding: 14px; display: grid; gap: 12px; }
+    .ticket-drawer[hidden] { display: none; }
+    .ticket-form { display: grid; gap: 9px; }
+    .ticket-form label { display: grid; gap: 5px; color: var(--muted); font-size: 11px; text-transform: uppercase; }
+    .ticket-form input { height: 36px; border: 2px solid var(--line); background: #0d0d0e; color: var(--ink); border-radius: 3px; padding: 0 10px; font-family: var(--mono); }
+    .ticket-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .toast-stack { position: fixed; top: 18px; right: 18px; z-index: 80; display: grid; gap: 10px; width: min(420px, calc(100vw - 36px)); pointer-events: none; }
+    .toast { pointer-events: auto; background: rgba(21,21,22,0.98); border: 2px solid var(--line); border-radius: 3px; padding: 12px; display: grid; gap: 7px; box-shadow: 0 18px 44px rgba(0,0,0,0.45), inset -2px -2px 0 rgba(0,0,0,0.28); animation: toast-in 180ms ease-out; }
+    .toast.ok { border-color: rgba(57,217,138,0.62); }
+    .toast.error { border-color: rgba(255,92,100,0.7); }
+    .toast.warn { border-color: rgba(246,196,83,0.7); }
+    .toast-head { display: flex; justify-content: space-between; gap: 10px; align-items: start; }
+    .toast-title { font-size: 12px; font-weight: 900; text-transform: uppercase; }
+    .toast-body { color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+    .toast-close { min-height: 22px; min-width: 26px; padding: 0 6px; border-width: 1px; box-shadow: none; }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+    .setup-modal { position: fixed; inset: 0; z-index: 120; display: grid; place-items: center; padding: 20px; background: rgba(2,2,8,0.78); backdrop-filter: blur(8px); }
+    .setup-modal[hidden] { display: none; }
+    .setup-card { width: min(760px, 100%); max-height: calc(100vh - 40px); overflow: auto; background: rgba(21,21,22,0.98); border: 2px solid rgba(0,229,255,0.48); border-radius: 3px; box-shadow: 0 24px 80px rgba(0,0,0,0.62), 0 0 34px rgba(255,49,214,0.16); padding: 18px; display: grid; gap: 14px; }
+    .setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .setup-field { display: grid; gap: 5px; color: var(--muted); font-size: 11px; text-transform: uppercase; }
+    .setup-field input { height: 36px; border: 2px solid var(--line); background: #0d0d0e; color: var(--ink); border-radius: 3px; padding: 0 10px; font-family: var(--mono); }
+    .setup-field.full { grid-column: 1 / -1; }
+    .setup-steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .setup-step { border: 2px solid var(--line-soft); background: rgba(255,255,255,0.03); border-radius: 3px; padding: 10px; min-height: 78px; }
+    .setup-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .chart-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; }
+    .chart-title { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .range-control { display: flex; flex-wrap: wrap; gap: 6px; }
+    .range-control button { min-height: 28px; min-width: 50px; padding: 0 8px; }
+    .range-control button.active { background: var(--green); border-color: var(--green); color: #07130c; }
+    .chart-canvas-wrap { position: relative; background: #0d0d0e; border: 2px solid var(--line); border-radius: 3px; padding: 10px; }
+    #stock-chart-canvas { width: 100%; height: 280px; display: block; }
+    .chart-tooltip { position: absolute; z-index: 5; min-width: 142px; pointer-events: none; background: rgba(10,10,11,0.96); color: var(--ink); border: 2px solid rgba(57,217,138,0.62); border-radius: 3px; padding: 8px 9px; font-size: 11px; line-height: 1.45; box-shadow: 0 12px 34px rgba(0,0,0,0.45); transform: translate(-50%, calc(-100% - 12px)); }
+    .chart-tooltip[hidden] { display: none; }
+    .chart-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .chart-stat { border: 2px solid var(--line-soft); background: rgba(255,255,255,0.03); padding: 9px; border-radius: 3px; }
+    .command-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .command-card { background: var(--panel); border: 2px solid var(--line); border-radius: 3px; padding: 14px; display: grid; gap: 10px; align-content: space-between; min-height: 176px; }
+    .command-card.danger { border-color: rgba(255,92,100,0.38); }
+    .command-code { color: var(--muted); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+    .command-actions { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .command-card button { min-width: 82px; }
+    @media (max-width: 1080px) {
+      .app-shell { grid-template-columns: 1fr; }
+      aside { position: static; }
+      .nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .topbar { grid-template-columns: 1fr; grid-template-areas: "search" "title" "market" "toolbar"; padding: 12px 0; }
+      .market-state { justify-self: start; }
+      .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .two-col { grid-template-columns: 1fr; }
+      .command-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      main { padding: 14px; }
+      .topbar { align-items: stretch; flex-direction: column; }
+      .toolbar { justify-content: flex-start; }
+      .metric-grid { grid-template-columns: 1fr; }
+      .data-row { grid-template-columns: 1fr; }
+      .right-stack { justify-items: start; white-space: normal; }
+      .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .command-grid { grid-template-columns: 1fr; }
+      .chart-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .ticket-drawer { left: 22px; }
+      .toast-stack { left: 14px; right: 14px; width: auto; }
+      .setup-grid, .setup-steps { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body data-theme="arcade" class="theme-arcade">
+  <div class="arcade-grid" aria-hidden="true"></div>
+  <div class="sidebar-backdrop" onclick="closeSidebar()" aria-hidden="true"></div>
+  <div class="app-shell">
+    <aside>
+      <div class="brand">
+        <div class="brand-main">
+          <div class="terminal-mark">B</div>
+          <div>
+            <h1>bonehawk</h1>
+            <div class="sub">AI trading terminal</div>
+          </div>
+        </div>
+        <button class="menu-pin" onclick="expandSidebar()">Pin</button>
+      </div>
+      <nav class="nav" aria-label="Dashboard sections">
+        <button class="tab active" onclick="showTab('portfolio-panel', this)">Portfolio</button>
+        <button class="tab" onclick="showTab('command-center-panel', this)">Commands</button>
+        <button class="tab" onclick="showTab('ideas-panel', this)">Trade Ideas</button>
+        <button class="tab" onclick="showTab('growth-panel', this)">Growth</button>
+        <button class="tab" onclick="showTab('stocks-panel', this)">Stocks</button>
+        <button class="tab" onclick="showTab('autopilot-panel', this)">Autopilot</button>
+        <button class="tab" onclick="showTab('agentic-panel', this)">Agentic</button>
+        <button class="tab" onclick="showTab('robinhood-panel', this)">Robinhood</button>
+        <button class="tab" onclick="showTab('scanner-panel', this)">Scanner</button>
+        <button class="tab" onclick="showTab('news-panel', this)">News</button>
+        <button class="tab" onclick="showTab('tickets-panel', this)">Tickets</button>
+        <button class="tab" onclick="showTab('logs-panel', this)">Logs</button>
+        <button class="tab" onclick="showTab('settings-panel', this)">Settings</button>
+      </nav>
+      <div class="rail-status">
+        <div id="rail-mode">Mode loading</div>
+        <div id="rail-updated">Waiting for market data</div>
+      </div>
+    </aside>
+    <main>
+      <div class="topbar">
+        <div class="search-box">
+          <span class="muted">Search</span>
+          <input id="symbol-search" type="text" placeholder="Search symbols, e.g. NVDA, BTC, SPY..." oninput="filterVisibleRows(this.value)" onkeydown="openTypedSymbol(event)">
+        </div>
+        <div class="view-heading">
+          <h1 id="view-title">Portfolio</h1>
+          <div id="ui-status" class="status-line">Loading market data...</div>
+        </div>
+        <div id="market-state" class="market-state">Market data live</div>
+        <div class="toolbar">
+          <button id="menu-toggle" class="menu-toggle" data-action onclick="toggleSidebar()" title="Toggle menu">☰</button>
+          <div class="mode-switch" role="group" aria-label="Trading mode">
+            <button data-action data-mode-option="paper" class="mode-option" onclick="setTradingMode('paper')">Paper</button>
+            <button data-action data-mode-option="live" class="mode-option live" onclick="setTradingMode('live')">Live</button>
+          </div>
+          <button data-action onclick="refreshAll()">Refresh</button>
+          <button data-action class="primary" onclick="runPaper(false)">Paper Cycle</button>
+          <button data-action onclick="runPaper(true)">Paper + Telegram</button>
+          <button data-action onclick="sendScannerAlerts()">Scanner Alerts</button>
+          <button data-action onclick="sendTradeIdeas()">Trade Ideas Telegram</button>
+        </div>
+      </div>
+      <div id="ticker-tape" class="ticker-tape"></div>
+
+      <section id="portfolio-panel" class="tab-panel active">
+        <div class="section-head">
+          <h2>Portfolio</h2>
+          <div id="symbols" class="muted"></div>
+        </div>
+        <div id="metric-grid" class="metric-grid"></div>
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Positions</h2>
+            <div id="position-list" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Sync</h2>
+            <div id="portfolio-sync" class="data-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="command-center-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Command Center</h2>
+          <div id="command-status" class="muted"></div>
+        </div>
+        <div id="command-groups" class="panel-block"></div>
+        <div class="panel-block">
+          <h2>Output</h2>
+          <pre id="command-output">No command run yet.</pre>
+        </div>
+      </section>
+
+      <section id="ideas-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Trade Ideas</h2>
+          <div id="idea-context" class="muted"></div>
+        </div>
+        <div id="trade-ideas" class="data-list"></div>
+      </section>
+
+      <section id="growth-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Quick Growth</h2>
+          <div id="growth-context" class="muted"></div>
+        </div>
+        <div id="growth-metrics" class="metric-grid"></div>
+        <div id="growth-candidates" class="data-list"></div>
+      </section>
+
+      <section id="stocks-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Stocks</h2>
+          <div id="stocks-status" class="muted"></div>
+        </div>
+        <div id="stocks-metrics" class="metric-grid"></div>
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Scan Universe</h2>
+            <div id="stock-symbols" class="symbol-cloud"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Execution</h2>
+            <div id="stock-execution" class="data-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="autopilot-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Alpaca Autopilot</h2>
+          <div class="toolbar">
+            <button data-action onclick="scanAutopilot()">Scan</button>
+            <button data-action class="primary" onclick="runAutopilotPaper()">Run Paper</button>
+          </div>
+        </div>
+        <div id="autopilot-metrics" class="metric-grid"></div>
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Planned Orders</h2>
+            <div id="autopilot-orders" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Alpaca / Risk</h2>
+            <div id="autopilot-risk" class="data-list"></div>
+          </div>
+        </div>
+        <div class="panel-block">
+          <h2>Execution Output</h2>
+          <pre id="autopilot-output">No autopilot run yet.</pre>
+        </div>
+      </section>
+
+      <section id="agentic-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Robinhood Agentic Trading</h2>
+          <div id="agentic-status" class="muted"></div>
+        </div>
+        <div id="agentic-metrics" class="metric-grid"></div>
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Setup</h2>
+            <div id="agentic-setup" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Guardrails</h2>
+            <div id="agentic-guardrails" class="data-list"></div>
+          </div>
+        </div>
+        <div class="panel-block">
+          <div class="section-head">
+            <h2>Connector Diagnostics</h2>
+            <button data-action onclick="diagnoseStockConnector()">Diagnose Connector</button>
+          </div>
+          <pre id="stock-connector-diagnostics">No diagnosis run yet.</pre>
+        </div>
+      </section>
+
+      <section id="robinhood-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Robinhood Crypto</h2>
+          <div id="robinhood-status" class="muted"></div>
+        </div>
+        <div id="robinhood-metrics" class="metric-grid"></div>
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Holdings</h2>
+            <div id="robinhood-holdings" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Open Orders</h2>
+            <div id="robinhood-orders" class="data-list"></div>
+          </div>
+        </div>
+        <div class="panel-block">
+          <h2>Crypto Quotes</h2>
+          <div id="robinhood-quotes" class="data-list"></div>
+        </div>
+      </section>
+
+      <section id="scanner-panel" class="tab-panel">
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Market Scanner</h2>
+            <div id="scanner" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Risk Flags</h2>
+            <div id="risk" class="data-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="news-panel" class="tab-panel">
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>News</h2>
+            <div id="news" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Insider Filings</h2>
+            <div id="insiders" class="data-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tickets-panel" class="tab-panel">
+        <div class="section-head">
+          <h2>Buy / Sell Tickets</h2>
+          <div id="tickets-status" class="muted"></div>
+        </div>
+        <div id="tickets-list" class="data-list"></div>
+      </section>
+
+      <section id="logs-panel" class="tab-panel">
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Decision Log</h2>
+            <div id="decision-log" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Paper Cycle Output</h2>
+            <pre id="paper">No run yet.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="settings-panel" class="tab-panel">
+        <div class="two-col">
+          <div class="panel-block">
+            <h2>Status</h2>
+            <div id="status" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Stock Order Controls</h2>
+            <div id="stock-settings" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Autopilot Controls</h2>
+            <div id="autopilot-settings" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Interface</h2>
+            <div id="ui-theme-settings" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Capabilities</h2>
+            <div id="capabilities" class="data-list"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div id="setup-modal" class="setup-modal" hidden>
+    <div class="setup-card">
+      <div class="section-head">
+        <div>
+          <h2>First Run Setup</h2>
+          <div id="setup-status-line" class="muted">Bonehawk needs Alpaca paper keys before autopilot can run.</div>
+        </div>
+        <button onclick="hideSetupModal()">Later</button>
+      </div>
+      <div id="setup-steps" class="setup-steps"></div>
+      <form id="setup-form" onsubmit="submitSetup(event)">
+        <div class="setup-grid">
+          <label class="setup-field">
+            Alpaca API key
+            <input id="setup-alpaca-api-key" type="password" autocomplete="off" placeholder="Paper API key">
+          </label>
+          <label class="setup-field">
+            Alpaca secret key
+            <input id="setup-alpaca-secret-key" type="password" autocomplete="off" placeholder="Paper secret key">
+          </label>
+          <label class="setup-field">
+            Max dollars per trade
+            <input id="setup-max-trade-usd" type="number" min="1" max="1000" step="1" value="25">
+          </label>
+          <label class="setup-field">
+            Max open positions
+            <input id="setup-max-open-positions" type="number" min="0" max="25" step="1" value="3">
+          </label>
+          <label class="setup-field">
+            Minimum confidence
+            <input id="setup-min-confidence" type="number" min="35" max="95" step="1" value="55">
+          </label>
+          <label class="setup-field">
+            Telegram bot token
+            <input id="setup-telegram-token" type="password" autocomplete="off" placeholder="Optional">
+          </label>
+          <label class="setup-field">
+            Telegram chat IDs
+            <input id="setup-chat-ids" type="text" autocomplete="off" placeholder="Optional comma-separated IDs">
+          </label>
+          <label class="setup-field">
+            Robinhood API key
+            <input id="setup-robinhood-api-key" type="password" autocomplete="off" placeholder="Optional crypto key">
+          </label>
+          <label class="setup-field full">
+            Robinhood private key base64
+            <input id="setup-robinhood-private-key" type="password" autocomplete="off" placeholder="Optional crypto private key">
+          </label>
+          <label class="setup-field">
+            Robinhood account number
+            <input id="setup-robinhood-account" type="password" autocomplete="off" placeholder="Optional">
+          </label>
+        </div>
+        <div class="setup-actions">
+          <button type="button" onclick="hideSetupModal()">Skip for now</button>
+          <button type="submit" class="primary" data-action>Save Setup</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
+  <div id="stock-chart-drawer" class="chart-drawer" hidden>
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">
+          <h2 id="stock-chart-title">Stock Chart</h2>
+          <span id="stock-chart-range-pill" class="pill quiet">1D</span>
+        </div>
+        <div id="stock-chart-subtitle" class="muted">Click a symbol to load chart data.</div>
+      </div>
+      <button onclick="closeStockChart()">Close</button>
+    </div>
+    <div id="chart-range-buttons" class="range-control" aria-label="Chart range">
+      <button onclick="setStockChartRange('1d')" data-chart-range="1d">1D</button>
+      <button onclick="setStockChartRange('1w')" data-chart-range="1w">1W</button>
+      <button onclick="setStockChartRange('1m')" data-chart-range="1m">1M</button>
+      <button onclick="setStockChartRange('3m')" data-chart-range="3m">3M</button>
+      <button onclick="setStockChartRange('1y')" data-chart-range="1y">1Y</button>
+    </div>
+    <div id="stock-chart-stats" class="chart-stats"></div>
+    <div class="chart-canvas-wrap">
+      <canvas id="stock-chart-canvas" width="960" height="360" onmousemove="showChartTooltip(event)" onmouseleave="hideChartTooltip()"></canvas>
+      <div id="stock-chart-tooltip" class="chart-tooltip" hidden></div>
+    </div>
+    <div id="stock-chart-status" class="muted">Review-only chart. No order placed.</div>
+  </div>
+  <div id="stock-ticket-drawer" class="ticket-drawer" hidden>
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">
+          <h2 id="stock-ticket-title">Stock Ticket</h2>
+          <span id="stock-ticket-side" class="pill quiet">Buy</span>
+        </div>
+        <div id="stock-ticket-note" class="muted">Review-only ticket. No live order placed.</div>
+      </div>
+      <button onclick="closeStockTicket()">Close</button>
+    </div>
+    <div class="ticket-form">
+      <label>
+        Shares
+        <input id="stock-ticket-quantity" type="number" inputmode="decimal" min="0.0001" step="0.0001" value="1">
+      </label>
+      <label>
+        Live confirmation
+        <input id="stock-ticket-confirm" type="text" autocomplete="off" placeholder="LIVE_STOCK_ORDER">
+      </label>
+      <div class="ticket-actions">
+        <button onclick="closeStockTicket()">Cancel</button>
+        <button class="primary" data-action onclick="submitStockTicket()">Record Ticket</button>
+        <button data-action onclick="submitLiveStockTicket()">Send Live</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    let selectedChartSymbol = '';
+    let selectedChartRange = '1d';
+    let chartPlotPoints = [];
+    let pendingStockTicket = {symbol: '', side: 'BUY'};
+    let setupDismissed = false;
+
+    async function getJson(url, options) {
+      const res = await fetch(url, options);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.message || data.error || `Request failed: ${res.status}`);
+      return data;
+    }
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function safeUrl(value) {
+      try {
+        const url = new URL(String(value || ''), window.location.origin);
+        return ['http:', 'https:'].includes(url.protocol) ? escapeHtml(url.href) : '#';
+      } catch {
+        return '#';
+      }
+    }
+    function money(value) {
+      const number = Number(value || 0);
+      return `$${number.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+    }
+    function pct(value) {
+      const number = Number(value || 0);
+      const cls = number >= 0 ? 'positive' : 'negative';
+      return `<span class="${cls}">${number.toFixed(2)}%</span>`;
+    }
+    function pill(text, extra = '') {
+      return `<span class="pill ${extra}">${escapeHtml(text)}</span>`;
+    }
+    function humanize(value) {
+      return escapeHtml(String(value || 'unknown').replaceAll('_', ' '));
+    }
+    function symbolButton(symbol) {
+      const value = String(symbol || '').toUpperCase();
+      return `<button class="symbol-link" data-symbol="${escapeHtml(value)}" onclick="openStockChart(this.dataset.symbol)">${escapeHtml(value)}</button>`;
+    }
+    function stockActionButtons(symbol) {
+      const value = String(symbol || '').toUpperCase();
+      return `<span class="stock-actions"><button class="trade-btn buy" data-action data-stock-action="BUY" data-stock-symbol="${escapeHtml(value)}">Buy</button><button class="trade-btn sell" data-action data-stock-action="SELL" data-stock-symbol="${escapeHtml(value)}">Sell</button></span>`;
+    }
+    function stockSymbolControls(symbol) {
+      return `<span class="stock-controls">${symbolButton(symbol)}${stockActionButtons(symbol)}</span>`;
+    }
+    function actionClass(action) {
+      const value = String(action || '').toLowerCase();
+      if (value.includes('buy') || value.includes('hold')) return 'buy';
+      if (value.includes('sell')) return 'sell';
+      if (value.includes('trim') || value.includes('watch')) return 'trim';
+      return 'no';
+    }
+    function metric(label, value, note) {
+      return `<div class="metric"><div><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value">${value}</div></div>${note ? `<div class="metric-note">${note}</div>` : ''}</div>`;
+    }
+    function row(title, sub = '', right = '') {
+      return `<div class="data-row"><div><div class="data-title">${title}</div>${sub ? `<div class="data-sub">${sub}</div>` : ''}</div>${right ? `<div class="right-stack">${right}</div>` : ''}</div>`;
+    }
+    function settingSwitch(options, activeValue, handler) {
+      return `<div class="mode-switch">${options.map(option => `<button data-action class="mode-option ${option.danger ? 'live' : ''} ${option.value === activeValue ? 'active' : ''}" onclick="${handler}('${escapeHtml(option.value)}')">${escapeHtml(option.label)}</button>`).join('')}</div>`;
+    }
+    function empty(text) {
+      return `<div class="empty">${escapeHtml(text)}</div>`;
+    }
+    function showOrderToast(result, fallbackTitle = 'Stock ticket') {
+      const ok = Boolean(result?.ok);
+      const status = String(result?.status || (ok ? 'ok' : 'failed'));
+      const kind = ok ? 'ok' : status.includes('blocked') || status.includes('required') || status.includes('disabled') ? 'warn' : 'error';
+      const title = ok
+        ? `${escapeHtml(result.side || '')} ${escapeHtml(result.symbol || '')} ${result.review_only === false ? 'sent' : 'recorded'}`
+        : `${fallbackTitle} ${kind === 'warn' ? 'blocked' : 'failed'}`;
+      const lines = [
+        result?.message || '',
+        `Status: ${status}`,
+        result?.symbol ? `Symbol: ${result.symbol}` : '',
+        result?.side ? `Side: ${result.side}` : '',
+        result?.quantity ? `Quantity: ${result.quantity}` : '',
+        result?.current_price ? `Price: ${money(result.current_price)}` : '',
+        result?.broker_order_id ? `Order ID: ${result.broker_order_id}` : '',
+        result?.detail ? `Detail: ${result.detail}` : '',
+        ok ? (result?.review_only === false ? 'Live connector response' : 'Review-only ticket') : 'Order was not sent'
+      ].filter(Boolean);
+      showToast(title, lines.join(' · '), kind);
+    }
+    function showToast(title, body, kind = 'ok') {
+      const stack = document.getElementById('toast-stack');
+      const id = `toast-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const node = document.createElement('div');
+      node.className = `toast ${kind}`;
+      node.id = id;
+      node.innerHTML = `<div class="toast-head"><div class="toast-title">${escapeHtml(title)}</div><button class="toast-close" onclick="dismissToast('${id}')">x</button></div><div class="toast-body">${escapeHtml(body)}</div>`;
+      stack.prepend(node);
+      window.setTimeout(() => dismissToast(id), 9000);
+    }
+    function dismissToast(id) {
+      const node = document.getElementById(id);
+      if (node) node.remove();
+    }
+    function setStatus(text, kind) {
+      const node = document.getElementById('ui-status');
+      node.textContent = text;
+      node.className = `status-line ${kind || ''}`;
+    }
+    function setBusy(isBusy) {
+      document.querySelectorAll('button[data-action]').forEach(button => button.disabled = isBusy);
+    }
+    function showTab(id, button) {
+      document.querySelectorAll('.tab-panel').forEach(panel => panel.classList.remove('active'));
+      document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+      document.getElementById(id).classList.add('active');
+      button.classList.add('active');
+      document.getElementById('view-title').textContent = button.textContent;
+      closeSidebar();
+    }
+    function initSidebar() {
+      const collapsed = window.localStorage.getItem('bonehawk-sidebar-collapsed') === 'true';
+      document.body.classList.toggle('sidebar-collapsed', collapsed);
+      document.body.classList.remove('menu-open');
+    }
+    function toggleSidebar() {
+      const collapsed = document.body.classList.contains('sidebar-collapsed');
+      const open = document.body.classList.contains('menu-open');
+      if (!collapsed) {
+        document.body.classList.add('sidebar-collapsed');
+        document.body.classList.remove('menu-open');
+        window.localStorage.setItem('bonehawk-sidebar-collapsed', 'true');
+        return;
+      }
+      document.body.classList.toggle('menu-open', !open);
+    }
+    function closeSidebar() {
+      document.body.classList.remove('menu-open');
+    }
+    function expandSidebar() {
+      document.body.classList.remove('sidebar-collapsed');
+      document.body.classList.remove('menu-open');
+      window.localStorage.setItem('bonehawk-sidebar-collapsed', 'false');
+    }
+    async function refreshStatus() {
+      const data = await getJson('/api/status');
+      const setup = await getJson('/api/setup-status');
+      document.getElementById('rail-mode').textContent = `Mode ${data.mode || 'unknown'}`;
+      document.getElementById('market-state').textContent = `Mode ${String(data.mode || 'unknown').toUpperCase()}`;
+      setModeButtons(data.mode || 'missing');
+      applyUiTheme(data.ui_theme || data.env?.BONEHAWK_UI_THEME || 'arcade');
+      document.getElementById('status').innerHTML = Object.entries(data.env).map(([k,v]) => row(escapeHtml(k), '', pill(v))).join('');
+      renderStockSettings(data);
+      renderUiThemeSettings(data);
+      renderSetupModal(setup);
+    }
+    function renderSetupModal(data) {
+      const modal = document.getElementById('setup-modal');
+      const required = Boolean(data.required);
+      if (!required || setupDismissed) {
+        modal.hidden = true;
+      } else {
+        modal.hidden = false;
+      }
+      const steps = data.steps || {};
+      document.getElementById('setup-status-line').textContent = required ? 'Add Alpaca paper keys to unlock autopilot paper orders.' : 'Setup complete.';
+      document.getElementById('setup-steps').innerHTML = Object.entries(steps).map(([key, step]) => `
+        <div class="setup-step">
+          <div class="data-title">${escapeHtml(key)} ${pill(step.status || 'missing', step.status === 'set' ? 'buy' : step.status === 'missing' ? 'trim' : 'quiet')}</div>
+          <div class="data-sub">${escapeHtml(step.message || '')}</div>
+        </div>
+      `).join('');
+    }
+    function hideSetupModal() {
+      setupDismissed = true;
+      document.getElementById('setup-modal').hidden = true;
+    }
+    async function submitSetup(event) {
+      event.preventDefault();
+      const payload = {
+        alpaca_api_key: document.getElementById('setup-alpaca-api-key').value,
+        alpaca_secret_key: document.getElementById('setup-alpaca-secret-key').value,
+        alpaca_paper: true,
+        telegram_bot_token: document.getElementById('setup-telegram-token').value,
+        allowed_chat_ids: document.getElementById('setup-chat-ids').value,
+        robinhood_api_key: document.getElementById('setup-robinhood-api-key').value,
+        robinhood_private_key_base64: document.getElementById('setup-robinhood-private-key').value,
+        robinhood_account_number: document.getElementById('setup-robinhood-account').value,
+        autopilot_enabled: true,
+        max_trade_usd: document.getElementById('setup-max-trade-usd').value,
+        max_open_positions: document.getElementById('setup-max-open-positions').value,
+        min_confidence: document.getElementById('setup-min-confidence').value
+      };
+      await runAction('Saving setup...', async () => {
+        const data = await getJson('/api/setup', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        ['setup-alpaca-api-key', 'setup-alpaca-secret-key', 'setup-telegram-token', 'setup-robinhood-api-key', 'setup-robinhood-private-key', 'setup-robinhood-account'].forEach(id => document.getElementById(id).value = '');
+        setupDismissed = false;
+        renderSetupModal(data.setup);
+        await refreshStatus();
+        await refreshIntel();
+        showToast('Setup saved', data.message || 'Bonehawk setup saved locally.', 'ok');
+      }, false, false);
+    }
+    async function refreshCommands() {
+      const data = await getJson('/api/commands');
+      renderCommands(data);
+    }
+    function setModeButtons(mode) {
+      const active = String(mode || '').toLowerCase();
+      document.querySelectorAll('[data-mode-option]').forEach(button => {
+        button.classList.toggle('active', button.dataset.modeOption === active);
+      });
+    }
+    async function refreshIntel() {
+      setStatus('Refreshing market data...', 'muted');
+      const [data, trades, growth, sync, logs, tickets, robinhood, stocks, agentic, autopilot] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/robinhood'), getJson('/api/stocks'), getJson('/api/agentic-trading'), getJson('/api/autopilot')]);
+      renderPortfolio(data, trades, sync);
+      renderTicker(trades);
+      renderTradeIdeas(trades);
+      renderGrowthCandidates(growth);
+      renderRobinhood(robinhood);
+      renderStocks(stocks);
+      renderAgentic(agentic);
+      renderAutopilot(autopilot);
+      renderAutopilotSettings(autopilot);
+      renderScanner(trades, data);
+      renderNews(data);
+      renderLogs(logs);
+      renderTickets(tickets);
+      renderSettings(data);
+      document.getElementById('rail-updated').textContent = new Date().toLocaleTimeString();
+      setStatus(`Updated. Scanner checked ${trades.summary?.symbols_scanned || 0} symbols. Market trend: ${trades.market_trend || 'unknown'}.`, 'ok');
+    }
+    function renderTicker(trades) {
+      const items = (trades.ideas || []).slice(0, 12);
+      document.getElementById('ticker-tape').innerHTML = items.map(item => {
+        const signal = (item.signals || []).find(value => String(value).startsWith('day ')) || '';
+        const change = Number(String(signal).replace('day ', '').replace('%', '')) || 0;
+        return `<div class="ticker">${stockSymbolControls(item.symbol)}<span>${item.current_price ? money(item.current_price) : 'n/a'}</span><span class="${change >= 0 ? 'positive' : 'negative'}">${change >= 0 ? '+' : ''}${change.toFixed(2)}%</span></div>`;
+      }).join('');
+    }
+    function renderPortfolio(data, trades, sync) {
+      const performance = data.portfolio_performance || {};
+      document.getElementById('symbols').textContent = data.symbols.join(', ');
+      document.getElementById('metric-grid').innerHTML = [
+        metric('Portfolio value', money(performance.total_value), 'Manual stock positions plus priced holdings'),
+        metric('Open P&L', `${money(performance.unrealized_pnl)} ${pct(performance.unrealized_pnl_pct)}`, 'Configured positions only'),
+        metric('Market trend', escapeHtml(trades.market_trend || 'unknown'), `${trades.summary?.symbols_scanned || 0} symbols scanned`),
+        metric('Alerts', String(trades.summary?.alerts || 0), 'Review-only scanner alerts')
+      ].join('');
+      const positions = performance.positions || [];
+      document.getElementById('position-list').innerHTML = positions.map(position => row(
+        stockSymbolControls(position.symbol),
+        `Qty ${position.quantity} · cost ${money(position.cost_basis)} · price ${money(position.current_price)}`,
+        `${money(position.market_value)}<span>${pct(position.unrealized_pnl_pct)}</span>`
+      )).join('') || empty('No priced stock positions configured.');
+      document.getElementById('portfolio-sync').innerHTML = [
+        row('Stock sync', escapeHtml(sync.stock_sync?.message || ''), pill(sync.stock_sync?.status || 'unknown')),
+        row('Crypto sync', escapeHtml(sync.crypto_sync?.message || ''), pill(sync.crypto_sync?.status || 'unknown'))
+      ].join('');
+    }
+    function renderTradeIdeas(trades) {
+      document.getElementById('idea-context').textContent = `Market ${trades.market_trend || 'unknown'} · ${trades.summary?.symbols_scanned || 0} scanned`;
+      document.getElementById('trade-ideas').innerHTML = (trades.ideas || []).map(idea => {
+        const action = escapeHtml(idea.action);
+        const stops = [idea.current_price ? `price ${money(idea.current_price)}` : 'price n/a', idea.stop_loss ? `stop ${money(idea.stop_loss)}` : '', idea.take_profit ? `target ${money(idea.take_profit)}` : ''].filter(Boolean).join(' · ');
+        const signals = (idea.signals || []).map(signal => pill(signal, 'quiet')).join('');
+        const score = Math.max(0, Math.min(100, Number(idea.confidence || 0)));
+        return row(
+          `${stockSymbolControls(idea.symbol)}${pill(action, actionClass(action))}`,
+          `${escapeHtml(idea.reason)} · ${stops}<div class="data-sub">${signals}</div>`,
+          `<div>${score}/100</div><div class="scorebar"><span style="width:${score}%"></span></div>`
+        );
+      }).join('') || empty('No trade ideas loaded.');
+    }
+    function renderGrowthCandidates(growth) {
+      const candidates = growth.candidates || [];
+      document.getElementById('growth-context').textContent = `Market ${growth.market_trend || 'unknown'} · ${growth.summary?.symbols_scanned || 0} scanned`;
+      const top = candidates[0] || {};
+      document.getElementById('growth-metrics').innerHTML = [
+        metric('Candidates', String(candidates.length), 'Quick-return review signals'),
+        metric('Top score', String(top.momentum_score || 0), escapeHtml(top.symbol || 'none')),
+        metric('Market trend', escapeHtml(growth.market_trend || 'unknown'), 'SPY/QQQ technical vote'),
+        metric('Safety', 'Review only', 'No live order placed')
+      ].join('');
+      document.getElementById('growth-candidates').innerHTML = candidates.map(candidate => {
+        const score = Math.max(0, Math.min(100, Number(candidate.momentum_score || 0)));
+        const signals = (candidate.signals || []).map(signal => pill(signal, 'quiet')).join('');
+        return row(
+          `${stockSymbolControls(candidate.symbol)}${pill(candidate.action, actionClass(candidate.action))}`,
+          `${escapeHtml(candidate.reason)} · price ${candidate.current_price ? money(candidate.current_price) : 'n/a'} · day ${pct(candidate.day_change_pct)}<div class="data-sub">${signals}</div>`,
+          `<div>${score}/100</div><div class="scorebar"><span style="width:${score}%"></span></div>`
+        );
+      }).join('') || empty('No quick-growth candidates loaded.');
+    }
+    function renderRobinhood(data) {
+      document.getElementById('robinhood-status').textContent = data.message || '';
+      document.getElementById('robinhood-metrics').innerHTML = [
+        metric('Connection', escapeHtml(data.status || 'unknown'), `Mode ${escapeHtml(data.trading_mode || 'unknown')}`),
+        metric('API version', escapeHtml(data.api_version || 'unknown'), `Account ${escapeHtml(data.configured_account_number || 'missing')}`),
+        metric('Crypto orders', escapeHtml(data.capabilities?.crypto_order_place || 'unknown'), 'Live orders require TRADING_MODE=live'),
+        metric('Stocks', escapeHtml(data.capabilities?.stock_trading || 'unknown'), 'Crypto API cannot place stock orders')
+      ].join('');
+      document.getElementById('robinhood-holdings').innerHTML = (data.holdings || []).map(item => row(
+        `<strong>${escapeHtml(item.symbol)}</strong>`,
+        `Available ${escapeHtml(item.available_quantity)} · total ${escapeHtml(item.total_quantity)}`,
+        pill('crypto', 'buy')
+      )).join('') || empty('No crypto holdings loaded.');
+      document.getElementById('robinhood-orders').innerHTML = (data.orders || []).map(item => row(
+        `<strong>${escapeHtml(item.symbol || 'order')}</strong>${pill(item.side || 'order', actionClass(item.side))}`,
+        `${escapeHtml(item.type || '')} · ${escapeHtml(item.state || '')}`,
+        escapeHtml(item.id || '')
+      )).join('') || empty('No open crypto orders.');
+      document.getElementById('robinhood-quotes').innerHTML = (data.quotes || []).map(item => row(
+        `<strong>${escapeHtml(item.symbol)}</strong>`,
+        `Bid ${escapeHtml(item.bid)} · ask ${escapeHtml(item.ask)}`,
+        pill('quote', 'quiet')
+      )).join('') || empty('No Robinhood quotes loaded.');
+    }
+    function renderStocks(data) {
+      const sample = data.sample_symbols || [];
+      document.getElementById('stocks-status').textContent = `${data.total_symbols || 0} stock symbols loaded`;
+      document.getElementById('stocks-metrics').innerHTML = [
+        metric('Universe', String(data.total_symbols || 0), escapeHtml(data.source || 'market_universe')),
+        metric('Active scan', String(data.scan_symbols || 0), `Cap ${escapeHtml(data.max_scan_symbols || 0)}`),
+        metric('Crypto API', humanize(data.execution?.robinhood_crypto_api), 'Stock orders not available here'),
+        metric('Stock orders', humanize(data.execution?.robinhood_agentic_mcp), 'Needs Robinhood Agentic Trading')
+      ].join('');
+      document.getElementById('stock-symbols').innerHTML = sample.map(symbol => `<div class="symbol-chip">${stockSymbolControls(symbol)}</div>`).join('') || empty('No stock symbols loaded.');
+      document.getElementById('stock-execution').innerHTML = [
+        row('Robinhood Crypto API', 'Crypto market data, account reads, holdings, and crypto orders.', pill(humanize(data.execution?.robinhood_crypto_api), 'quiet')),
+        row('Robinhood Agentic Trading', 'Required before bonehawk can place live stock orders through Robinhood.', pill(humanize(data.execution?.robinhood_agentic_mcp), 'trim'))
+      ].join('');
+    }
+    function renderAgentic(data) {
+      document.getElementById('agentic-status').textContent = data.message || '';
+      const connector = data.stock_order_connector || {};
+      document.getElementById('agentic-metrics').innerHTML = [
+        metric('MCP status', humanize(data.status), data.codex_mcp_configured ? 'Configured in Codex' : 'Not found in Codex config'),
+        metric('Stock mode', humanize(data.stock_trading_mode), 'Review mode is safest for testing'),
+        metric('Connector', humanize(connector.status), humanize(connector.connector_mode)),
+        metric('Order placement', humanize(data.capabilities?.stock_order_place), `Confirm ${escapeHtml(connector.confirmation_phrase || 'required')}`)
+      ].join('');
+      document.getElementById('agentic-setup').innerHTML = [
+        row('MCP server', escapeHtml(data.mcp_url || ''), pill(data.mcp_name || 'robinhood-trading', 'quiet')),
+        row('Add to Codex', escapeHtml(data.setup?.codex_cli_command || ''), pill(data.codex_mcp_configured ? 'done' : 'needed', data.codex_mcp_configured ? 'buy' : 'trim')),
+        row('Login', escapeHtml(data.setup?.codex_login_command || ''), pill('OAuth', 'trim')),
+        row('Desktop onboarding', escapeHtml(data.setup?.desktop_note || ''), pill('required', 'trim'))
+      ].join('');
+      document.getElementById('agentic-guardrails').innerHTML = (data.guardrails || []).map(item => row(escapeHtml(item), '', pill('guardrail', 'quiet'))).join('') || empty('No guardrails loaded.');
+    }
+    function renderAutopilot(data) {
+      const config = data.config || {};
+      const broker = data.broker || {};
+      document.getElementById('autopilot-metrics').innerHTML = [
+        metric('Status', humanize(data.status), `Mode ${escapeHtml(config.mode || 'paper')}`),
+        metric('Broker', 'Alpaca', humanize(broker.status || 'unknown')),
+        metric('Trade size', money(config.max_trade_usd || 0), `${config.max_open_positions || 0} max open positions`),
+        metric('Live gate', config.live_ready ? 'Ready' : 'Locked', config.allow_live ? 'Live permission on' : 'Paper-first')
+      ].join('');
+      document.getElementById('autopilot-orders').innerHTML = empty('Run Scan to build a fresh paper plan.');
+      document.getElementById('autopilot-risk').innerHTML = [
+        row('Alpaca API key', '', pill(broker.api_key || 'missing', broker.api_key === 'set' ? 'buy' : 'trim')),
+        row('Alpaca secret', '', pill(broker.secret_key || 'missing', broker.secret_key === 'set' ? 'buy' : 'trim')),
+        row('Paper mode', 'Paper execution uses Alpaca paper trading.', pill(String(broker.paper ?? true), 'quiet')),
+        row('Guardrail', escapeHtml(data.notice || ''), pill('risk', 'trim'))
+      ].join('');
+    }
+    function renderAutopilotPlan(data) {
+      const orders = data.orders || [];
+      const blocked = data.blocked || [];
+      document.getElementById('autopilot-orders').innerHTML = orders.map(order => {
+        const score = Math.max(0, Math.min(100, Number(order.confidence || 0)));
+        const stops = [order.current_price ? `price ${money(order.current_price)}` : '', order.stop_loss ? `stop ${money(order.stop_loss)}` : '', order.take_profit ? `target ${money(order.take_profit)}` : '', order.notional ? `size ${money(order.notional)}` : ''].filter(Boolean).join(' · ');
+        return row(
+          `${stockSymbolControls(order.symbol)}${pill(order.side || order.action, actionClass(order.side || order.action))}`,
+          `${escapeHtml(order.reason || '')} · ${stops}<div class="data-sub">${(order.signals || []).map(signal => pill(signal, 'quiet')).join('')}</div>`,
+          `<div>${score}/100</div><div class="scorebar"><span style="width:${score}%"></span></div>`
+        );
+      }).join('') || empty('No autopilot orders met the risk rules.');
+      document.getElementById('autopilot-risk').innerHTML = [
+        row('Market trend', escapeHtml(data.market_trend || 'unknown'), pill(data.mode || 'paper', data.mode === 'live' ? 'sell' : 'buy')),
+        row('Symbols scanned', String(data.summary?.symbols_scanned || 0), pill(`${orders.length} planned`, orders.length ? 'buy' : 'quiet')),
+        ...blocked.slice(0, 8).map(item => row(`${escapeHtml(item.symbol || 'blocked')}`, escapeHtml(item.reason || ''), pill('blocked', 'trim')))
+      ].join('');
+    }
+    async function scanAutopilot() {
+      await runAction('Scanning Alpaca autopilot setups...', async () => {
+        const data = await getJson('/api/autopilot-scan', {method: 'POST'});
+        renderAutopilotPlan(data);
+        document.getElementById('autopilot-output').textContent = JSON.stringify(data, null, 2);
+        setStatus(`Autopilot planned ${data.orders?.length || 0} paper order(s).`, 'ok');
+      }, false, false);
+    }
+    async function runAutopilotPaper() {
+      await runAction('Running Alpaca autopilot paper execution...', async () => {
+        const response = await fetch('/api/autopilot-run', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({confirm: ''})
+        });
+        const data = await response.json();
+        renderAutopilotPlan(data);
+        document.getElementById('autopilot-output').textContent = JSON.stringify(data, null, 2);
+        (data.executed || []).forEach(item => showOrderToast(item, 'Autopilot order'));
+        setStatus(data.ok ? 'Autopilot paper execution submitted.' : data.message || data.status || 'Autopilot did not submit orders.', data.ok ? 'ok' : 'error');
+        await refreshTickets();
+      }, true, false);
+    }
+    async function diagnoseStockConnector() {
+      await runAction('Diagnosing Robinhood stock connector...', async () => {
+        const data = await getJson('/api/stock-connector-diagnostics');
+        document.getElementById('stock-connector-diagnostics').textContent = formatConnectorDiagnosis(data);
+        showToast(data.ok ? 'Connector ready' : 'Connector blocked', data.message || 'Diagnosis finished.', data.ok ? 'ok' : 'warn');
+        setStatus(data.message || 'Connector diagnosis finished.', data.ok ? 'ok' : 'error');
+      }, false, false);
+    }
+    function formatConnectorDiagnosis(data) {
+      const lines = [
+        `status: ${data.status || 'unknown'}`,
+        `message: ${data.message || ''}`,
+        '',
+        'checks:',
+        ...(data.checks || []).map(check => `- ${check.ok ? 'OK' : 'BLOCKED'} ${check.label}${check.fix ? ` · ${check.fix}` : ''}`),
+        '',
+        'codex mcp list:',
+        `status: ${data.codex_mcp_list?.status || 'unknown'}`,
+        `returncode: ${data.codex_mcp_list?.returncode ?? 'n/a'}`,
+        data.codex_mcp_list?.output || ''
+      ];
+      return lines.join('\\n');
+    }
+    function renderScanner(trades, data) {
+      document.getElementById('scanner').innerHTML = (trades.scans || []).map(scan => {
+        const score = Math.max(0, Math.min(100, Number(scan.score || 0)));
+        return row(
+          `${stockSymbolControls(scan.symbol)}${pill(scan.rating, scan.rating === 'QUIET' ? 'quiet' : 'watch')}`,
+          escapeHtml((scan.reasons || []).slice(0, 2).join(' ')),
+          `<div>${score}/100</div><div class="scorebar"><span style="width:${score}%"></span></div>`
+        );
+      }).join('') || empty('No scanner data.');
+      document.getElementById('risk').innerHTML = (data.risk_flags || []).map(flag => row(escapeHtml(flag), '', pill('risk', 'trim'))).join('') || empty('No risk flags.');
+    }
+    function renderNews(data) {
+      document.getElementById('news').innerHTML = (data.news || []).map(item => row(
+        `<a href="${safeUrl(item.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.title)}</a>`,
+        escapeHtml(item.published || ''),
+        pill(item.symbol || 'news')
+      )).join('') || empty('No news loaded.');
+      document.getElementById('insiders').innerHTML = (data.insider_filings || []).map(item => row(
+        `<a href="${safeUrl(item.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.title)}</a>`,
+        escapeHtml(item.updated || ''),
+        pill('Form 4', 'trim')
+      )).join('') || empty('No filings loaded.');
+    }
+    function renderLogs(logs) {
+      document.getElementById('decision-log').innerHTML = (logs.decisions || []).map(item => row(
+        `${stockSymbolControls(item.symbol)}${pill(item.action, actionClass(item.action))}`,
+        `${escapeHtml(item.source)} · ${escapeHtml(item.reason || '')}`,
+        escapeHtml(item.timestamp || '')
+      )).join('') || empty('No decisions logged yet.');
+    }
+    function renderTickets(data) {
+      const tickets = data.tickets || [];
+      document.getElementById('tickets-status').textContent = `${tickets.length} ticket${tickets.length === 1 ? '' : 's'} tracked`;
+      document.getElementById('tickets-list').innerHTML = tickets.map(ticket => {
+        const status = String(ticket.status || 'unknown');
+        const action = String(ticket.side || ticket.action || 'ORDER');
+        const detail = [
+          ticket.quantity ? `Qty ${ticket.quantity}` : '',
+          ticket.current_price ? `price ${money(ticket.current_price)}` : '',
+          ticket.broker_order_id ? `order ${ticket.broker_order_id}` : '',
+          ticket.review_only === false ? 'live connector' : 'review ticket'
+        ].filter(Boolean).join(' · ');
+        const message = [escapeHtml(ticket.message || ''), detail].filter(Boolean).join(' · ');
+        return row(
+          `${stockSymbolControls(ticket.symbol)}${pill(action, actionClass(action))}`,
+          `${escapeHtml(ticket.source || 'ticket')} · ${message}`,
+          `${pill(status, status === 'submitted' || status === 'recorded' ? 'buy' : 'trim')}<span>${escapeHtml(ticket.timestamp || '')}</span>`
+        );
+      }).join('') || empty('No buy or sell tickets yet.');
+    }
+    async function refreshTickets() {
+      const tickets = await getJson('/api/tickets');
+      renderTickets(tickets);
+    }
+    async function openStockChart(symbol, range) {
+      const normalized = String(symbol || '').trim().toUpperCase();
+      if (!normalized) return;
+      selectedChartSymbol = normalized;
+      selectedChartRange = range || selectedChartRange || '1d';
+      document.getElementById('stock-chart-drawer').hidden = false;
+      await loadStockChart();
+    }
+    function closeStockChart() {
+      document.getElementById('stock-chart-drawer').hidden = true;
+    }
+    async function setStockChartRange(range) {
+      selectedChartRange = range || '1d';
+      if (selectedChartSymbol) await loadStockChart();
+    }
+    async function loadStockChart() {
+      updateChartRangeButtons();
+      document.getElementById('stock-chart-title').textContent = `${selectedChartSymbol} Chart`;
+      document.getElementById('stock-chart-range-pill').textContent = selectedChartRange.toUpperCase();
+      document.getElementById('stock-chart-status').textContent = 'Loading chart data...';
+      try {
+        const chart = await getJson(`/api/stock-chart?symbol=${encodeURIComponent(selectedChartSymbol)}&range=${encodeURIComponent(selectedChartRange)}`);
+        renderStockChart(chart);
+      } catch (error) {
+        document.getElementById('stock-chart-status').textContent = error.message || 'Chart unavailable.';
+        drawStockChart([]);
+      }
+    }
+    function updateChartRangeButtons() {
+      document.querySelectorAll('[data-chart-range]').forEach(button => {
+        button.classList.toggle('active', button.dataset.chartRange === selectedChartRange);
+      });
+    }
+    function renderStockChart(chart) {
+      const points = chart.points || [];
+      document.getElementById('stock-chart-subtitle').textContent = `${points.length} points · interval ${chart.interval || 'n/a'} · review only`;
+      document.getElementById('stock-chart-stats').innerHTML = [
+        chartStat('Latest', money(chart.latest_price)),
+        chartStat('Move', `${Number(chart.change_pct || 0).toFixed(2)}%`),
+        chartStat('High', money(chart.summary?.high)),
+        chartStat('Low', money(chart.summary?.low))
+      ].join('');
+      document.getElementById('stock-chart-status').textContent = chart.notice || 'Review-only chart. No order placed.';
+      drawStockChart(points);
+    }
+    function chartStat(label, value) {
+      return `<div class="chart-stat"><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value">${value}</div></div>`;
+    }
+    function drawStockChart(points) {
+      const canvas = document.getElementById('stock-chart-canvas');
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      chartPlotPoints = [];
+      hideChartTooltip();
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#0d0d0e';
+      ctx.fillRect(0, 0, width, height);
+      const cleanPoints = (points || []).filter(point => Number.isFinite(Number(point.close)) && Number.isFinite(Number(point.timestamp)));
+      const values = cleanPoints.map(point => Number(point.close));
+      if (cleanPoints.length < 2) {
+        drawChartAxes(ctx, width, height, 0, 1, []);
+        ctx.fillStyle = '#9ca3af';
+        ctx.font = '18px monospace';
+        ctx.fillText('No chart data loaded', 82, 56);
+        return;
+      }
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = Math.max(0.01, max - min);
+      const pad = {left: 72, right: 24, top: 24, bottom: 48};
+      drawChartAxes(ctx, width, height, min, max, cleanPoints, pad);
+      ctx.strokeStyle = values[values.length - 1] >= values[0] ? '#39d98a' : '#ff5c64';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      cleanPoints.forEach((point, index) => {
+        const value = Number(point.close);
+        const x = pad.left + (index / (cleanPoints.length - 1)) * (width - pad.left - pad.right);
+        const y = height - pad.bottom - ((value - min) / span) * (height - pad.top - pad.bottom);
+        chartPlotPoints.push({x, y, price: value, timestamp: Number(point.timestamp)});
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+    function drawChartAxes(ctx, width, height, min, max, points, pad = {left: 72, right: 24, top: 24, bottom: 48}) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, pad.top);
+      ctx.lineTo(pad.left, height - pad.bottom);
+      ctx.lineTo(width - pad.right, height - pad.bottom);
+      ctx.stroke();
+      ctx.fillStyle = '#9ca3af';
+      ctx.font = '13px monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      const yTicks = 4;
+      for (let tick = 0; tick <= yTicks; tick += 1) {
+        const ratio = tick / yTicks;
+        const y = pad.top + ratio * (height - pad.top - pad.bottom);
+        const price = max - ratio * Math.max(0.01, max - min);
+        ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(width - pad.right, y);
+        ctx.stroke();
+        ctx.fillText(`$${price.toFixed(2)}`, pad.left - 9, y);
+      }
+      if (!points.length) return;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const xIndexes = [0, Math.floor((points.length - 1) / 3), Math.floor(((points.length - 1) * 2) / 3), points.length - 1];
+      [...new Set(xIndexes)].forEach(index => {
+        const x = pad.left + (index / (points.length - 1)) * (width - pad.left - pad.right);
+        const label = formatChartTime(points[index].timestamp);
+        ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top);
+        ctx.lineTo(x, height - pad.bottom);
+        ctx.stroke();
+        ctx.fillStyle = '#9ca3af';
+        ctx.fillText(label, x, height - pad.bottom + 14);
+      });
+    }
+    function formatChartTime(timestamp) {
+      const date = new Date(Number(timestamp) * 1000);
+      const options = selectedChartRange === '1d'
+        ? {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'}
+        : {month: 'short', day: 'numeric'};
+      return new Intl.DateTimeFormat(undefined, options).format(date);
+    }
+    function showChartTooltip(event) {
+      if (!chartPlotPoints.length) return;
+      const canvas = document.getElementById('stock-chart-canvas');
+      const rect = canvas.getBoundingClientRect();
+      const canvasX = (event.clientX - rect.left) * (canvas.width / rect.width);
+      const nearest = chartPlotPoints.reduce((best, point) => Math.abs(point.x - canvasX) < Math.abs(best.x - canvasX) ? point : best, chartPlotPoints[0]);
+      const scaleX = rect.width / canvas.width;
+      const scaleY = rect.height / canvas.height;
+      const tooltip = document.getElementById('stock-chart-tooltip');
+      tooltip.hidden = false;
+      tooltip.style.left = `${10 + nearest.x * scaleX}px`;
+      tooltip.style.top = `${10 + nearest.y * scaleY}px`;
+      tooltip.innerHTML = `<strong>${escapeHtml(selectedChartSymbol)}</strong><br>${escapeHtml(formatChartHoverTime(nearest.timestamp))}<br>${money(nearest.price)}`;
+    }
+    function hideChartTooltip() {
+      const tooltip = document.getElementById('stock-chart-tooltip');
+      if (tooltip) tooltip.hidden = true;
+    }
+    function formatChartHoverTime(timestamp) {
+      const date = new Date(Number(timestamp) * 1000);
+      return new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(date);
+    }
+    function openStockTicket(symbol, side) {
+      const normalizedSymbol = String(symbol || '').trim().toUpperCase();
+      const normalizedSide = String(side || 'BUY').trim().toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+      if (!normalizedSymbol) return;
+      pendingStockTicket = {symbol: normalizedSymbol, side: normalizedSide};
+      document.getElementById('stock-ticket-title').textContent = `${normalizedSymbol} ${normalizedSide}`;
+      const sidePill = document.getElementById('stock-ticket-side');
+      sidePill.textContent = normalizedSide;
+      sidePill.className = `pill ${normalizedSide === 'BUY' ? 'buy' : 'sell'}`;
+      document.getElementById('stock-ticket-note').textContent = 'Review-only ticket. No live stock order will be placed.';
+      document.getElementById('stock-ticket-quantity').value = '1';
+      document.getElementById('stock-ticket-confirm').value = '';
+      document.getElementById('stock-ticket-drawer').hidden = false;
+      document.getElementById('stock-ticket-quantity').focus();
+    }
+    function closeStockTicket() {
+      document.getElementById('stock-ticket-drawer').hidden = true;
+    }
+    async function submitStockTicket() {
+      const quantity = document.getElementById('stock-ticket-quantity').value;
+      await submitStockIntent(pendingStockTicket.symbol, pendingStockTicket.side, quantity);
+    }
+    async function submitLiveStockTicket() {
+      const quantity = document.getElementById('stock-ticket-quantity').value;
+      const confirm = document.getElementById('stock-ticket-confirm').value;
+      await runAction(`Sending ${pendingStockTicket.side} order for ${pendingStockTicket.symbol}...`, async () => {
+        const response = await fetch('/api/stock-order', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({symbol: pendingStockTicket.symbol, side: pendingStockTicket.side, quantity, confirm})
+        });
+        const result = await response.json();
+        document.getElementById('paper').textContent = JSON.stringify(result, null, 2);
+        showOrderToast(result, 'Live order');
+        setStatus(result.message || `${pendingStockTicket.side} order handled.`, response.ok && result.ok ? 'ok' : 'error');
+        await refreshTickets();
+        if (response.ok && result.ok) closeStockTicket();
+      }, true, false);
+    }
+    async function submitStockIntent(symbol, side, quantity) {
+      await runAction(`Recording ${side} ticket for ${symbol}...`, async () => {
+        const response = await fetch('/api/stock-order-intent', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({symbol, side, quantity})
+        });
+        const result = await response.json();
+        document.getElementById('paper').textContent = JSON.stringify(result, null, 2);
+        showOrderToast(result, 'Stock ticket');
+        setStatus(result.message || `${side} ticket recorded.`, response.ok && result.ok ? 'ok' : 'error');
+        await refreshTickets();
+        if (response.ok && result.ok) closeStockTicket();
+      }, true, false);
+    }
+    document.addEventListener('click', event => {
+      const button = event.target.closest('[data-stock-action]');
+      if (!button) return;
+      event.preventDefault();
+      event.stopPropagation();
+      openStockTicket(button.dataset.stockSymbol, button.dataset.stockAction);
+    });
+    function renderSettings(data) {
+      document.getElementById('capabilities').innerHTML = Object.entries(data.capabilities || {}).map(([key, value]) => row(escapeHtml(key), escapeHtml(value))).join('');
+    }
+    function applyUiTheme(theme) {
+      const nextTheme = String(theme || 'arcade').toLowerCase() === 'classic' ? 'classic' : 'arcade';
+      document.body.dataset.theme = nextTheme;
+      document.body.classList.toggle('theme-arcade', nextTheme === 'arcade');
+      document.body.classList.toggle('theme-classic', nextTheme === 'classic');
+    }
+    function renderUiThemeSettings(status) {
+      const env = status.env || {};
+      const theme = String(status.ui_theme || env.BONEHAWK_UI_THEME || 'arcade').toLowerCase() === 'classic' ? 'classic' : 'arcade';
+      document.getElementById('ui-theme-settings').innerHTML = row(
+        'UI style',
+        'Arcade is the new neon cabinet view. Classic keeps the current dashboard look.',
+        settingSwitch([{label: 'Arcade', value: 'arcade'}, {label: 'Classic', value: 'classic'}], theme, 'setUiTheme')
+      );
+    }
+    function renderStockSettings(status) {
+      const env = status.env || {};
+      const appMode = String(status.mode || env.TRADING_MODE || 'missing').toLowerCase();
+      const stockMode = String(env.BONEHAWK_STOCK_TRADING_MODE || 'missing').toLowerCase();
+      const connector = String(env.BONEHAWK_STOCK_ORDER_CONNECTOR || 'missing').toLowerCase();
+      document.getElementById('stock-settings').innerHTML = [
+        row(
+          'App trading mode',
+          'Controls crypto live order commands and is required for live stock connector sends.',
+          settingSwitch([{label: 'Paper', value: 'paper'}, {label: 'Live', value: 'live', danger: true}], appMode, 'setSettingsTradingMode')
+        ),
+        row(
+          'Stock trading mode',
+          'Controls whether stock orders can leave review mode.',
+          settingSwitch([{label: 'Review', value: 'review'}, {label: 'Paper', value: 'paper'}, {label: 'Live', value: 'live', danger: true}], stockMode, 'setStockTradingMode')
+        ),
+        row(
+          'Stock connector',
+          'Controls whether Send Live can call the Robinhood MCP bridge.',
+          settingSwitch([{label: 'Disabled', value: 'disabled'}, {label: 'Codex MCP', value: 'codex_mcp', danger: true}], connector, 'setStockConnectorMode')
+        )
+      ].join('');
+    }
+    function renderAutopilotSettings(data) {
+      const config = data.config || {};
+      document.getElementById('autopilot-settings').innerHTML = [
+        row(
+          'Autopilot',
+          'Enabled lets Run Paper submit planned paper orders to Alpaca.',
+          settingSwitch([{label: 'Off', value: 'false'}, {label: 'On', value: 'true'}], String(Boolean(config.enabled)), 'setAutopilotEnabled')
+        ),
+        row(
+          'Autopilot mode',
+          'Paper mode uses Alpaca paper trading. Live requires two confirmation gates.',
+          settingSwitch([{label: 'Paper', value: 'paper'}, {label: 'Live', value: 'live', danger: true}], String(config.mode || 'paper'), 'setAutopilotMode')
+        ),
+        row(
+          'Allow live Alpaca',
+          'This must stay off until paper trading proves stable.',
+          settingSwitch([{label: 'Off', value: 'false'}, {label: 'On', value: 'true', danger: true}], String(Boolean(config.allow_live)), 'setAutopilotAllowLive')
+        ),
+        row(
+          'Risk numbers',
+          `Trade size ${money(config.max_trade_usd || 0)} · max positions ${escapeHtml(config.max_open_positions || 0)} · minimum score ${escapeHtml(config.min_confidence || 0)}`,
+          '<button data-action onclick="editAutopilotRisk()">Edit</button>'
+        )
+      ].join('');
+    }
+    function renderCommands(data) {
+      const commands = data.commands || [];
+      const groups = commands.reduce((acc, command) => {
+        const group = command.group || 'Commands';
+        acc[group] = acc[group] || [];
+        acc[group].push(command);
+        return acc;
+      }, {});
+      document.getElementById('command-status').textContent = `${commands.length} README actions loaded`;
+      document.getElementById('command-groups').innerHTML = Object.entries(groups).map(([group, items]) => `
+        <div class="panel-block">
+          <h2>${escapeHtml(group)}</h2>
+          <div class="command-grid">
+            ${items.map(commandCard).join('')}
+          </div>
+        </div>
+      `).join('');
+    }
+    function commandCard(command) {
+      const danger = command.requires_confirmation ? 'danger' : '';
+      const inputCount = (command.inputs || []).length;
+      const detail = [command.description, inputCount ? `${inputCount} input${inputCount === 1 ? '' : 's'}` : '', command.requires_confirmation ? `confirm ${command.confirm_phrase}` : ''].filter(Boolean).join(' · ');
+      return `
+        <div class="command-card ${danger}">
+          <div>
+            <div class="data-title"><strong>${escapeHtml(command.label)}</strong>${command.requires_confirmation ? pill('guarded', 'trim') : pill(command.action || 'run', 'quiet')}</div>
+            <div class="data-sub">${escapeHtml(detail)}</div>
+          </div>
+          <div class="command-code">${escapeHtml(command.command)}</div>
+          <div class="command-actions">
+            ${pill(command.source || 'README', 'quiet')}
+            <button data-action onclick="runReadmeCommand('${escapeHtml(command.id)}')">Run</button>
+          </div>
+        </div>
+      `;
+    }
+    function filterVisibleRows(query) {
+      const value = String(query || '').trim().toLowerCase();
+      document.querySelectorAll('.data-row').forEach(row => {
+        row.style.display = !value || row.textContent.toLowerCase().includes(value) ? '' : 'none';
+      });
+    }
+    function openTypedSymbol(event) {
+      if (event.key !== 'Enter') return;
+      const symbol = String(event.target.value || '').trim().split(/\\s+/)[0];
+      if (symbol) openStockChart(symbol);
+    }
+    async function runPaper(notify) {
+      await runAction(notify ? 'Running paper cycle and sending Telegram...' : 'Running paper cycle...', async () => {
+        const data = await getJson(notify ? '/api/paper-cycle-notify' : '/api/paper-cycle', {method: 'POST'});
+        document.getElementById('paper').textContent = data.stdout || data.stderr || JSON.stringify(data, null, 2);
+        setStatus(data.ok ? 'Paper cycle finished.' : 'Paper cycle failed. See output panel.', data.ok ? 'ok' : 'error');
+      }, false);
+    }
+    async function sendScannerAlerts() {
+      await runAction('Sending scanner alert to Telegram...', async () => {
+        const data = await getJson('/api/scanner-alerts', {method: 'POST'});
+        document.getElementById('paper').textContent = data.message + "\\n\\n" + (data.stdout || data.stderr || '');
+        setStatus(data.ok ? 'Scanner alert sent.' : 'Telegram send failed. See output panel.', data.ok ? 'ok' : 'error');
+      }, false);
+    }
+    async function sendTradeIdeas() {
+      await runAction('Sending trade ideas to Telegram...', async () => {
+        const data = await getJson('/api/trade-idea-alerts', {method: 'POST'});
+        document.getElementById('paper').textContent = data.message + "\\n\\n" + (data.stdout || data.stderr || '');
+        setStatus(data.ok ? 'Trade ideas sent.' : 'Telegram send failed. See output panel.', data.ok ? 'ok' : 'error');
+      }, false);
+    }
+    async function runReadmeCommand(id) {
+      const catalog = await getJson('/api/commands');
+      const command = (catalog.commands || []).find(item => item.id === id);
+      if (!command) {
+        setStatus('Command not found.', 'error');
+        return;
+      }
+      const inputs = {};
+      for (const input of command.inputs || []) {
+        const value = window.prompt(input.label, input.default || '');
+        if (value === null) return;
+        inputs[input.name] = value;
+      }
+      let confirm = '';
+      if (command.requires_confirmation) {
+        const value = window.prompt(`Type ${command.confirm_phrase} to run ${command.label}.`, '');
+        if (value === null) return;
+        confirm = value;
+      }
+      await runAction(`Running ${command.label}...`, async () => {
+        const result = await getJson('/api/commands/run', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({id, inputs, confirm})
+        });
+        document.getElementById('command-output').textContent = formatCommandResult(result);
+        setStatus(result.ok ? `${command.label} finished.` : `${command.label} failed.`, result.ok ? 'ok' : 'error');
+      }, false);
+    }
+    function formatCommandResult(result) {
+      const parts = [
+        `status: ${result.status || 'unknown'}`,
+        `returncode: ${result.returncode ?? 'n/a'}`,
+        '',
+        'stdout:',
+        result.stdout || '',
+        '',
+        'stderr:',
+        result.stderr || ''
+      ];
+      if (result.pid) parts.splice(2, 0, `pid: ${result.pid}`);
+      return parts.join('\\n');
+    }
+    async function setTradingMode(mode) {
+      const nextMode = String(mode || '').toLowerCase();
+      if (nextMode === 'live') {
+        const ok = window.confirm('Switch bonehawk to LIVE mode? Crypto order commands can place real orders when TRADING_MODE=live.');
+        if (!ok) return;
+      }
+      await runAction(`Switching to ${nextMode.toUpperCase()} mode...`, async () => {
+        const data = await getJson('/api/trading-mode', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({mode: nextMode, confirm: nextMode === 'live' ? 'LIVE' : ''})
+        });
+        setModeButtons(data.mode);
+        await refreshStatus();
+        await refreshIntel();
+        setStatus(data.message || `Trading mode switched to ${nextMode}.`, data.ok ? 'ok' : 'error');
+      }, false);
+    }
+    async function setSettingsTradingMode(mode) {
+      await setTradingMode(mode);
+    }
+    async function setStockTradingMode(mode) {
+      const value = String(mode || '').toLowerCase();
+      let confirm = '';
+      if (value === 'live') {
+        const typed = window.prompt('Type LIVE_STOCK_MODE to enable live stock mode.', '');
+        if (typed === null) return;
+        confirm = typed;
+      }
+      await setStockSetting('BONEHAWK_STOCK_TRADING_MODE', value, confirm);
+    }
+    async function setStockConnectorMode(mode) {
+      const value = String(mode || '').toLowerCase();
+      let confirm = '';
+      if (value === 'codex_mcp') {
+        const typed = window.prompt('Type ENABLE_STOCK_CONNECTOR to enable the Robinhood stock connector.', '');
+        if (typed === null) return;
+        confirm = typed;
+      }
+      await setStockSetting('BONEHAWK_STOCK_ORDER_CONNECTOR', value, confirm);
+    }
+    async function setUiTheme(theme) {
+      const value = String(theme || 'arcade').toLowerCase();
+      await runAction(`Switching UI style to ${value.toUpperCase()}...`, async () => {
+        const data = await getJson('/api/ui-theme', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({theme: value})
+        });
+        applyUiTheme(data.theme);
+        await refreshStatus();
+        setStatus(data.message || 'UI style updated.', data.ok ? 'ok' : 'error');
+      }, false, false);
+    }
+    async function setAutopilotEnabled(value) {
+      await setAutopilotSetting('enabled', value, '');
+    }
+    async function setAutopilotMode(mode) {
+      const value = String(mode || '').toLowerCase();
+      let confirm = '';
+      if (value === 'live') {
+        const typed = window.prompt('Type LIVE_ALPACA_AUTOPILOT to switch autopilot mode to live.', '');
+        if (typed === null) return;
+        confirm = typed;
+      }
+      await setAutopilotSetting('mode', value, confirm);
+    }
+    async function setAutopilotAllowLive(value) {
+      const next = String(value || '').toLowerCase();
+      let confirm = '';
+      if (next === 'true') {
+        const typed = window.prompt('Type ALLOW_LIVE_ALPACA to unlock live Alpaca permission.', '');
+        if (typed === null) return;
+        confirm = typed;
+      }
+      await setAutopilotSetting('allow_live', next, confirm);
+    }
+    async function editAutopilotRisk() {
+      const snapshot = await getJson('/api/autopilot');
+      const config = snapshot.config || {};
+      const maxTrade = window.prompt('Max dollars per autopilot trade', config.max_trade_usd || 25);
+      if (maxTrade === null) return;
+      const maxPositions = window.prompt('Max open positions', config.max_open_positions || 3);
+      if (maxPositions === null) return;
+      const minConfidence = window.prompt('Minimum confidence score', config.min_confidence || 55);
+      if (minConfidence === null) return;
+      await setAutopilotSetting('max_trade_usd', maxTrade, '', false);
+      await setAutopilotSetting('max_open_positions', maxPositions, '', false);
+      await setAutopilotSetting('min_confidence', minConfidence, '', true);
+    }
+    async function setAutopilotSetting(setting, value, confirm, refresh = true) {
+      await runAction(`Updating autopilot ${setting}...`, async () => {
+        const data = await getJson('/api/autopilot-settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({setting, value, confirm})
+        });
+        const autopilot = await getJson('/api/autopilot');
+        renderAutopilot(autopilot);
+        renderAutopilotSettings(autopilot);
+        setStatus(data.message || 'Autopilot setting updated.', data.ok ? 'ok' : 'error');
+      }, refresh, false);
+    }
+    async function setStockSetting(setting, value, confirm) {
+      await runAction(`Updating ${setting}...`, async () => {
+        const data = await getJson('/api/stock-settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({setting, value, confirm})
+        });
+        await refreshStatus();
+        await refreshIntel();
+        setStatus(data.message || 'Stock setting updated.', data.ok ? 'ok' : 'error');
+      }, false, false);
+    }
+    async function runAction(label, action, refreshAfter = true, disableButtons = true) {
+      if (disableButtons) setBusy(true);
+      setStatus(label, 'muted');
+      try {
+        await action();
+        if (refreshAfter) await refreshIntel();
+      } catch (error) {
+        setStatus(error.message || 'Something failed.', 'error');
+        document.getElementById('paper').textContent = error.stack || String(error);
+      } finally {
+        if (disableButtons) setBusy(false);
+      }
+    }
+    async function refreshAll() {
+      await runAction('Refreshing dashboard...', async () => {
+        await refreshStatus();
+        await refreshCommands();
+        await refreshIntel();
+      }, false, false);
+    }
+    initSidebar();
+    refreshAll();
+  </script>
+</body>
+</html>
+"""
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run local trading bot dashboard.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(DashboardService()))
+    print(f"Dashboard running at http://{args.host}:{args.port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
