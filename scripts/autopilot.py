@@ -119,10 +119,14 @@ class AutopilotEngine:
         elif not self.alpaca_client:
             decisions["blocked"].append({"status": "broker_missing", "reason": "Alpaca client is not available."})
         else:
-            for order in decisions["orders"]:
+            planned_orders = list(decisions["orders"])
+            for index, order in enumerate(planned_orders):
                 request, broker_block = _broker_order_request(order, self.config, self.alpaca_client)
                 if broker_block:
                     decisions["blocked"].append(broker_block)
+                    if broker_block.get("status") == "rate_limited":
+                        decisions["blocked"].extend(_rate_limit_blocks(planned_orders[index + 1 :]))
+                        break
                     continue
                 response = self.alpaca_client.place_order(request, confirm=confirm)
                 executed.append(
@@ -137,11 +141,14 @@ class AutopilotEngine:
                         "reason": order.get("reason"),
                     }
                 )
+                if response.get("status") == "rate_limited":
+                    decisions["blocked"].extend(_rate_limit_blocks(planned_orders[index + 1 :]))
+                    break
         decision_rows = [_decision_from_execution(item) for item in executed] if executed else decisions["orders"]
         record_decisions(self.root / "logs" / "decision_log.jsonl", "autopilot_order", decision_rows)
         submitted = [item for item in executed if item.get("ok")]
         rejected = [item for item in executed if not item.get("ok")]
-        status = _execution_status(executed)
+        status = _execution_status(executed, decisions["blocked"])
         return {
             "ok": bool(executed) and not rejected,
             "status": status,
@@ -166,6 +173,7 @@ class AutopilotEngine:
         symbols = _autopilot_symbols(self.root, watchlist, self.config.symbols_per_run)
         active_watchlist = replace(watchlist, symbols=symbols, positions=_watchlist_positions(open_positions))
         account_state = self._account_state()
+        loss_outcome = _record_daily_loss_outcome_once(self.root, account_state, self.config)
         snapshot = self.intel_client.snapshot(active_watchlist)
         scan_result = scan_market(active_watchlist, snapshot)
         quote_symbols = list(dict.fromkeys([*symbols[: self.config.symbols_per_run], *position_symbols, "SPY", "QQQ"]))
@@ -193,6 +201,8 @@ class AutopilotEngine:
         postmortems = run_pending_loss_postmortems(self.root)
         if postmortems:
             agentic_scan = {**agentic_scan, "postmortems": postmortems}
+        if loss_outcome:
+            agentic_scan = {**agentic_scan, "loss_guardrail": _daily_loss_block(account_state, self.config)}
         exit_candidates = _build_exit_candidates(open_positions, quotes, technicals, agentic_scan, self.config, market_trend)
         return {
             "summary": scan_result["summary"],
@@ -213,6 +223,9 @@ class AutopilotEngine:
         blocked: list[dict[str, Any]] = []
         open_slots = max(0, self.config.max_open_positions - len(held_symbols))
         remaining_cash = _safe_float((scan_payload.get("account_state") or {}).get("available_cash"), 0)
+        loss_block = _daily_loss_block(scan_payload.get("account_state") or {}, self.config)
+        if loss_block:
+            return {"orders": [], "blocked": [loss_block]}
 
         for exit_candidate in scan_payload.get("exit_candidates", []):
             if exit_candidate.get("status") == "planned":
@@ -261,7 +274,7 @@ class AutopilotEngine:
             try:
                 positions = self.alpaca_client.get_positions()
             except Exception:
-                positions = None
+                return []
             if positions is not None:
                 return [position for position in (_normalize_alpaca_position(item) for item in positions) if position]
         return [_normalize_watchlist_position(position) for position in watchlist.positions if position.quantity > 0]
@@ -280,24 +293,33 @@ class AutopilotEngine:
             account = self.alpaca_client.get_account()
         except Exception:
             return {
-                "source": "config_fallback",
-                "cash": fallback,
-                "buying_power": fallback,
-                "portfolio_value": fallback,
-                "available_cash": fallback,
+                "source": "alpaca_unavailable",
+                "cash": 0,
+                "buying_power": 0,
+                "portfolio_value": 0,
+                "equity": 0,
+                "last_equity": 0,
+                "day_pnl": 0,
+                "available_cash": 0,
             }
         cash = _safe_float(account.get("cash"))
         buying_power = _safe_float(account.get("buying_power"))
         portfolio_value = _safe_float(account.get("portfolio_value"))
+        equity = _safe_float(account.get("equity"), portfolio_value)
+        last_equity = _safe_float(account.get("last_equity"))
+        day_pnl = round(equity - last_equity, 2) if equity > 0 and last_equity > 0 else _safe_float(account.get("day_pnl"))
         if cash > 0 and buying_power > 0:
             available_cash = min(cash, buying_power)
         else:
-            available_cash = max(cash, buying_power, portfolio_value, fallback)
+            available_cash = max(cash, buying_power, portfolio_value)
         return {
             "source": "alpaca",
             "cash": cash,
             "buying_power": buying_power,
             "portfolio_value": portfolio_value,
+            "equity": equity,
+            "last_equity": last_equity,
+            "day_pnl": day_pnl,
             "available_cash": available_cash,
         }
 
@@ -401,6 +423,80 @@ def _apply_order_cooldown(root: Path, decisions: dict[str, list[dict[str, Any]]]
             continue
         orders.append(order)
     return {"orders": orders, "blocked": blocked}
+
+
+def _rate_limit_blocks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **row,
+            "status": "rate_limited",
+            "reason": "Alpaca rate limit was hit; remaining planned orders were not sent.",
+        }
+        for row in rows
+    ]
+
+
+def _daily_loss_block(account_state: dict[str, Any], config: AutopilotConfig) -> dict[str, Any] | None:
+    day_pnl = _safe_float(account_state.get("day_pnl"))
+    max_loss = abs(_safe_float(config.max_daily_loss_usd, 20))
+    if max_loss <= 0 or day_pnl >= -max_loss:
+        return None
+    return {
+        "status": "daily_loss_limit",
+        "symbol": "PORTFOLIO",
+        "side": "halt",
+        "action": "AUTO_HALT_DAILY_LOSS",
+        "reason": f"Daily account P&L is ${day_pnl:.2f}, beyond the ${max_loss:.2f} max daily loss. Autopilot is halted for review.",
+        "day_pnl": round(day_pnl, 2),
+        "max_daily_loss_usd": round(max_loss, 2),
+        "review_only": True,
+    }
+
+
+def _record_daily_loss_outcome_once(root: Path, account_state: dict[str, Any], config: AutopilotConfig) -> dict[str, Any] | None:
+    block = _daily_loss_block(account_state, config)
+    if not block:
+        return None
+    path = root / "logs" / "trade_outcomes.jsonl"
+    today = datetime.now(UTC).date().isoformat()
+    key = f"{today}|PORTFOLIO|daily_loss_limit"
+    for row in _jsonl_rows(path):
+        if row.get("outcome_key") == key:
+            return row
+    outcome = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "outcome_key": key,
+        "symbol": "PORTFOLIO",
+        "realized_pnl": block["day_pnl"],
+        "reason": block["reason"],
+        "signals": [
+            f"day_pnl {block['day_pnl']}",
+            f"max_daily_loss_usd {block['max_daily_loss_usd']}",
+            f"equity {account_state.get('equity', 0)}",
+            f"last_equity {account_state.get('last_equity', 0)}",
+        ],
+        "review_only": True,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(outcome, sort_keys=True) + "\n")
+    return outcome
+
+
+def _jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            rows.append(value)
+    return rows
 
 
 def _recent_order_fingerprints(path: Path, cooldown_minutes: int) -> set[tuple[str, str, str]]:
@@ -936,7 +1032,12 @@ def _broker_bracket_prices(order: dict[str, Any], config: AutopilotConfig) -> di
     return {"stop_loss": order.get("stop_loss"), "take_profit": order.get("take_profit")}
 
 
-def _execution_status(executed: list[dict[str, Any]]) -> str:
+def _execution_status(executed: list[dict[str, Any]], blocked: list[dict[str, Any]] | None = None) -> str:
+    blocked = blocked or []
+    if any(item.get("status") == "daily_loss_limit" for item in blocked):
+        return "daily_loss_limit"
+    if any(item.get("status") == "rate_limited" for item in blocked) and not executed:
+        return "rate_limited"
     if not executed:
         return "no_orders_submitted"
     success_count = sum(1 for item in executed if item.get("ok"))
@@ -948,6 +1049,10 @@ def _execution_status(executed: list[dict[str, Any]]) -> str:
 
 
 def _execution_message(status: str, submitted: list[dict[str, Any]], rejected: list[dict[str, Any]], orders: list[dict[str, Any]]) -> str:
+    if status == "daily_loss_limit":
+        return "Autopilot halted because the daily loss limit was breached. Post-mortem review was recorded."
+    if status == "rate_limited":
+        return "Alpaca rate limit was hit before orders could be submitted."
     if submitted and not rejected:
         return f"Submitted {len(submitted)} Alpaca paper order(s)."
     if submitted and rejected:

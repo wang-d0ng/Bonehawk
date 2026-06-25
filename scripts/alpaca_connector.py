@@ -204,10 +204,12 @@ class AlpacaTradingClient:
             if order_id := str(data.get("id") or "").strip():
                 data = _merge_order_refresh(data, self._refresh_order(order_id))
         except httpx.HTTPStatusError as error:
+            status = "rate_limited" if error.response.status_code == 429 else "rejected"
+            message = "Alpaca rate limit hit. Waiting before more order requests." if status == "rate_limited" else "Alpaca rejected the order."
             return {
                 "ok": False,
-                "status": "rejected",
-                "message": "Alpaca rejected the order.",
+                "status": status,
+                "message": message,
                 "detail": _safe_http_error(error),
                 "request_id": error.response.headers.get("X-Request-ID"),
                 "review_only": True,

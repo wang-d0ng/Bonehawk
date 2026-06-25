@@ -631,6 +631,28 @@ def test_dashboard_service_autopilot_snapshot_is_redacted(tmp_path: Path) -> Non
     assert "telegram-secret" not in json.dumps(payload)
 
 
+def test_dashboard_service_disabling_autopilot_stops_background_loop(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper"}))
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
+    stops: list[bool] = []
+
+    def fake_stop() -> dict:
+        stops.append(True)
+        return {"status": "stopped", "running": False}
+
+    service.stop_autopilot_background = fake_stop  # type: ignore[method-assign]
+
+    payload = service.set_autopilot_setting("enabled", False)
+    saved = json.loads((config / "autopilot.json").read_text())
+
+    assert payload["ok"] is True
+    assert saved["enabled"] is False
+    assert stops == [True]
+    assert payload["background"]["status"] == "stopped"
+
+
 def test_dashboard_service_autopilot_scan_and_execute_paper_order(tmp_path: Path) -> None:
     config = tmp_path / "config"
     config.mkdir()

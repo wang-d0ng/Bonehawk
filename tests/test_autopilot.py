@@ -198,6 +198,38 @@ class NonFractionableAlpacaClient(FakeAlpacaClient):
         return {"symbol": symbol.upper(), "status": "active", "tradable": True, "fractionable": False}
 
 
+class RateLimitedAlpacaClient(FakeAlpacaClient):
+    def place_order(self, request, confirm: str = "") -> dict:
+        self.orders.append((request, confirm))
+        return {
+            "ok": False,
+            "status": "rate_limited",
+            "message": "Alpaca rate limit hit.",
+            "detail": "{'code': 42910000, 'message': 'rate limit exceeded'}",
+            "symbol": request.symbol,
+            "side": request.side.upper(),
+            "quantity": request.quantity,
+            "notional": request.notional,
+            "review_only": True,
+        }
+
+
+class PositionFetchFailingAlpacaClient(FakeAlpacaClient):
+    def get_positions(self) -> list[dict]:
+        raise RuntimeError("rate limit exceeded")
+
+
+class DailyLossAlpacaClient(FakeAlpacaClient):
+    def get_account(self) -> dict:
+        return {
+            "cash": "1000",
+            "buying_power": "1000",
+            "portfolio_value": "780",
+            "equity": "780",
+            "last_equity": "1000",
+        }
+
+
 def test_load_autopilot_config_defaults_to_paper_disabled(tmp_path: Path) -> None:
     config = load_autopilot_config(tmp_path / "missing.json")
 
@@ -419,6 +451,61 @@ def test_autopilot_blocks_non_fractionable_buy_when_cash_cannot_buy_one_share(tm
 
     assert payload["executed"] == []
     assert any(item["status"] == "whole_share_required" for item in payload["blocked"])
+    assert alpaca.orders == []
+
+
+def test_autopilot_stops_batch_after_rate_limit(tmp_path: Path) -> None:
+    alpaca = RateLimitedAlpacaClient(cash=1000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, max_open_positions=5),
+        intel_client=FakeIntelClient(["MSFT", "NVDA"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT", "NVDA"], positions=[], risk={}, aliases={}))
+
+    assert payload["status"] == "orders_rejected"
+    assert len(alpaca.orders) == 1
+    assert payload["executed"][0]["status"] == "rate_limited"
+    assert any(item["status"] == "rate_limited" for item in payload["blocked"])
+
+
+def test_autopilot_does_not_sell_watchlist_position_when_alpaca_positions_fail(tmp_path: Path) -> None:
+    alpaca = PositionFetchFailingAlpacaClient(cash=1000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, max_open_positions=5),
+        intel_client=FakeIntelClient(["AAPL"]),
+        quote_client=ProfitTakingQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["AAPL"], positions=[type("Position", (), {"symbol": "AAPL", "quantity": 1, "cost_basis": 1})()], risk={}, aliases={}))
+
+    assert all(order.get("side") != "sell" for order in payload["orders"])
+    assert all(request.side != "sell" for request, _confirm in alpaca.orders)
+
+
+def test_autopilot_daily_loss_halts_orders_and_records_postmortem(tmp_path: Path) -> None:
+    alpaca = DailyLossAlpacaClient(cash=1000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, max_daily_loss_usd=20),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+    postmortem_rows = (tmp_path / "logs" / "postmortems.jsonl").read_text().splitlines()
+
+    assert payload["status"] == "daily_loss_limit"
+    assert payload["orders"] == []
+    assert payload["executed"] == []
+    assert payload["agentic_scan"]["postmortems"]
+    assert json.loads(postmortem_rows[0])["symbol"] == "PORTFOLIO"
     assert alpaca.orders == []
 
 

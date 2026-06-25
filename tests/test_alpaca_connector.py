@@ -246,6 +246,20 @@ def test_alpaca_client_reports_rejected_and_network_errors() -> None:
     assert network_result["status"] == "network_error"
 
 
+def test_alpaca_client_reports_rate_limit_rejection() -> None:
+    client = AlpacaTradingClient(
+        AlpacaConfig(api_key="key", secret_key="secret"),
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(429, headers={"X-Request-ID": "rate-1"}, json={"code": 42910000, "message": "rate limit exceeded"}))),
+    )
+
+    result = client.place_order(AlpacaOrderRequest(symbol="MSFT", side="buy", notional=1))
+
+    assert result["ok"] is False
+    assert result["status"] == "rate_limited"
+    assert result["request_id"] == "rate-1"
+    assert "rate limit" in result["detail"].lower()
+
+
 def test_alpaca_client_reports_missing_config_without_calling_network() -> None:
     client = AlpacaTradingClient(AlpacaConfig())
 

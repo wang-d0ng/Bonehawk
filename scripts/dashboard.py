@@ -70,6 +70,7 @@ class DashboardService:
         self._background_started_at = ""
         self._background_last_started_at = ""
         self._background_last_finished_at = ""
+        self._ticket_refresh_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def status(self) -> dict[str, Any]:
         env = _read_env_presence(self.root / ".env")
@@ -335,6 +336,8 @@ class DashboardService:
         if payload.get("ok"):
             save_autopilot_config(path, next_config)
             payload["config"] = next_config.snapshot()
+            if str(setting or "").strip() == "enabled" and not next_config.enabled:
+                payload["background"] = self.stop_autopilot_background()
         else:
             payload["config"] = config.snapshot()
         return payload
@@ -535,12 +538,19 @@ class DashboardService:
         if not hasattr(client, "get_order"):
             return tickets
         refreshed = list(tickets)
+        now = time.monotonic()
         for index in refreshable_indexes:
             ticket = refreshed[index]
+            order_id = str(ticket.get("broker_order_id") or "")
+            cached = self._ticket_refresh_cache.get(order_id)
+            if cached and now - cached[0] < 20:
+                refreshed[index] = _ticket_with_alpaca_order(ticket, cached[1])
+                continue
             try:
-                order = client.get_order(str(ticket.get("broker_order_id")))
+                order = client.get_order(order_id)
             except Exception:
                 continue
+            self._ticket_refresh_cache[order_id] = (now, order)
             refreshed[index] = _ticket_with_alpaca_order(ticket, order)
         return refreshed
 
@@ -687,9 +697,9 @@ class DashboardService:
         watchlist = self.scanner_watchlist()
         portfolio = self._alpaca_portfolio()
         if portfolio.get("status") in {"connected", "partial"}:
-            return _watchlist_with_portfolio_positions(watchlist, portfolio.get("watchlist_positions") or [])
+            return _watchlist_with_portfolio_positions(watchlist, portfolio.get("watchlist_positions") or [], replace_positions=True)
         if portfolio.get("status") == "error":
-            return _watchlist_with_portfolio_positions(watchlist, [])
+            return _watchlist_with_portfolio_positions(watchlist, [], replace_positions=True)
         return watchlist
 
     def paper_cycle(self, notify: bool = False) -> dict[str, Any]:
@@ -1117,9 +1127,9 @@ def _trade_quote_symbols(scan_result: dict[str, Any], positions: list[Any], limi
     return list(dict.fromkeys(symbols))[:limit]
 
 
-def _watchlist_with_portfolio_positions(watchlist: Watchlist, positions: list[Position]) -> Watchlist:
+def _watchlist_with_portfolio_positions(watchlist: Watchlist, positions: list[Position], *, replace_positions: bool = False) -> Watchlist:
     if not positions:
-        return watchlist
+        return Watchlist(symbols=watchlist.symbols, positions=[] if replace_positions else watchlist.positions, risk=watchlist.risk, aliases=watchlist.aliases)
     symbols = list(dict.fromkeys([*watchlist.symbols, *[position.symbol for position in positions]]))
     return Watchlist(symbols=symbols, positions=positions, risk=watchlist.risk, aliases=watchlist.aliases)
 
@@ -3563,7 +3573,7 @@ HTML = """
     initSidebar();
     refreshAll();
     window.setInterval(refreshAutopilotBackgroundStatus, 10000);
-    window.setInterval(refreshLiveOrders, 2000);
+    window.setInterval(refreshLiveOrders, 5000);
   </script>
 </body>
 </html>
