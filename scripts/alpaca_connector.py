@@ -144,6 +144,17 @@ class AlpacaTradingClient:
         payload = response.json()
         return payload if isinstance(payload, list) else []
 
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        normalized_id = str(order_id or "").strip()
+        if not normalized_id:
+            raise AlpacaError("Alpaca order id is missing.")
+        if not self.config.is_configured:
+            raise AlpacaError("Alpaca API keys are missing.")
+        response = self.http_client.get(f"{self.config.trading_base_url}/v2/orders/{normalized_id}", headers=self.config.headers())
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
     def place_order(self, request: AlpacaOrderRequest, confirm: str = "") -> dict[str, Any]:
         validation = _validate_order_request(request)
         if validation:
@@ -179,6 +190,8 @@ class AlpacaTradingClient:
             request_id = response.headers.get("X-Request-ID")
             response.raise_for_status()
             data = response.json()
+            if order_id := str(data.get("id") or "").strip():
+                data = _merge_order_refresh(data, self._refresh_order(order_id))
         except httpx.HTTPStatusError as error:
             return {
                 "ok": False,
@@ -196,6 +209,7 @@ class AlpacaTradingClient:
                 "detail": _safe_error(error),
                 "review_only": True,
             }
+        fill = _order_fill_snapshot(data)
         return {
             "ok": True,
             "status": "submitted",
@@ -208,14 +222,29 @@ class AlpacaTradingClient:
             "broker_order_id": data.get("id"),
             "client_order_id": data.get("client_order_id"),
             "broker_status": data.get("status"),
+            "filled_quantity": fill["filled_quantity"],
+            "filled_average_price": fill["filled_average_price"],
+            "fill_status": fill["fill_status"],
+            "submitted_at": data.get("submitted_at"),
+            "filled_at": data.get("filled_at"),
             "request_id": request_id,
-            "message": f"Alpaca {'paper' if self.config.paper else 'live'} order submitted.",
+            "message": _order_message(self.config.paper, fill["fill_status"], data.get("status")),
             "review_only": False,
         }
+
+    def _refresh_order(self, order_id: str) -> dict[str, Any]:
+        try:
+            return self.get_order(order_id)
+        except (AlpacaError, httpx.HTTPError):
+            return {}
 
 
 class AlpacaError(RuntimeError):
     pass
+
+
+def alpaca_order_fill_snapshot(order: dict[str, Any]) -> dict[str, Any]:
+    return _order_fill_snapshot(order)
 
 
 def _validate_order_request(request: AlpacaOrderRequest) -> dict[str, Any] | None:
@@ -264,6 +293,70 @@ def _env_float(value: str | None, default: float, minimum: float, maximum: float
 
 def _format_decimal(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def _merge_order_refresh(submitted: dict[str, Any], refreshed: dict[str, Any]) -> dict[str, Any]:
+    if not refreshed:
+        return submitted
+    merged = dict(submitted)
+    merged.update({key: value for key, value in refreshed.items() if value is not None})
+    return merged
+
+
+def _order_fill_snapshot(order: dict[str, Any]) -> dict[str, Any]:
+    broker_status = str(order.get("status") or "").strip().lower()
+    filled_quantity = _safe_float(order.get("filled_qty"))
+    order_quantity = _safe_float(order.get("qty"))
+    fill_status = _fill_status(broker_status, filled_quantity, order_quantity)
+    return {
+        "filled_quantity": filled_quantity,
+        "filled_average_price": _safe_float_or_none(order.get("filled_avg_price")),
+        "fill_status": fill_status,
+    }
+
+
+def _fill_status(broker_status: str, filled_quantity: float, order_quantity: float) -> str:
+    if broker_status == "filled" or (order_quantity > 0 and filled_quantity >= order_quantity):
+        return "filled"
+    if filled_quantity > 0:
+        return "partially_filled"
+    if broker_status in {"accepted", "new", "pending_new", "accepted_for_bidding", "pending_cancel", "pending_replace", "held"}:
+        return "not_filled_yet"
+    if broker_status in {"canceled", "cancelled", "expired", "rejected", "stopped", "suspended", "done_for_day"}:
+        return broker_status
+    return "not_filled_yet" if broker_status else "unknown"
+
+
+def _order_message(paper: bool, fill_status: str, broker_status: Any) -> str:
+    mode = "paper" if paper else "live"
+    if fill_status == "filled":
+        return f"Alpaca {mode} order filled."
+    if fill_status == "partially_filled":
+        return f"Alpaca {mode} order partially filled."
+    if fill_status == "not_filled_yet":
+        return f"Alpaca {mode} order accepted but not filled yet."
+    if fill_status in {"canceled", "cancelled", "expired", "rejected", "stopped", "suspended", "done_for_day"}:
+        return f"Alpaca {mode} order is {fill_status}."
+    status = str(broker_status or "submitted").strip() or "submitted"
+    return f"Alpaca {mode} order submitted with broker status {status}."
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _safe_http_error(error: httpx.HTTPStatusError) -> str:

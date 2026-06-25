@@ -48,6 +48,25 @@ Telegram smoke test:
 bash scripts/telegram.sh "Bonehawk Alpaca smoke test"
 ```
 
+Telegram autopilot control:
+
+```bash
+python scripts/telegram_autopilot.py --once
+python scripts/telegram_autopilot.py --loop
+```
+
+Only chats listed in `ALLOWED_CHAT_IDS` can control the bot. Supported commands:
+
+- `/bh status`
+- `/bh scan`
+- `/bh run` for paper-mode execution only
+- `/bh tickets`
+- `/bh enable` or `/bh disable`
+- `/bh paper-mode`
+- `/bh size 25`
+- `/bh positions 3`
+- `/bh confidence 55`
+
 ## Market Scanner
 
 To customize tracked assets:
@@ -141,6 +160,12 @@ The build output is `dist/Bonehawk.app`. The desktop app icon lives at `assets/a
 ## Command Center
 
 The dashboard Command Center exposes setup, scanner, Telegram, paper cycle, desktop, daily alert, and test commands as buttons. It uses an allowlist instead of a free-form shell box, redacts likely sensitive output, and requires typed confirmation for guarded commands.
+
+UI profiles are selectable in Settings:
+
+- `Arcade`: the neon cabinet profile
+- `Algo Desk`: black CRT trading terminal profile inspired by the arcade algo desk reference
+- `Classic`: quieter operational dashboard styling
 
 ## Daily Telegram Alerts
 

@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.alpaca_connector import AlpacaConfig, AlpacaOrderRequest, AlpacaTradingClient
+from scripts.alpaca_connector import AlpacaConfig, AlpacaOrderRequest, AlpacaTradingClient, alpaca_order_fill_snapshot
 from scripts.autopilot import AutopilotConfig, AutopilotEngine, load_autopilot_config, save_autopilot_config, update_autopilot_config
 from scripts.command_center import command_catalog, run_command
 from scripts.decision_log import latest_decisions, record_decisions
@@ -27,7 +27,7 @@ from scripts.portfolio_sync import portfolio_sync_snapshot
 from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfolio_performance
 from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
 
-UI_THEME_VALUES = {"arcade", "classic"}
+UI_THEME_VALUES = {"arcade", "classic", "algo-desk"}
 SETUP_SECRET_KEYS = {
     "ALPACA_API_KEY",
     "ALPACA_SECRET_KEY",
@@ -95,7 +95,7 @@ class DashboardService:
     def set_ui_theme(self, theme: Any) -> dict[str, Any]:
         normalized = str(theme or "").strip().lower()
         if normalized not in UI_THEME_VALUES:
-            return {"ok": False, "status": "invalid_theme", "theme": _ui_theme_from_env(_read_env_presence(self.root / ".env")), "message": "UI style must be arcade or classic."}
+            return {"ok": False, "status": "invalid_theme", "theme": _ui_theme_from_env(_read_env_presence(self.root / ".env")), "message": "UI style must be arcade, algo-desk, or classic."}
         _write_env_value(self.root / ".env", "BONEHAWK_UI_THEME", normalized)
         return {"ok": True, "status": "updated", "theme": normalized, "message": f"UI style switched to {normalized}."}
 
@@ -347,9 +347,18 @@ class DashboardService:
                     "current_price": None,
                     "quantity": result.get("quantity", request.quantity),
                     "status": result.get("status"),
+                    "broker_status": result.get("broker_status"),
                     "broker_order_id": result.get("broker_order_id"),
+                    "filled_quantity": result.get("filled_quantity"),
+                    "filled_average_price": result.get("filled_average_price"),
+                    "fill_status": result.get("fill_status"),
                     "reason": result.get("message"),
-                    "signals": [f"quantity {result.get('quantity', request.quantity)}", f"broker_order_id {result.get('broker_order_id') or 'unknown'}"],
+                    "signals": [
+                        f"quantity {result.get('quantity', request.quantity)}",
+                        f"broker_order_id {result.get('broker_order_id') or 'unknown'}",
+                        f"broker_status {result.get('broker_status') or 'unknown'}",
+                        f"fill_status {result.get('fill_status') or 'unknown'}",
+                    ],
                     "review_only": bool(result.get("review_only", False)),
                 }
             ],
@@ -360,7 +369,29 @@ class DashboardService:
         rows = latest_decisions(self.root / "logs" / "decision_log.jsonl", limit=200)
         tickets = [_ticket_from_decision(row) for row in rows]
         tickets = [ticket for ticket in tickets if ticket is not None]
+        tickets = self._refresh_alpaca_ticket_statuses(tickets)
         return {"tickets": tickets, "summary": {"count": len(tickets)}}
+
+    def _refresh_alpaca_ticket_statuses(self, tickets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        refreshable_indexes = [
+            index
+            for index, ticket in enumerate(tickets)
+            if ticket.get("broker_order_id") and ticket.get("review_only") is False
+        ][:12]
+        if not refreshable_indexes:
+            return tickets
+        client = self._alpaca_client()
+        if not hasattr(client, "get_order"):
+            return tickets
+        refreshed = list(tickets)
+        for index in refreshable_indexes:
+            ticket = refreshed[index]
+            try:
+                order = client.get_order(str(ticket.get("broker_order_id")))
+            except Exception:
+                continue
+            refreshed[index] = _ticket_with_alpaca_order(ticket, order)
+        return refreshed
 
     def _alpaca_client(self) -> Any:
         if self.alpaca_client is not None:
@@ -771,9 +802,24 @@ def _ticket_from_decision(row: dict[str, Any]) -> dict[str, Any] | None:
         "quantity": _ticket_quantity(row),
         "current_price": row.get("current_price"),
         "status": status,
+        "broker_status": row.get("broker_status"),
         "broker_order_id": row.get("broker_order_id"),
+        "filled_quantity": row.get("filled_quantity"),
+        "filled_average_price": row.get("filled_average_price"),
+        "fill_status": row.get("fill_status") or _ticket_signal_value(row, "fill_status"),
         "message": row.get("reason"),
         "review_only": row.get("review_only", True),
+    }
+
+
+def _ticket_with_alpaca_order(ticket: dict[str, Any], order: dict[str, Any]) -> dict[str, Any]:
+    fill = alpaca_order_fill_snapshot(order)
+    return {
+        **ticket,
+        "broker_status": order.get("status") or ticket.get("broker_status"),
+        "filled_quantity": fill["filled_quantity"],
+        "filled_average_price": fill["filled_average_price"],
+        "fill_status": fill["fill_status"],
     }
 
 
@@ -791,6 +837,15 @@ def _ticket_quantity(row: dict[str, Any]) -> float | None:
                 return float(text.split(" ", 1)[1])
             except ValueError:
                 return None
+    return None
+
+
+def _ticket_signal_value(row: dict[str, Any], prefix: str) -> str | None:
+    needle = f"{prefix} "
+    for signal in row.get("signals") or []:
+        text = str(signal)
+        if text.startswith(needle):
+            return text.split(" ", 1)[1]
     return None
 
 
@@ -975,6 +1030,105 @@ HTML = """
     body.theme-arcade .range-control button.active {
       box-shadow: 0 0 18px rgba(0,255,156,0.34), inset 0 0 0 1px rgba(255,255,255,0.18);
     }
+    body.theme-algo-desk {
+      --ink: #e0e0e0;
+      --muted: #7aa17a;
+      --page: #050505;
+      --panel: #0a0a0a;
+      --panel-raised: #101510;
+      --line: rgba(57,255,20,0.45);
+      --line-soft: rgba(57,255,20,0.24);
+      --blue: #39ff14;
+      --green: #00ff41;
+      --red: #ff003c;
+      --amber: #ffbf00;
+      background:
+        linear-gradient(180deg, rgba(57,255,20,0.06), rgba(5,5,5,0.96) 34%),
+        radial-gradient(circle at 82% 8%, rgba(255,191,0,0.12), transparent 22%),
+        #050505;
+      text-shadow: 0 0 8px rgba(57,255,20,0.26);
+    }
+    body.theme-algo-desk::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      pointer-events: none;
+      background:
+        repeating-linear-gradient(to bottom, rgba(255,255,255,0.05) 0 1px, rgba(0,0,0,0.24) 1px 3px, transparent 3px 6px),
+        linear-gradient(90deg, rgba(255,0,60,0.035), transparent 18%, rgba(0,255,65,0.025) 52%, transparent 76%, rgba(0,40,255,0.035));
+      mix-blend-mode: screen;
+      opacity: 0.38;
+    }
+    body.theme-algo-desk .arcade-grid {
+      background:
+        linear-gradient(rgba(57,255,20,0.13) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(57,255,20,0.09) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,0.52), transparent 78%);
+    }
+    body.theme-algo-desk h1,
+    body.theme-algo-desk h2,
+    body.theme-algo-desk .brand .sub {
+      color: var(--green);
+      text-shadow: 0 0 8px rgba(0,255,65,0.82), 0 0 22px rgba(57,255,20,0.28);
+    }
+    body.theme-algo-desk .brand,
+    body.theme-algo-desk .topbar {
+      background: linear-gradient(90deg, rgba(57,255,20,0.11), rgba(0,0,0,0.78));
+    }
+    body.theme-algo-desk .terminal-mark {
+      background: var(--green);
+      color: #050505;
+      box-shadow: 4px 4px 0 var(--red), 0 0 18px rgba(57,255,20,0.72);
+    }
+    body.theme-algo-desk button.primary,
+    body.theme-algo-desk .mode-option.active,
+    body.theme-algo-desk .range-control button.active {
+      background: var(--green);
+      border-color: var(--green);
+      color: #050505;
+      box-shadow: 0 0 18px rgba(57,255,20,0.45), inset -2px -2px 0 rgba(0,0,0,0.45);
+    }
+    body.theme-algo-desk aside,
+    body.theme-algo-desk .metric,
+    body.theme-algo-desk .data-row,
+    body.theme-algo-desk .command-card,
+    body.theme-algo-desk .chart-drawer,
+    body.theme-algo-desk .ticket-drawer,
+    body.theme-algo-desk .toast,
+    body.theme-algo-desk pre {
+      border-color: rgba(57,255,20,0.5);
+      box-shadow: 0 0 0 1px rgba(57,255,20,0.18), 0 0 24px rgba(57,255,20,0.13), inset 0 0 20px rgba(57,255,20,0.05);
+    }
+    body.theme-algo-desk .tab.active {
+      background: rgba(57,255,20,0.13);
+      color: var(--green);
+      border-color: var(--green);
+      box-shadow: inset 4px 0 0 var(--amber), 0 0 18px rgba(57,255,20,0.22);
+    }
+    body.theme-algo-desk .ticker strong,
+    body.theme-algo-desk .metric-value,
+    body.theme-algo-desk .symbol-link {
+      color: var(--green);
+    }
+    body.theme-algo-desk .pill.buy,
+    body.theme-algo-desk .pill.hold {
+      background: rgba(0,255,65,0.1);
+      color: var(--green);
+      border-color: rgba(0,255,65,0.58);
+    }
+    body.theme-algo-desk .pill.sell {
+      background: rgba(255,0,60,0.1);
+      color: var(--red);
+      border-color: rgba(255,0,60,0.62);
+    }
+    body.theme-algo-desk .pill.trim,
+    body.theme-algo-desk .pill.watch {
+      background: rgba(255,191,0,0.1);
+      color: var(--amber);
+      border-color: rgba(255,191,0,0.62);
+    }
     body.theme-classic {
       --ink: #f4f4f5;
       --muted: #9ca3af;
@@ -1060,7 +1214,7 @@ HTML = """
     .pill.sell { background: rgba(255,92,100,0.12); color: var(--red); border-color: rgba(255,92,100,0.32); }
     .pill.trim, .pill.watch { background: rgba(246,196,83,0.12); color: var(--amber); border-color: rgba(246,196,83,0.34); }
     .pill.quiet, .pill.no { background: rgba(255,255,255,0.04); color: var(--muted); }
-    .mode-switch { display: inline-grid; grid-template-columns: 1fr 1fr; border: 2px solid var(--line); border-radius: 3px; background: #0d0d0e; padding: 3px; gap: 3px; }
+    .mode-switch { display: inline-grid; grid-template-columns: repeat(var(--switch-count, 2), minmax(68px, 1fr)); border: 2px solid var(--line); border-radius: 3px; background: #0d0d0e; padding: 3px; gap: 3px; }
     .mode-option { min-height: 28px; min-width: 68px; border-color: transparent; background: transparent; color: var(--muted); box-shadow: none; }
     .mode-option.active { background: var(--green); color: #07130c; border-color: var(--green); }
     .mode-option.live.active { background: var(--red); color: #fff7f7; border-color: var(--red); }
@@ -1594,6 +1748,10 @@ HTML = """
         result?.quantity ? `Quantity: ${result.quantity}` : '',
         result?.current_price ? `Price: ${money(result.current_price)}` : '',
         result?.broker_order_id ? `Order ID: ${result.broker_order_id}` : '',
+        result?.broker_status ? `Broker: ${result.broker_status}` : '',
+        result?.fill_status ? `Fill: ${result.fill_status}` : '',
+        Number.isFinite(Number(result?.filled_quantity)) ? `Filled Qty: ${result.filled_quantity}` : '',
+        result?.filled_average_price ? `Avg Fill: ${money(result.filled_average_price)}` : '',
         result?.detail ? `Detail: ${result.detail}` : '',
         ok ? (result?.review_only === false ? 'Live connector response' : 'Review-only ticket') : 'Order was not sent'
       ].filter(Boolean);
@@ -2020,6 +2178,9 @@ HTML = """
           ticket.quantity ? `Qty ${ticket.quantity}` : '',
           ticket.current_price ? `price ${money(ticket.current_price)}` : '',
           ticket.broker_order_id ? `order ${ticket.broker_order_id}` : '',
+          ticket.broker_status ? `broker ${ticket.broker_status}` : '',
+          ticket.fill_status ? `fill ${ticket.fill_status}` : '',
+          Number.isFinite(Number(ticket.filled_quantity)) ? `filled ${ticket.filled_quantity}` : '',
           ticket.review_only === false ? 'live connector' : 'review ticket'
         ].filter(Boolean).join(' · ');
         const message = [escapeHtml(ticket.message || ''), detail].filter(Boolean).join(' · ');
@@ -2252,19 +2413,24 @@ HTML = """
     function renderSettings(data) {
       document.getElementById('capabilities').innerHTML = Object.entries(data.capabilities || {}).map(([key, value]) => row(escapeHtml(key), escapeHtml(value))).join('');
     }
+    function normalizeUiTheme(theme) {
+      const value = String(theme || 'arcade').toLowerCase();
+      return ['arcade', 'algo-desk', 'classic'].includes(value) ? value : 'arcade';
+    }
     function applyUiTheme(theme) {
-      const nextTheme = String(theme || 'arcade').toLowerCase() === 'classic' ? 'classic' : 'arcade';
+      const nextTheme = normalizeUiTheme(theme);
       document.body.dataset.theme = nextTheme;
       document.body.classList.toggle('theme-arcade', nextTheme === 'arcade');
+      document.body.classList.toggle('theme-algo-desk', nextTheme === 'algo-desk');
       document.body.classList.toggle('theme-classic', nextTheme === 'classic');
     }
     function renderUiThemeSettings(status) {
       const env = status.env || {};
-      const theme = String(status.ui_theme || env.BONEHAWK_UI_THEME || 'arcade').toLowerCase() === 'classic' ? 'classic' : 'arcade';
+      const theme = normalizeUiTheme(status.ui_theme || env.BONEHAWK_UI_THEME || 'arcade');
       document.getElementById('ui-theme-settings').innerHTML = row(
         'UI style',
-        'Arcade is the new neon cabinet view. Classic keeps the current dashboard look.',
-        settingSwitch([{label: 'Arcade', value: 'arcade'}, {label: 'Classic', value: 'classic'}], theme, 'setUiTheme')
+        'Arcade is neon cabinet, Algo Desk is black-market terminal, Classic keeps the quiet dashboard look.',
+        settingSwitch([{label: 'Arcade', value: 'arcade'}, {label: 'Algo Desk', value: 'algo-desk'}, {label: 'Classic', value: 'classic'}], theme, 'setUiTheme')
       );
     }
     function renderAutopilotSettings(data) {

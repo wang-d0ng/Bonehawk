@@ -90,8 +90,26 @@ class FakeAlpacaClient:
             "notional": request.notional,
             "broker_order_id": "alpaca-paper-order",
             "broker_status": "accepted",
+            "filled_quantity": 0,
+            "fill_status": "not_filled_yet",
             "message": "Alpaca paper order submitted.",
             "review_only": False,
+        }
+
+
+class FakeFilledOrderAlpacaClient(FakeAlpacaClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refreshed_order_ids = []
+
+    def get_order(self, order_id):
+        self.refreshed_order_ids.append(order_id)
+        return {
+            "id": order_id,
+            "status": "filled",
+            "filled_qty": "1",
+            "qty": "1",
+            "filled_avg_price": "101.25",
         }
 
 
@@ -219,12 +237,12 @@ def test_dashboard_service_updates_ui_theme(tmp_path: Path) -> None:
     env_file.write_text("ALPACA_API_KEY=secret\nBONEHAWK_UI_THEME=classic\n")
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient())
 
-    payload = service.set_ui_theme("arcade")
+    payload = service.set_ui_theme("algo-desk")
 
     assert payload["ok"] is True
-    assert payload["theme"] == "arcade"
+    assert payload["theme"] == "algo-desk"
     assert "ALPACA_API_KEY=secret" in env_file.read_text()
-    assert "BONEHAWK_UI_THEME=arcade" in env_file.read_text()
+    assert "BONEHAWK_UI_THEME=algo-desk" in env_file.read_text()
 
 
 def test_dashboard_service_rejects_invalid_ui_theme(tmp_path: Path) -> None:
@@ -485,10 +503,37 @@ def test_dashboard_service_stock_order_calls_alpaca_client(tmp_path: Path) -> No
     assert payload["ok"] is True
     assert payload["status"] == "submitted"
     assert payload["broker_order_id"] == "alpaca-paper-order"
+    assert payload["fill_status"] == "not_filled_yet"
     assert alpaca.orders[0][0].symbol == "MSFT"
     assert alpaca.orders[0][0].quantity == 3
     assert alpaca.orders[0][1] == "LIVE_ALPACA_ORDER"
     assert (tmp_path / "logs" / "decision_log.jsonl").exists()
+
+
+def test_dashboard_service_tickets_show_unfilled_alpaca_orders(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
+
+    service.stock_order("msft", "buy", "1", confirm="LIVE_ALPACA_ORDER")
+    payload = service.tickets()
+
+    assert payload["tickets"][0]["status"] == "submitted"
+    assert payload["tickets"][0]["broker_status"] == "accepted"
+    assert payload["tickets"][0]["fill_status"] == "not_filled_yet"
+    assert payload["tickets"][0]["filled_quantity"] == 0
+
+
+def test_dashboard_service_tickets_refresh_alpaca_fill_status(tmp_path: Path) -> None:
+    alpaca = FakeFilledOrderAlpacaClient()
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=alpaca)
+
+    service.stock_order("msft", "buy", "1", confirm="LIVE_ALPACA_ORDER")
+    payload = service.tickets()
+
+    assert alpaca.refreshed_order_ids == ["alpaca-paper-order"]
+    assert payload["tickets"][0]["broker_status"] == "filled"
+    assert payload["tickets"][0]["fill_status"] == "filled"
+    assert payload["tickets"][0]["filled_quantity"] == 1
+    assert payload["tickets"][0]["filled_average_price"] == 101.25
 
 
 def test_dashboard_service_autopilot_snapshot_is_redacted(tmp_path: Path) -> None:
@@ -743,6 +788,9 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "/api/ui-theme" in HTML
     assert "setUiTheme" in HTML
     assert "theme-classic" in HTML
+    assert "theme-algo-desk" in HTML
+    assert "Algo Desk" in HTML
+    assert "#39ff14" in HTML
     assert "showOrderToast" in HTML
     assert "dismissToast" in HTML
     assert "openStockChart" in HTML

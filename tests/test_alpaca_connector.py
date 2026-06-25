@@ -33,11 +33,15 @@ def test_alpaca_client_places_paper_order_and_returns_ticket_data() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        assert request.url == "https://paper-api.alpaca.markets/v2/orders"
+        assert request.url in {
+            httpx.URL("https://paper-api.alpaca.markets/v2/orders"),
+            httpx.URL("https://paper-api.alpaca.markets/v2/orders/order-123"),
+        }
         assert request.headers["APCA-API-KEY-ID"] == "key"
-        body = json.loads(request.content.decode())
-        assert body["symbol"] == "MSFT"
-        assert body["notional"] == "25.00"
+        if request.method == "POST":
+            body = json.loads(request.content.decode())
+            assert body["symbol"] == "MSFT"
+            assert body["notional"] == "25.00"
         return httpx.Response(
             200,
             headers={"X-Request-ID": "req-123"},
@@ -55,7 +59,61 @@ def test_alpaca_client_places_paper_order_and_returns_ticket_data() -> None:
     assert result["broker_order_id"] == "order-123"
     assert result["broker_status"] == "accepted"
     assert result["request_id"] == "req-123"
-    assert len(calls) == 1
+    assert len(calls) == 2
+
+
+def test_alpaca_client_refreshes_accepted_order_and_reports_not_filled_yet() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={"id": "order-123", "client_order_id": "client-123", "status": "accepted", "filled_qty": "0", "qty": "1"},
+            )
+        return httpx.Response(
+            200,
+            json={"id": "order-123", "client_order_id": "client-123", "status": "accepted", "filled_qty": "0", "qty": "1"},
+        )
+
+    client = AlpacaTradingClient(
+        AlpacaConfig(api_key="key", secret_key="secret", paper=True),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = client.place_order(AlpacaOrderRequest(symbol="MSFT", side="buy", quantity=1))
+
+    assert calls == ["POST /v2/orders", "GET /v2/orders/order-123"]
+    assert result["ok"] is True
+    assert result["broker_status"] == "accepted"
+    assert result["filled_quantity"] == 0
+    assert result["fill_status"] == "not_filled_yet"
+    assert result["message"] == "Alpaca paper order accepted but not filled yet."
+
+
+def test_alpaca_client_reports_fill_when_order_refresh_is_filled() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": "order-456", "status": "accepted", "filled_qty": "0", "qty": "1"})
+        return httpx.Response(
+            200,
+            json={"id": "order-456", "status": "filled", "filled_qty": "1", "qty": "1", "filled_avg_price": "123.45"},
+        )
+
+    client = AlpacaTradingClient(
+        AlpacaConfig(api_key="key", secret_key="secret", paper=True),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = client.place_order(AlpacaOrderRequest(symbol="MSFT", side="buy", quantity=1))
+
+    assert result["ok"] is True
+    assert result["broker_status"] == "filled"
+    assert result["filled_quantity"] == 1
+    assert result["fill_status"] == "filled"
+    assert result["filled_average_price"] == 123.45
+    assert result["message"] == "Alpaca paper order filled."
 
 
 def test_alpaca_client_snapshot_loads_account_summary() -> None:
@@ -126,7 +184,10 @@ def test_alpaca_client_blocks_live_when_not_allowed_even_with_confirmation() -> 
 
 def test_alpaca_client_places_confirmed_live_order() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url == "https://api.alpaca.markets/v2/orders"
+        assert request.url in {
+            httpx.URL("https://api.alpaca.markets/v2/orders"),
+            httpx.URL("https://api.alpaca.markets/v2/orders/live-order"),
+        }
         return httpx.Response(200, json={"id": "live-order", "status": "accepted"})
 
     client = AlpacaTradingClient(

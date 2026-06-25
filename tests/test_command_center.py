@@ -16,7 +16,7 @@ def test_command_catalog_hides_argv_and_groups_commands() -> None:
 def test_command_catalog_contains_current_cycle_commands() -> None:
     ids = {command["id"] for command in command_catalog()["commands"]}
 
-    assert {"paper-cycle", "paper-cycle-notify", "daily-loop"}.issubset(ids)
+    assert {"paper-cycle", "paper-cycle-notify", "daily-loop", "telegram-autopilot-once", "telegram-autopilot-loop"}.issubset(ids)
 
 
 def test_run_command_copy_creates_missing_target(tmp_path: Path) -> None:

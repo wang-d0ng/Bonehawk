@@ -428,9 +428,17 @@ def _decision_from_execution(item: dict[str, Any]) -> dict[str, Any]:
         "current_price": None,
         "quantity": item.get("quantity") or item.get("notional"),
         "status": item.get("status"),
+        "broker_status": item.get("broker_status"),
         "broker_order_id": item.get("broker_order_id"),
+        "filled_quantity": item.get("filled_quantity"),
+        "filled_average_price": item.get("filled_average_price"),
+        "fill_status": item.get("fill_status"),
         "reason": item.get("message"),
-        "signals": [f"broker_status {item.get('broker_status') or item.get('status')}", f"notional {item.get('notional') or 'n/a'}"],
+        "signals": [
+            f"broker_status {item.get('broker_status') or item.get('status')}",
+            f"fill_status {item.get('fill_status') or 'unknown'}",
+            f"notional {item.get('notional') or 'n/a'}",
+        ],
         "review_only": item.get("review_only", True),
     }
 

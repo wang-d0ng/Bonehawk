@@ -62,6 +62,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("desktop-run", "Desktop", "Open desktop app", "Launch Bonehawk in a desktop window.", "python scripts/desktop_app.py", ("{python}", "scripts/desktop_app.py"), action="background"),
     CommandSpec("desktop-build", "Desktop", "Build Mac app", "Create dist/Bonehawk.app with PyInstaller.", "python scripts/build_desktop_app.py", ("{python}", "scripts/build_desktop_app.py"), timeout=240),
     CommandSpec("telegram-test", "Alerts", "Telegram test", "Send a Bonehawk Telegram smoke-test message.", 'bash scripts/telegram.sh "Bonehawk Alpaca smoke test"', ("bash", "scripts/telegram.sh", "Bonehawk Alpaca smoke test")),
+    CommandSpec("telegram-autopilot-once", "Alerts", "Telegram autopilot check", "Poll Telegram once for authorized Bonehawk autopilot commands.", "python scripts/telegram_autopilot.py --once", ("{python}", "scripts/telegram_autopilot.py", "--once")),
+    CommandSpec("telegram-autopilot-loop", "Alerts", "Start Telegram autopilot", "Start the Telegram autopilot command listener in the background.", "python scripts/telegram_autopilot.py --loop", ("{python}", "scripts/telegram_autopilot.py", "--loop"), confirm_phrase="START_TELEGRAM_AUTOPILOT", action="background"),
     CommandSpec("pytest", "Checks", "Run tests", "Run the project test suite.", "python -m pytest", ("{python}", "-m", "pytest"), timeout=180),
     CommandSpec("paper-cycle", "Cycles", "Paper cycle", "Run the safe paper trading cycle.", "python scripts/paper_cycle.py", ("{python}", "scripts/paper_cycle.py")),
     CommandSpec("paper-cycle-notify", "Cycles", "Paper + Telegram", "Run the paper cycle and notify Telegram.", "python scripts/paper_cycle.py --notify", ("{python}", "scripts/paper_cycle.py", "--notify")),
