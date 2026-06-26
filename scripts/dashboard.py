@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from scripts.growth_scanner import build_growth_candidates, build_growth_candida
 from scripts.market_intel import MarketIntelClient, Position, Watchlist, load_watchlist
 from scripts.market_scanner import build_alert_message, scan_market
 from scripts.market_universe import combine_symbols, load_market_universe, market_universe_snapshot
+from scripts.postmortem_report import apply_loss_postmortem_report, build_loss_postmortem_report
 from scripts.portfolio_sync import portfolio_sync_snapshot
 from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfolio_performance
 from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
@@ -234,12 +236,14 @@ class DashboardService:
     def start_autopilot_background(self) -> dict[str, Any]:
         with self._background_lock:
             if self._background_thread and self._background_thread.is_alive() and not self._background_stop.is_set():
-                return {**self.autopilot_background_status(), "status": "already_running"}
-            self._background_stop.clear()
-            self._background_started_at = _utc_now()
-            self._background_thread = threading.Thread(target=self._autopilot_background_loop, name="bonehawk-autopilot-background", daemon=True)
-            self._background_thread.start()
-            return {**self.autopilot_background_status(), "status": "started"}
+                already_running = True
+            else:
+                already_running = False
+                self._background_stop.clear()
+                self._background_started_at = _utc_now()
+                self._background_thread = threading.Thread(target=self._autopilot_background_loop, name="bonehawk-autopilot-background", daemon=True)
+                self._background_thread.start()
+        return {**self.autopilot_background_status(), "status": "already_running" if already_running else "started"}
 
     def stop_autopilot_background(self) -> dict[str, Any]:
         with self._background_lock:
@@ -526,6 +530,76 @@ class DashboardService:
             "message": "Live View is watching recent buy/sell tickets and Alpaca broker responses.",
         }
 
+    def loss_postmortem_report(self, window_hours: Any = 24) -> dict[str, Any]:
+        hours = int(max(1, min(168, _safe_float(window_hours, 24))))
+        return build_loss_postmortem_report(self.root, window_hours=hours)
+
+    def apply_loss_postmortem_report(self, report_id: Any, reviewer_notes: Any = "") -> dict[str, Any]:
+        report = self.loss_postmortem_report()
+        expected_report_id = str(report.get("report_id") or "")
+        submitted_report_id = str(report_id or "").strip()
+        if not submitted_report_id:
+            return {"ok": False, "status": "missing_report", "message": "Run a post-mortem report before applying learnings."}
+        if submitted_report_id != expected_report_id:
+            return {
+                "ok": False,
+                "status": "stale_report",
+                "message": "The post-mortem report changed. Run the report again before applying learnings.",
+                "report": report,
+            }
+        return apply_loss_postmortem_report(self.root, report, reviewer_notes=str(reviewer_notes or ""))
+
+    def overview_metrics(self) -> dict[str, Any]:
+        portfolio = self._alpaca_portfolio()
+        performance = portfolio.get("performance") or _empty_portfolio_performance(str(portfolio.get("status") or "unknown"))
+        market_trend = self._market_trend()
+        return {
+            "ok": True,
+            "status": "ready",
+            "updated_at": datetime.now(UTC).isoformat(),
+            "portfolio": {
+                "source_status": portfolio.get("status", "unknown"),
+                "account_value": performance.get("account_value", performance.get("total_value", 0)),
+                "total_value": performance.get("total_value", 0),
+                "cash": performance.get("cash", 0),
+                "buying_power": performance.get("buying_power", 0),
+                "unrealized_pnl": performance.get("unrealized_pnl", 0),
+                "unrealized_pnl_pct": performance.get("unrealized_pnl_pct", 0),
+                "positions": len(performance.get("positions") or []),
+            },
+            "market_trend": market_trend,
+            "message": "Overview metrics refreshed.",
+        }
+
+    def report(self, window_minutes: int = 10) -> dict[str, Any]:
+        minutes = int(max(1, min(120, _safe_float(window_minutes, 10))))
+        metrics = self.overview_metrics()
+        live_orders = self.live_orders()
+        events = _events_within_window(live_orders.get("events") or [], minutes)
+        return {
+            "ok": True,
+            "status": "ready",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "window_minutes": minutes,
+            "portfolio": metrics.get("portfolio") or {},
+            "market_trend": metrics.get("market_trend", "UNKNOWN"),
+            "trades": events,
+            "summary": {
+                "trade_count": len(events),
+                "submitted": sum(1 for event in events if event.get("category") == "submitted"),
+                "filled": sum(1 for event in events if event.get("category") == "filled"),
+                "rejected": sum(1 for event in events if event.get("category") == "rejected"),
+            },
+        }
+
+    def _market_trend(self) -> str:
+        try:
+            histories = self.quote_client.get_histories(["SPY", "QQQ"])
+        except Exception:
+            return "UNKNOWN"
+        technicals = {symbol: history.technicals() for symbol, history in histories.items()}
+        return build_market_trend(technicals)
+
     def _refresh_alpaca_ticket_statuses(self, tickets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         refreshable_indexes = [
             index
@@ -741,6 +815,8 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 self._send(*json_response(service.market_intel()))
             elif path == "/api/portfolio-sync":
                 self._send(*json_response(service.portfolio_sync()))
+            elif path == "/api/overview-metrics":
+                self._send(*json_response(service.overview_metrics()))
             elif path == "/api/autopilot":
                 self._send(*json_response(service.autopilot()))
             elif path == "/api/autopilot-background":
@@ -763,6 +839,8 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 self._send(*json_response(service.tickets()))
             elif path == "/api/live-orders":
                 self._send(*json_response(service.live_orders()))
+            elif path == "/api/postmortem-report":
+                self._send(*json_response(service.loss_postmortem_report(_first_query_value(query, "hours") or 24)))
             elif path == "/api/commands":
                 self._send(*json_response(service.command_catalog()))
             else:
@@ -863,6 +941,15 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                     return
                 result = service.stock_order(payload.get("symbol"), payload.get("side"), payload.get("quantity"), confirm=str(payload.get("confirm", "")))
                 status = 200 if result.get("ok") else 409 if result.get("status") in {"confirmation_required", "live_not_allowed", "not_configured"} else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/postmortem-apply":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.apply_loss_postmortem_report(payload.get("report_id"), reviewer_notes=payload.get("reviewer_notes", ""))
+                status = 200 if result.get("ok") else 409 if result.get("status") == "stale_report" else 400
                 self._send(*json_response(result, status=status))
             else:
                 self._send(*json_response({"error": "not found"}, status=404))
@@ -1022,11 +1109,14 @@ def _live_order_event(ticket: dict[str, Any]) -> dict[str, Any]:
     broker_status = str(ticket.get("broker_status") or "").lower()
     fill_status = str(ticket.get("fill_status") or "").lower()
     category = _live_order_category(status, broker_status, fill_status, bool(ticket.get("broker_order_id")))
+    side = str(ticket.get("side") or "ORDER").upper()
+    symbol = str(ticket.get("symbol") or "UNKNOWN").upper()
     return {
         "timestamp": ticket.get("timestamp"),
         "source": ticket.get("source"),
-        "symbol": ticket.get("symbol"),
-        "side": ticket.get("side"),
+        "symbol": symbol,
+        "side": side,
+        "direction": side.lower() if side in {"BUY", "SELL"} else "order",
         "action": ticket.get("action"),
         "quantity": ticket.get("quantity"),
         "current_price": ticket.get("current_price"),
@@ -1039,6 +1129,9 @@ def _live_order_event(ticket: dict[str, Any]) -> dict[str, Any]:
         "message": ticket.get("message"),
         "review_only": ticket.get("review_only", True),
         "category": category,
+        "compact_label": f"{symbol} {side} {category}",
+        "progress_pct": _live_order_progress(category),
+        "age_seconds": _event_age_seconds(ticket),
     }
 
 
@@ -1055,13 +1148,35 @@ def _live_order_category(status: str, broker_status: str, fill_status: str, has_
     return "blocked" if status not in {"unknown", ""} else "unknown"
 
 
-def _live_order_summary(events: list[dict[str, Any]]) -> dict[str, int]:
+def _live_order_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     categories = {"submitted": 0, "rejected": 0, "filled": 0, "recorded": 0, "blocked": 0, "unknown": 0}
     for event in events:
         category = str(event.get("category") or "unknown")
         categories[category if category in categories else "unknown"] += 1
     categories["total"] = len(events)
+    categories["flow"] = [
+        {"category": category, "count": categories[category], "pct": round((categories[category] / len(events)) * 100, 1) if events else 0}
+        for category in ("rejected", "filled", "submitted", "recorded", "blocked", "unknown")
+        if categories[category]
+    ]
     return categories
+
+
+def _live_order_progress(category: str) -> int:
+    return {
+        "filled": 100,
+        "rejected": 100,
+        "submitted": 62,
+        "recorded": 35,
+        "blocked": 18,
+    }.get(category, 10)
+
+
+def _event_age_seconds(ticket: dict[str, Any]) -> int | None:
+    timestamp = _event_timestamp(ticket)
+    if timestamp is None:
+        return None
+    return max(0, int((datetime.now(UTC) - timestamp).total_seconds()))
 
 
 def _ticket_quantity(row: dict[str, Any]) -> float | None:
@@ -1185,6 +1300,32 @@ def _stock_order_request(symbol: Any, side: Any, quantity: Any) -> StockOrderTic
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _events_within_window(events: list[dict[str, Any]], minutes: int) -> list[dict[str, Any]]:
+    cutoff = datetime.now(UTC) - timedelta(minutes=minutes)
+    recent = [event for event in events if (_event_timestamp(event) or datetime.min.replace(tzinfo=UTC)) >= cutoff]
+    return sorted(recent, key=lambda event: _event_timestamp(event) or datetime.min.replace(tzinfo=UTC), reverse=True)
+
+
+def _event_timestamp(event: dict[str, Any]) -> datetime | None:
+    raw = str(event.get("timestamp") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _background_scan_summary(scan: dict[str, Any]) -> dict[str, Any]:
@@ -1774,6 +1915,32 @@ HTML = """
     .data-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-weight: 720; min-width: 0; }
     .data-sub { color: var(--muted); font-size: 12px; margin-top: 4px; overflow-wrap: anywhere; }
     .right-stack { display: grid; justify-items: end; gap: 5px; white-space: nowrap; }
+    .live-grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr); gap: 12px; align-items: start; }
+    .live-mini-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .live-mini-card { min-height: 72px; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.42); display: grid; align-content: space-between; }
+    .live-mini-label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .live-mini-value { font-family: var(--font-display); font-size: 24px; line-height: 1; letter-spacing: 0; }
+    .live-flow { min-height: 40px; display: flex; align-items: stretch; gap: 5px; padding: 5px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.38); overflow: hidden; }
+    .flow-segment { min-width: 46px; flex-basis: var(--w); flex-grow: 1; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 2px; color: var(--ink); font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em; }
+    .flow-segment.filled, .flow-segment.submitted, .flow-segment.recorded { background: rgba(57,217,138,0.15); border-color: rgba(57,217,138,0.36); color: var(--green); }
+    .flow-segment.rejected { background: rgba(255,92,100,0.14); border-color: rgba(255,92,100,0.38); color: var(--red); }
+    .flow-segment.blocked { background: rgba(246,196,83,0.14); border-color: rgba(246,196,83,0.36); color: var(--amber); }
+    .live-event-stack, .live-side-stack { display: grid; gap: 7px; }
+    .live-event { min-height: 54px; display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 9px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.36); }
+    .live-event.buy { border-color: rgba(57,217,138,0.22); }
+    .live-event.sell { border-color: rgba(255,92,100,0.24); }
+    .live-event-rail { align-self: stretch; border-radius: 999px; background: var(--muted); box-shadow: 0 0 12px rgba(255,255,255,0.08); }
+    .live-event.buy .live-event-rail { background: var(--green); box-shadow: 0 0 13px rgba(152,255,182,0.42); }
+    .live-event.sell .live-event-rail { background: var(--red); box-shadow: 0 0 13px rgba(255,92,100,0.38); }
+    .live-event-main { min-width: 0; display: grid; gap: 5px; }
+    .live-event-title { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; font-weight: 850; }
+    .live-event-detail { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .live-event-meta { display: grid; justify-items: end; gap: 5px; min-width: 112px; }
+    .live-progress { width: 96px; height: 6px; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; background: rgba(0,0,0,0.38); }
+    .live-progress span { display: block; width: var(--w); height: 100%; background: var(--green); }
+    .live-event.sell .live-progress span, .live-event.rejected .live-progress span { background: var(--red); }
+    .live-side-card { min-height: 58px; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(5,6,7,0.38); display: grid; gap: 6px; }
+    .live-side-card b { color: var(--ink); font-size: 13px; }
     .pill { display: inline-flex; align-items: center; min-height: 24px; border-radius: 999px; padding: 2px 8px; background: rgba(5,6,7,0.48); color: var(--muted); border: 1px solid var(--line); font-family: var(--mono); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.07em; white-space: nowrap; }
     .pill.buy, .pill.hold { background: rgba(57,217,138,0.12); color: var(--green); border-color: rgba(57,217,138,0.3); }
     .pill.sell { background: rgba(255,92,100,0.12); color: var(--red); border-color: rgba(255,92,100,0.32); }
@@ -1886,7 +2053,7 @@ HTML = """
       .tab { grid-template-columns: 1fr; justify-items: center; padding: 0; }
       .nav-glyph { width: 28px; height: 28px; font-size: 10px; }
       .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .desk-grid, .two-col { grid-template-columns: 1fr; }
+      .desk-grid, .two-col, .live-grid { grid-template-columns: 1fr; }
       .agent-grid, .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .command-grid, .settings-command-groups .command-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .page-head { grid-template-columns: 1fr; }
@@ -1905,8 +2072,11 @@ HTML = """
       .workspace { padding: 14px; overflow: visible; }
       .page-head { gap: 12px; }
       h1 { font-size: 36px; }
-      .metric-grid, .agent-grid, .pipeline, .risk-grid, .command-grid, .settings-command-groups .command-grid { grid-template-columns: 1fr; }
+      .metric-grid, .agent-grid, .pipeline, .risk-grid, .command-grid, .settings-command-groups .command-grid, .live-mini-grid { grid-template-columns: 1fr; }
       .data-row { grid-template-columns: 1fr; }
+      .live-event { grid-template-columns: 7px minmax(0, 1fr); }
+      .live-event-meta { grid-column: 2; justify-items: start; min-width: 0; }
+      .live-event-detail { white-space: normal; }
       .right-stack { justify-items: start; white-space: normal; }
       .chart-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .ticket-drawer { left: 14px; right: 14px; bottom: 14px; width: auto; }
@@ -2105,6 +2275,20 @@ HTML = """
             <div class="panel-block">
               <div class="section-head">
                 <div>
+                  <h2>Loss Post-Mortem</h2>
+                  <div class="panel-sub">Scans losing trades from the last 24 hours, then applies reviewed learnings only when approved.</div>
+                </div>
+                <div class="toolbar">
+                  <button data-action onclick="runLossPostmortem()">Run Post-Mortem</button>
+                  <button data-action class="primary" onclick="applyPostmortemLearnings()">Apply Learnings</button>
+                </div>
+              </div>
+              <div id="postmortem-summary" class="data-list"></div>
+              <pre id="postmortem-output">No post-mortem report yet.</pre>
+            </div>
+            <div class="panel-block">
+              <div class="section-head">
+                <div>
                   <h2>Opportunities</h2>
                   <div class="panel-sub">Paper tickets planned by the current scan, ranked by model score and guardrails.</div>
                 </div>
@@ -2194,15 +2378,22 @@ HTML = """
           <h2>Live Order View</h2>
           <div id="live-order-status" class="muted"></div>
         </div>
-        <div id="live-order-summary" class="metric-grid"></div>
-        <div class="two-col">
+        <div class="live-grid">
           <div class="panel-block">
-            <h2>Order Tape</h2>
-            <div id="live-order-feed" class="data-list"></div>
+            <div class="section-head">
+              <div>
+                <h2>Order Radar</h2>
+                <div class="panel-sub">Compact broker events, fills, rejects, and review tickets.</div>
+              </div>
+              <span class="pill quiet">5s refresh</span>
+            </div>
+            <div id="live-order-summary" class="live-mini-grid"></div>
+            <div id="live-order-flow" class="live-flow"></div>
+            <div id="live-order-feed" class="live-event-stack"></div>
           </div>
           <div class="panel-block">
             <h2>Background Loop</h2>
-            <div id="live-order-background" class="data-list"></div>
+            <div id="live-order-background" class="live-side-stack"></div>
           </div>
         </div>
       </section>
@@ -2352,6 +2543,7 @@ HTML = """
     let pendingStockTicket = {symbol: '', side: 'BUY'};
     let setupDismissed = false;
     let lastBackgroundRunRendered = 0;
+    let lastPostmortemReportId = '';
     const ESSENTIAL_COMMAND_IDS = new Set(['telegram-test', 'telegram-autopilot-once', 'telegram-autopilot-loop', 'daily-loop', 'pytest']);
 
     async function getJson(url, options) {
@@ -2616,6 +2808,25 @@ HTML = """
       document.getElementById('rail-updated').textContent = updated;
       document.getElementById('rail-updated-side').textContent = `Updated ${updated}`;
       setStatus(`Updated. Scanner checked ${trades.summary?.symbols_scanned || 0} symbols. Market trend: ${trades.market_trend || 'unknown'}.`, 'ok');
+    }
+    async function refreshOverviewMetrics() {
+      try {
+        const data = await getJson('/api/overview-metrics');
+        const portfolio = data.portfolio || {};
+        const source = String(portfolio.source_status || 'unknown');
+        document.getElementById('metric-grid').innerHTML = [
+          metric('Portfolio value', money(portfolio.account_value ?? portfolio.total_value), source === 'connected' ? 'Alpaca account value' : `Source ${source}`),
+          metric('Open P&L', `${money(portfolio.unrealized_pnl)} ${pct(portfolio.unrealized_pnl_pct)}`, source === 'connected' ? 'Alpaca open positions' : 'Latest available positions'),
+          metric('Market trend', escapeHtml(data.market_trend || 'unknown'), 'SPY/QQQ technical vote'),
+          metric('Positions', String(portfolio.positions || 0), 'Open Alpaca positions')
+        ].join('');
+        const updated = new Date().toLocaleTimeString();
+        document.getElementById('rail-updated').textContent = updated;
+        document.getElementById('rail-updated-side').textContent = `Updated ${updated}`;
+      } catch (error) {
+        const node = document.getElementById('rail-updated-side');
+        if (node) node.textContent = 'Metrics refresh paused';
+      }
     }
     function renderTicker(trades) {
       const items = (trades.ideas || []).slice(0, 12);
@@ -2940,6 +3151,91 @@ HTML = """
         await refreshLiveOrders();
       }, true, false);
     }
+    async function runLossPostmortem() {
+      await runAction('Running 24h loss post-mortem...', async () => {
+        const data = await getJson('/api/postmortem-report?hours=24');
+        renderLossPostmortem(data);
+        setStatus(`Post-mortem found ${data.summary?.loss_count || 0} losing trade(s).`, data.summary?.loss_count ? 'ok' : 'muted');
+      }, false, false);
+    }
+    async function applyPostmortemLearnings() {
+      if (!lastPostmortemReportId) {
+        await runLossPostmortem();
+      }
+      if (!lastPostmortemReportId) {
+        setStatus('Run a post-mortem report before applying learnings.', 'error');
+        return;
+      }
+      const reviewerNotes = window.prompt('Reviewer notes for the learning update', '') || '';
+      await runAction('Applying reviewed post-mortem learnings...', async () => {
+        const data = await getJson('/api/postmortem-apply', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({report_id: lastPostmortemReportId, reviewer_notes: reviewerNotes})
+        });
+        renderAppliedPostmortem(data);
+        setStatus(data.message || 'Post-mortem learnings applied.', data.ok ? 'ok' : 'error');
+      }, true, false);
+    }
+    function renderLossPostmortem(data) {
+      lastPostmortemReportId = data.report_id || '';
+      const summary = data.summary || {};
+      const patterns = data.patterns || {};
+      const issues = data.issues || [];
+      const updates = data.suggested_updates || [];
+      document.getElementById('postmortem-summary').innerHTML = [
+        row('Losses', `${summary.loss_count || 0} losing trade(s) · total ${money(summary.total_realized_pnl || 0)} · average ${money(summary.average_loss || 0)}`, pill(`${data.window_hours || 24}h`, 'trim')),
+        row('Largest loss', summary.largest_loss?.symbol ? `${escapeHtml(summary.largest_loss.symbol)} · ${money(summary.largest_loss.realized_pnl || 0)} · ${escapeHtml(summary.largest_loss.reason || '')}` : 'No loss trades in the window.', pill(data.status || 'ready', 'quiet')),
+        row('Top pattern', (patterns.symbols || [])[0] ? `${escapeHtml(patterns.symbols[0].symbol)} · ${patterns.symbols[0].count} loss(es)` : 'No repeated symbol pattern.', pill(`${issues.length} issue${issues.length === 1 ? '' : 's'}`, issues.length ? 'trim' : 'buy')),
+        row('Suggested update', updates.length ? updates.map(update => update.type === 'cooldown_symbol' ? `Cooldown ${update.symbol}` : update.type).join(' · ') : 'No system update suggested.', pill('review first', 'quiet'))
+      ].join('');
+      document.getElementById('postmortem-output').textContent = formatLossPostmortem(data);
+    }
+    function renderAppliedPostmortem(data) {
+      const learning = data.learning || {};
+      const cooldowns = Object.keys(learning.cooldown_symbols || {});
+      document.getElementById('postmortem-summary').innerHTML = [
+        row('Applied', escapeHtml(data.message || 'Learning update written.'), pill(data.status || 'applied', 'buy')),
+        row('Cooldowns', cooldowns.length ? cooldowns.join(', ') : 'No symbol cooldowns.', pill(learning.active_until || 'active', 'trim')),
+        row('Risk throttle', `${Number(learning.risk?.max_next_risk_fraction || 1).toFixed(2)}x next sizing budget`, pill(learning.risk?.require_price_confirmation ? 'confirmation on' : 'confirmation off', 'quiet'))
+      ].join('');
+      document.getElementById('postmortem-output').textContent = JSON.stringify(data, null, 2);
+    }
+    function formatLossPostmortem(data) {
+      const summary = data.summary || {};
+      const patterns = data.patterns || {};
+      const lines = [
+        `Loss Post-Mortem`,
+        `Report: ${data.report_id || 'unknown'}`,
+        `Window: ${data.window_hours || 24} hours`,
+        `Loss trades: ${summary.loss_count || 0}`,
+        `Total P/L: ${money(summary.total_realized_pnl || 0)}`,
+        `Average loss: ${money(summary.average_loss || 0)}`,
+        ''
+      ];
+      if ((patterns.symbols || []).length) {
+        lines.push('Repeated symbols:');
+        patterns.symbols.slice(0, 5).forEach(item => lines.push(`- ${item.symbol}: ${item.count} loss(es), ${money(item.realized_pnl || 0)}`));
+        lines.push('');
+      }
+      if ((patterns.signals || []).length) {
+        lines.push('Common signals:');
+        patterns.signals.slice(0, 6).forEach(item => lines.push(`- ${item.signal}: ${item.count}`));
+        lines.push('');
+      }
+      if ((data.issues || []).length) {
+        lines.push('Issues found:');
+        data.issues.forEach(issue => lines.push(`- [${issue.severity}] ${issue.title} ${issue.detail || ''}`));
+        lines.push('');
+      }
+      if ((data.suggested_updates || []).length) {
+        lines.push('Suggested system updates:');
+        data.suggested_updates.forEach(update => lines.push(`- ${update.type}${update.symbol ? ` ${update.symbol}` : ''}${update.until ? ` until ${update.until}` : ''}`));
+      } else {
+        lines.push('No update suggested.');
+      }
+      return lines.join('\\n');
+    }
     async function setAutopilotBackground(enabled) {
       await runAction(enabled ? 'Starting background paper loop...' : 'Stopping background paper loop...', async () => {
         const data = await getJson('/api/autopilot-background', {
@@ -3018,32 +3314,82 @@ HTML = """
       const background = data.background || {};
       const statusNode = document.getElementById('live-order-status');
       if (!statusNode) return;
-      statusNode.textContent = `${events.length} recent events · ${summary.submitted || 0} submitted · ${summary.rejected || 0} rejected`;
+      const total = summary.total ?? events.length;
+      statusNode.textContent = `${total} events · ${summary.filled || 0} filled · ${summary.rejected || 0} rejected · ${summary.submitted || 0} submitted`;
       document.getElementById('live-order-summary').innerHTML = [
-        metric('Submitted', String(summary.submitted || 0), 'Accepted by Alpaca or carrying an order ID'),
-        metric('Rejected', String(summary.rejected || 0), 'Broker or guardrail rejects'),
-        metric('Filled', String(summary.filled || 0), 'Completed broker fills'),
-        metric('Recorded', String(summary.recorded || 0), 'Review tickets, no order sent')
+        liveMiniCard('Filled', summary.filled || 0, 'complete', 'filled'),
+        liveMiniCard('Open', summary.submitted || 0, 'submitted', 'submitted'),
+        liveMiniCard('Rejected', summary.rejected || 0, 'blocked', 'rejected'),
+        liveMiniCard('Tickets', summary.recorded || 0, 'review only', 'recorded')
       ].join('');
-      document.getElementById('live-order-feed').innerHTML = events.map(event => {
-        const category = String(event.category || event.status || 'unknown');
-        const size = event.quantity ? `qty ${event.quantity}` : '';
-        const fill = event.fill_status ? `fill ${event.fill_status}` : '';
-        const filledQty = Number.isFinite(Number(event.filled_quantity)) ? `filled ${event.filled_quantity}` : '';
-        const broker = event.broker_status ? `broker ${event.broker_status}` : '';
-        const orderId = event.broker_order_id ? `order ${event.broker_order_id}` : 'no order id yet';
-        const detail = [size, broker, fill, filledQty, orderId].filter(Boolean).join(' · ');
-        return row(
-          `${stockSymbolControls(event.symbol)}${pill(event.side || event.action || 'ORDER', actionClass(event.side || event.action))}`,
-          `${escapeHtml(event.source || 'order')} · ${escapeHtml(event.message || '')}<div class="data-sub">${escapeHtml(detail)}</div>`,
-          `${pill(category, liveOrderClass(category))}<span>${escapeHtml(event.timestamp || '')}</span>`
-        );
-      }).join('') || empty('No order events yet.');
+      const flow = summary.flow || [];
+      document.getElementById('live-order-flow').innerHTML = flow.length ? flow.map(segment => {
+        const category = String(segment.category || 'unknown').toLowerCase();
+        const pct = Math.max(8, Math.min(100, Number(segment.pct || 0)));
+        return `<div class="flow-segment ${escapeHtml(category)}" style="--w:${pct}%">${escapeHtml(category)} ${Number(segment.count || 0)}</div>`;
+      }).join('') : '<div class="flow-segment unknown" style="--w:100%">idle</div>';
+      document.getElementById('live-order-feed').innerHTML = events.slice(0, 30).map(liveOrderEventHtml).join('') || empty('No order events yet.');
       document.getElementById('live-order-background').innerHTML = [
-        row('Loop', background.running ? 'Background scan and paper run is active.' : 'Background scan and paper run is stopped.', pill(background.status || 'unknown', background.running ? 'buy' : 'trim')),
-        row('Runs', `${background.runs || 0} completed`, background.last_finished_at ? escapeHtml(background.last_finished_at) : ''),
-        background.last_error ? row('Last error', escapeHtml(background.last_error), pill('error', 'sell')) : row('Last error', 'No background loop error reported.', pill('clear', 'buy'))
+        liveSideCard('Loop', background.running ? 'Background scan and paper run is active.' : 'Background scan and paper run is stopped.', pill(background.status || 'unknown', background.running ? 'buy' : 'trim')),
+        liveSideCard('Runs', `${background.runs || 0} completed`, background.last_finished_at ? escapeHtml(background.last_finished_at) : ''),
+        background.last_error ? liveSideCard('Last error', background.last_error, pill('error', 'sell')) : liveSideCard('Last error', 'No background loop error reported.', pill('clear', 'buy'))
       ].join('');
+    }
+    function liveMiniCard(label, value, note, category) {
+      return `<div class="live-mini-card ${escapeHtml(category || '')}">
+        <div class="live-mini-label">${escapeHtml(label)}</div>
+        <div class="live-mini-value">${escapeHtml(value)}</div>
+        <div class="metric-note">${escapeHtml(note)}</div>
+      </div>`;
+    }
+    function liveOrderEventHtml(event) {
+      const category = String(event.category || event.status || 'unknown').toLowerCase();
+      const direction = String(event.direction || '').toLowerCase();
+      const side = String(event.side || event.action || 'ORDER').toUpperCase();
+      const rowClass = category === 'rejected' ? 'rejected sell' : direction === 'sell' ? 'sell' : direction === 'buy' ? 'buy' : '';
+      const qty = event.quantity ? `qty ${formatCompactNumber(event.quantity)}` : '';
+      const filledQty = Number.isFinite(Number(event.filled_quantity)) ? `filled ${formatCompactNumber(event.filled_quantity)}` : '';
+      const avg = event.filled_average_price ? `avg ${money(event.filled_average_price)}` : '';
+      const broker = event.broker_status ? `broker ${event.broker_status}` : '';
+      const orderId = event.broker_order_id ? `order ${shortOrderId(event.broker_order_id)}` : 'no order id';
+      const age = formatAge(event.age_seconds);
+      const detail = [event.source || 'order', event.message || '', qty, filledQty, avg, broker, orderId].filter(Boolean).join(' · ');
+      const progress = Math.max(0, Math.min(100, Number(event.progress_pct || 0)));
+      return `<div class="live-event ${escapeHtml(rowClass)}">
+        <span class="live-event-rail"></span>
+        <div class="live-event-main">
+          <div class="live-event-title">
+            ${stockSymbolControls(event.symbol)}
+            ${pill(side, actionClass(side))}
+            ${pill(category, liveOrderClass(category))}
+          </div>
+          <div class="live-event-detail">${escapeHtml(detail)}</div>
+        </div>
+        <div class="live-event-meta">
+          <div class="live-progress" title="${progress}%"><span style="--w:${progress}%"></span></div>
+          <span class="muted">${escapeHtml(age || event.timestamp || '')}</span>
+        </div>
+      </div>`;
+    }
+    function liveSideCard(title, body, badge) {
+      return `<div class="live-side-card"><b>${escapeHtml(title)}</b><div class="muted">${escapeHtml(body)}</div><div>${badge || ''}</div></div>`;
+    }
+    function formatCompactNumber(value) {
+      const number = Number(value || 0);
+      if (!Number.isFinite(number)) return '';
+      if (Math.abs(number) >= 1000) return number.toLocaleString(undefined, {maximumFractionDigits: 0});
+      return number.toLocaleString(undefined, {maximumFractionDigits: 4});
+    }
+    function shortOrderId(value) {
+      const text = String(value || '');
+      return text.length > 10 ? text.slice(0, 8) : text;
+    }
+    function formatAge(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value)) return '';
+      if (value < 60) return `${Math.max(0, Math.round(value))}s ago`;
+      if (value < 3600) return `${Math.round(value / 60)}m ago`;
+      return `${Math.round(value / 3600)}h ago`;
     }
     function liveOrderClass(category) {
       const value = String(category || '').toLowerCase();
@@ -3309,6 +3655,8 @@ HTML = """
     }
     function renderAutopilotSettings(data) {
       const config = data.config || {};
+      const kellyPct = Number((config.max_kelly_fraction || 0.05) * 100);
+      const dailyLossPct = Math.max(2, Math.min(5, kellyPct / 2));
       document.getElementById('autopilot-settings').innerHTML = [
         row(
           'Autopilot',
@@ -3327,12 +3675,12 @@ HTML = """
         ),
         row(
           'Dynamic sizing',
-          `Bot decides dollars from Alpaca cash, buying power, stock price, probability, edge, and stop distance. Safety rail: ${escapeHtml(config.max_open_positions || 0)} max open positions.`,
+          `Bot decides dollars from Alpaca cash, buying power, stock price, probability, edge, and stop distance. Safety rails: ${escapeHtml(config.max_open_positions || 0)} max open positions · daily halt only after ${dailyLossPct.toFixed(1)}% cash drawdown.`,
           '<button data-action onclick="editAutopilotRisk()">Edit Safety</button>'
         ),
         row(
           'Agentic scan',
-          `Window ${escapeHtml(config.scan_window_minutes || 5)}m · safety ceiling ${Number((config.max_kelly_fraction || 0.05) * 100).toFixed(1)}% · min probability ${Number((config.min_probability || 0.56) * 100).toFixed(1)}%`,
+          `Window ${escapeHtml(config.scan_window_minutes || 5)}m · safety ceiling ${kellyPct.toFixed(1)}% · min probability ${Number((config.min_probability || 0.56) * 100).toFixed(1)}%`,
           '<button data-action onclick="editAutopilotAgentic()">Edit</button>'
         ),
         row(
@@ -3573,6 +3921,7 @@ HTML = """
     initSidebar();
     refreshAll();
     window.setInterval(refreshAutopilotBackgroundStatus, 10000);
+    window.setInterval(refreshOverviewMetrics, 5000);
     window.setInterval(refreshLiveOrders, 5000);
   </script>
 </body>

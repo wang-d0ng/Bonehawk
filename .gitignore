@@ -12,6 +12,8 @@ state/
 .DS_Store
 DAILY-SUMMARY.md
 config/autopilot.json
+config/autopilot_learning.json
 config/daily_schedule.json
 config/market_universe.json
 config/watchlist.json
+memory/POSTMORTEM-LEARNINGS.md

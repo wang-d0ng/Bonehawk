@@ -65,6 +65,32 @@ class FakeTelegramService:
             ]
         }
 
+    def report(self, window_minutes: int = 10):
+        return {
+            "ok": True,
+            "status": "ready",
+            "window_minutes": window_minutes,
+            "portfolio": {
+                "account_value": 1250.5,
+                "unrealized_pnl": -8.25,
+                "unrealized_pnl_pct": -0.66,
+                "source_status": "connected",
+            },
+            "market_trend": "UP",
+            "trades": [
+                {
+                    "timestamp": "2026-06-25T16:20:00Z",
+                    "symbol": "MSFT",
+                    "side": "BUY",
+                    "category": "submitted",
+                    "quantity": 1,
+                    "broker_order_id": "paper-order",
+                    "fill_status": "not_filled_yet",
+                }
+            ],
+            "summary": {"trade_count": 1},
+        }
+
 
 def test_parse_autopilot_command_accepts_bonehawk_aliases() -> None:
     assert parse_autopilot_command("/bh scan") == ("scan", [])
@@ -111,6 +137,21 @@ def test_handle_autopilot_command_updates_paper_safe_settings() -> None:
     assert response.ok is True
     assert disabled.ok is True
     assert service.settings == [("max_trade_usd", 50.0, ""), ("enabled", False, "")]
+
+
+def test_handle_autopilot_command_sends_recent_report() -> None:
+    service = FakeTelegramService()
+
+    response = handle_autopilot_command("/bh report", service)
+
+    assert response.ok is True
+    assert "Bonehawk Report" in response.message
+    assert "Last 10m" in response.message
+    assert "Portfolio: $1,250.50" in response.message
+    assert "Open P/L: -$8.25 (-0.66%)" in response.message
+    assert "Market trend: UP" in response.message
+    assert "MSFT BUY submitted" in response.message
+    assert "paper-order" in response.message
 
 
 def test_telegram_bot_processes_only_allowed_chat_and_sends_reply(tmp_path: Path) -> None:

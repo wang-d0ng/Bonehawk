@@ -144,6 +144,8 @@ def handle_autopilot_command(text: str, service: Any) -> CommandResponse:
         if (snapshot.get("config") or {}).get("mode") != "paper":
             return CommandResponse(False, "live_blocked", "Bonehawk autopilot Telegram run is paper mode only. Switch the dashboard/autopilot back to paper first.")
         return CommandResponse(True, "executed", _format_execution(service.autopilot_execute()))
+    if command == "report":
+        return CommandResponse(True, "report", _format_report(service.report(window_minutes=_report_window_minutes(args))))
     if command == "tickets":
         return CommandResponse(True, "tickets", _format_tickets(service.tickets()))
     if command in {"enable", "on"}:
@@ -233,12 +235,85 @@ def _format_tickets(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_report(payload: dict[str, Any]) -> str:
+    portfolio = payload.get("portfolio") or {}
+    trades = payload.get("trades") or []
+    window = int(payload.get("window_minutes") or 10)
+    lines = [
+        f"Bonehawk Report - Last {window}m",
+        f"Portfolio: {_money(portfolio.get('account_value', portfolio.get('total_value', 0)))}",
+        f"Open P/L: {_money(portfolio.get('unrealized_pnl'))} ({_pct(portfolio.get('unrealized_pnl_pct'))})",
+        f"Market trend: {payload.get('market_trend', 'UNKNOWN')}",
+        f"Trades: {len(trades)}",
+    ]
+    if not trades:
+        lines.append("No submitted, filled, or rejected trades in this window.")
+        return "\n".join(lines)
+    lines.append("Recent trades:")
+    for trade in trades[:8]:
+        lines.append(_format_report_trade(trade))
+    return "\n".join(lines)
+
+
+def _format_report_trade(trade: dict[str, Any]) -> str:
+    symbol = str(trade.get("symbol") or "UNKNOWN").upper()
+    side = str(trade.get("side") or "ORDER").upper()
+    status = str(trade.get("category") or trade.get("status") or "unknown")
+    quantity = _format_quantity(trade.get("quantity"))
+    fill = str(trade.get("fill_status") or trade.get("broker_status") or "").strip()
+    order_id = str(trade.get("broker_order_id") or "").strip()
+    parts = [symbol, side, status]
+    if quantity:
+        parts.append(f"qty {quantity}")
+    if fill:
+        parts.append(fill)
+    if order_id:
+        parts.append(order_id)
+    return " ".join(parts)
+
+
+def _report_window_minutes(args: list[str]) -> int:
+    if not args:
+        return 10
+    try:
+        value = int(float(args[0]))
+    except ValueError:
+        return 10
+    return max(1, min(120, value))
+
+
+def _money(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    sign = "-" if number < 0 else ""
+    return f"{sign}${abs(number):,.2f}"
+
+
+def _pct(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    return f"{number:.2f}%"
+
+
+def _format_quantity(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{number:g}" if number > 0 else ""
+
+
 def _help_message() -> str:
     return (
         "Bonehawk Telegram commands:\n"
         "/bh status\n"
         "/bh scan\n"
         "/bh run  (paper only)\n"
+        "/bh report\n"
         "/bh tickets\n"
         "/bh enable | /bh disable\n"
         "/bh paper-mode\n"

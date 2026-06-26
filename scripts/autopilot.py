@@ -14,6 +14,7 @@ from scripts.growth_scanner import build_growth_candidates
 from scripts.market_intel import MarketIntelClient, Position, Watchlist
 from scripts.market_scanner import scan_market
 from scripts.market_universe import combine_symbols, load_market_universe
+from scripts.postmortem_report import load_active_postmortem_learnings
 from scripts.quotes import YahooQuoteClient
 from scripts.trade_ideas import build_market_trend, build_trade_ideas
 
@@ -173,7 +174,9 @@ class AutopilotEngine:
         symbols = _autopilot_symbols(self.root, watchlist, self.config.symbols_per_run)
         active_watchlist = replace(watchlist, symbols=symbols, positions=_watchlist_positions(open_positions))
         account_state = self._account_state()
-        loss_outcome = _record_daily_loss_outcome_once(self.root, account_state, self.config)
+        account_state = {**account_state, **_daily_loss_policy(account_state, self.config)}
+        loss_signal = _daily_loss_review_signal(account_state, self.config)
+        loss_outcome = _record_daily_loss_outcome_once(self.root, loss_signal) if loss_signal else None
         snapshot = self.intel_client.snapshot(active_watchlist)
         scan_result = scan_market(active_watchlist, snapshot)
         quote_symbols = list(dict.fromkeys([*symbols[: self.config.symbols_per_run], *position_symbols, "SPY", "QQQ"]))
@@ -201,8 +204,11 @@ class AutopilotEngine:
         postmortems = run_pending_loss_postmortems(self.root)
         if postmortems:
             agentic_scan = {**agentic_scan, "postmortems": postmortems}
-        if loss_outcome:
-            agentic_scan = {**agentic_scan, "loss_guardrail": _daily_loss_block(account_state, self.config)}
+        loss_block = _daily_loss_block(account_state, self.config)
+        if loss_block:
+            agentic_scan = {**agentic_scan, "loss_guardrail": loss_block}
+        elif loss_outcome:
+            agentic_scan = {**agentic_scan, "loss_review": loss_signal}
         exit_candidates = _build_exit_candidates(open_positions, quotes, technicals, agentic_scan, self.config, market_trend)
         return {
             "summary": scan_result["summary"],
@@ -222,7 +228,8 @@ class AutopilotEngine:
         orders: list[dict[str, Any]] = []
         blocked: list[dict[str, Any]] = []
         open_slots = max(0, self.config.max_open_positions - len(held_symbols))
-        remaining_cash = _safe_float((scan_payload.get("account_state") or {}).get("available_cash"), 0)
+        learning = load_active_postmortem_learnings(self.root)
+        remaining_cash = _safe_float((scan_payload.get("account_state") or {}).get("available_cash"), 0) * _learning_risk_fraction(learning)
         loss_block = _daily_loss_block(scan_payload.get("account_state") or {}, self.config)
         if loss_block:
             return {"orders": [], "blocked": [loss_block]}
@@ -249,6 +256,10 @@ class AutopilotEngine:
                 continue
             if candidate["symbol"] in held_symbols:
                 blocked.append({**candidate, "status": "blocked", "reason": "Already in configured positions."})
+                continue
+            learning_block = _postmortem_learning_block(candidate, learning)
+            if learning_block:
+                blocked.append(learning_block)
                 continue
             notional = _order_notional(candidate, remaining_cash)
             if notional <= 0:
@@ -436,44 +447,101 @@ def _rate_limit_blocks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _daily_loss_policy(account_state: dict[str, Any], config: AutopilotConfig) -> dict[str, Any]:
+    cash = max(0, _safe_float(account_state.get("cash")))
+    if cash <= 0:
+        cash = max(0, _safe_float(account_state.get("available_cash")))
+    day_pnl = _safe_float(account_state.get("day_pnl"))
+    halt_fraction = _daily_loss_halt_fraction(config)
+    review_fraction = max(0.001, halt_fraction * 0.05)
+    day_pnl_pct = (day_pnl / cash) * 100 if cash > 0 else 0
+    return {
+        "daily_loss_cash_base": round(cash, 2),
+        "daily_loss_limit_usd": round(cash * halt_fraction, 2) if cash > 0 else 0,
+        "daily_loss_limit_cash_pct": round(halt_fraction * 100, 2),
+        "daily_loss_review_usd": round(cash * review_fraction, 2) if cash > 0 else 0,
+        "daily_loss_review_cash_pct": round(review_fraction * 100, 2),
+        "daily_loss_cash_pct": round(day_pnl_pct, 2),
+        "daily_loss_policy": "cash_balance_dynamic",
+    }
+
+
+def _daily_loss_halt_fraction(config: AutopilotConfig) -> float:
+    kelly = _clamp_float(config.max_kelly_fraction, 0, 0.25, 0.05)
+    return max(0.02, min(0.05, kelly / 2))
+
+
+def _daily_loss_review_signal(account_state: dict[str, Any], config: AutopilotConfig) -> dict[str, Any] | None:
+    block = _daily_loss_block(account_state, config)
+    if block:
+        return block
+    day_pnl = _safe_float(account_state.get("day_pnl"))
+    cash_base = _safe_float(account_state.get("daily_loss_cash_base"))
+    review_loss = _safe_float(account_state.get("daily_loss_review_usd"))
+    if cash_base <= 0 or review_loss <= 0 or day_pnl >= 0 or abs(day_pnl) < review_loss:
+        return None
+    return {
+        "status": "daily_loss_review",
+        "symbol": "PORTFOLIO",
+        "side": "review",
+        "action": "REVIEW_DAILY_LOSS",
+        "reason": f"Daily account P&L is ${day_pnl:.2f} ({_safe_float(account_state.get('daily_loss_cash_pct')):.2f}% of cash). Post-mortem recorded, but trading is not halted until the cash-based limit is breached.",
+        "day_pnl": round(day_pnl, 2),
+        "daily_loss_cash_base": round(cash_base, 2),
+        "daily_loss_cash_pct": round(_safe_float(account_state.get("daily_loss_cash_pct")), 2),
+        "daily_loss_limit_usd": round(_safe_float(account_state.get("daily_loss_limit_usd")), 2),
+        "daily_loss_limit_cash_pct": round(_safe_float(account_state.get("daily_loss_limit_cash_pct")), 2),
+        "daily_loss_review_usd": round(review_loss, 2),
+        "daily_loss_review_cash_pct": round(_safe_float(account_state.get("daily_loss_review_cash_pct")), 2),
+        "review_only": True,
+    }
+
+
 def _daily_loss_block(account_state: dict[str, Any], config: AutopilotConfig) -> dict[str, Any] | None:
     day_pnl = _safe_float(account_state.get("day_pnl"))
-    max_loss = abs(_safe_float(config.max_daily_loss_usd, 20))
-    if max_loss <= 0 or day_pnl >= -max_loss:
+    cash_base = _safe_float(account_state.get("daily_loss_cash_base"))
+    max_loss = _safe_float(account_state.get("daily_loss_limit_usd"))
+    if cash_base <= 0 or max_loss <= 0 or day_pnl >= -max_loss:
         return None
     return {
         "status": "daily_loss_limit",
         "symbol": "PORTFOLIO",
         "side": "halt",
         "action": "AUTO_HALT_DAILY_LOSS",
-        "reason": f"Daily account P&L is ${day_pnl:.2f}, beyond the ${max_loss:.2f} max daily loss. Autopilot is halted for review.",
+        "reason": f"Daily account P&L is ${day_pnl:.2f} ({_safe_float(account_state.get('daily_loss_cash_pct')):.2f}% of cash), beyond the ${max_loss:.2f} cash-based daily loss limit. Autopilot is halted for review.",
         "day_pnl": round(day_pnl, 2),
+        "daily_loss_cash_base": round(cash_base, 2),
+        "daily_loss_cash_pct": round(_safe_float(account_state.get("daily_loss_cash_pct")), 2),
+        "daily_loss_limit_usd": round(max_loss, 2),
+        "daily_loss_limit_cash_pct": round(_safe_float(account_state.get("daily_loss_limit_cash_pct")), 2),
         "max_daily_loss_usd": round(max_loss, 2),
+        "daily_loss_policy": account_state.get("daily_loss_policy", "cash_balance_dynamic"),
         "review_only": True,
     }
 
 
-def _record_daily_loss_outcome_once(root: Path, account_state: dict[str, Any], config: AutopilotConfig) -> dict[str, Any] | None:
-    block = _daily_loss_block(account_state, config)
-    if not block:
-        return None
+def _record_daily_loss_outcome_once(root: Path, signal: dict[str, Any]) -> dict[str, Any] | None:
     path = root / "logs" / "trade_outcomes.jsonl"
     today = datetime.now(UTC).date().isoformat()
-    key = f"{today}|PORTFOLIO|daily_loss_limit"
+    status = str(signal.get("status") or "daily_loss_review")
+    key = f"{today}|PORTFOLIO|{status}"
     for row in _jsonl_rows(path):
         if row.get("outcome_key") == key:
             return row
     outcome = {
         "timestamp": datetime.now(UTC).isoformat(),
         "outcome_key": key,
+        "status": status,
+        "action": signal.get("action"),
         "symbol": "PORTFOLIO",
-        "realized_pnl": block["day_pnl"],
-        "reason": block["reason"],
+        "realized_pnl": signal["day_pnl"],
+        "reason": signal["reason"],
         "signals": [
-            f"day_pnl {block['day_pnl']}",
-            f"max_daily_loss_usd {block['max_daily_loss_usd']}",
-            f"equity {account_state.get('equity', 0)}",
-            f"last_equity {account_state.get('last_equity', 0)}",
+            f"day_pnl {signal['day_pnl']}",
+            f"cash_base {signal.get('daily_loss_cash_base', 0)}",
+            f"daily_loss_cash_pct {signal.get('daily_loss_cash_pct', 0)}",
+            f"daily_loss_limit_usd {signal.get('daily_loss_limit_usd', 0)}",
+            f"daily_loss_limit_cash_pct {signal.get('daily_loss_limit_cash_pct', 0)}",
         ],
         "review_only": True,
     }
@@ -969,6 +1037,30 @@ def _order_notional(candidate: dict[str, Any], remaining_cash: float) -> float:
         return 0
     notional = min(suggested, remaining_cash)
     return notional if notional >= 1 else 0
+
+
+def _learning_risk_fraction(learning: dict[str, Any]) -> float:
+    if not learning.get("active"):
+        return 1
+    risk = learning.get("risk") if isinstance(learning.get("risk"), dict) else {}
+    return _clamp_float(risk.get("max_next_risk_fraction"), 0.1, 1, 1)
+
+
+def _postmortem_learning_block(candidate: dict[str, Any], learning: dict[str, Any]) -> dict[str, Any] | None:
+    if not learning.get("active"):
+        return None
+    symbol = str(candidate.get("symbol") or "").upper()
+    cooldown = (learning.get("cooldown_symbols") or {}).get(symbol)
+    if not cooldown:
+        return None
+    reason = str(cooldown.get("reason") or "Reviewed post-mortem cooldown is active.")
+    until = str(cooldown.get("until") or learning.get("active_until") or "")
+    return {
+        **candidate,
+        "status": "postmortem_cooldown",
+        "reason": f"{reason} Cooldown active until {until}.",
+        "cooldown_until": until,
+    }
 
 
 def _broker_order_request(order: dict[str, Any], config: AutopilotConfig, alpaca_client: AlpacaTradingClient) -> tuple[AlpacaOrderRequest | None, dict[str, Any] | None]:

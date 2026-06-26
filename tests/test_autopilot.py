@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from scripts.autopilot import AutopilotConfig, AutopilotEngine, load_autopilot_config
@@ -230,6 +231,17 @@ class DailyLossAlpacaClient(FakeAlpacaClient):
         }
 
 
+class SmallCashRelativeDailyLossAlpacaClient(FakeAlpacaClient):
+    def get_account(self) -> dict:
+        return {
+            "cash": "100000",
+            "buying_power": "100000",
+            "portfolio_value": "99800",
+            "equity": "99800",
+            "last_equity": "100000",
+        }
+
+
 def test_load_autopilot_config_defaults_to_paper_disabled(tmp_path: Path) -> None:
     config = load_autopilot_config(tmp_path / "missing.json")
 
@@ -350,6 +362,42 @@ def test_autopilot_profit_exit_cooldown_blocks_duplicate_sell(tmp_path: Path) ->
     cooldown = next(item for item in second["blocked"] if item["status"] == "cooldown")
     assert "recent" in cooldown["reason"].lower()
     assert len(alpaca.orders) == 1
+
+
+def test_autopilot_applies_reviewed_postmortem_symbol_cooldown(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "autopilot_learning.json").write_text(
+        json.dumps(
+            {
+                "last_report_id": "loss-report-test",
+                "updated_at": datetime.now(UTC).isoformat(),
+                "active_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                "cooldown_symbols": {
+                    "MSFT": {
+                        "until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                        "reason": "Repeated loss pattern from reviewed post-mortem.",
+                    }
+                },
+                "risk": {"max_next_risk_fraction": 0.5, "require_price_confirmation": True},
+            }
+        )
+    )
+    alpaca = FakeAlpacaClient(cash=1000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["orders"] == []
+    assert payload["executed"] == []
+    assert any(item.get("status") == "postmortem_cooldown" and item.get("symbol") == "MSFT" for item in payload["blocked"])
+    assert alpaca.orders == []
 
 
 def test_autopilot_rejected_exit_attempt_cools_down_duplicate_sell(tmp_path: Path) -> None:
@@ -488,11 +536,30 @@ def test_autopilot_does_not_sell_watchlist_position_when_alpaca_positions_fail(t
     assert all(request.side != "sell" for request, _confirm in alpaca.orders)
 
 
-def test_autopilot_daily_loss_halts_orders_and_records_postmortem(tmp_path: Path) -> None:
+def test_autopilot_small_cash_relative_daily_loss_does_not_halt_orders(tmp_path: Path) -> None:
+    alpaca = SmallCashRelativeDailyLossAlpacaClient(cash=100000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, max_daily_loss_usd=20, max_kelly_fraction=0.08),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}))
+
+    assert payload["status"] != "daily_loss_limit"
+    assert payload["account_state"]["daily_loss_limit_usd"] == 4000
+    assert payload["agentic_scan"]["loss_review"]["status"] == "daily_loss_review"
+    assert not any(item.get("status") == "daily_loss_limit" for item in payload["blocked"])
+    assert alpaca.orders
+
+
+def test_autopilot_significant_cash_relative_daily_loss_halts_orders_and_records_postmortem(tmp_path: Path) -> None:
     alpaca = DailyLossAlpacaClient(cash=1000)
     engine = AutopilotEngine(
         root=tmp_path,
-        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, max_daily_loss_usd=20),
+        config=AutopilotConfig(enabled=True, mode="paper", max_trade_usd=25, min_confidence=40, max_daily_loss_usd=20, max_kelly_fraction=0.08),
         intel_client=FakeIntelClient(["MSFT"]),
         quote_client=FakeQuoteClient(),
         alpaca_client=alpaca,
@@ -504,6 +571,9 @@ def test_autopilot_daily_loss_halts_orders_and_records_postmortem(tmp_path: Path
     assert payload["status"] == "daily_loss_limit"
     assert payload["orders"] == []
     assert payload["executed"] == []
+    assert payload["account_state"]["daily_loss_limit_usd"] == 40
+    assert payload["blocked"][0]["daily_loss_cash_pct"] == -22.0
+    assert payload["blocked"][0]["daily_loss_limit_cash_pct"] == 4.0
     assert payload["agentic_scan"]["postmortems"]
     assert json.loads(postmortem_rows[0])["symbol"] == "PORTFOLIO"
     assert alpaca.orders == []

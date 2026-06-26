@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -50,6 +51,14 @@ class FakeQuoteClient:
             ChartPoint(timestamp=1120, close=120, volume=1200),
         ]
         return StockChart(symbol=symbol.upper(), range_key=range_key, interval="5m", latest_price=120, points=points)
+
+
+class TrendingQuoteClient(FakeQuoteClient):
+    def get_histories(self, symbols):
+        from scripts.quotes import PriceHistory
+
+        closes = [100 + index for index in range(25)]
+        return {symbol: PriceHistory(symbol, closes=closes, volumes=[100] * len(closes)) for symbol in symbols}
 
 
 class FakeAlpacaClient:
@@ -608,7 +617,12 @@ def test_dashboard_service_live_orders_summarizes_recent_order_events(tmp_path: 
 
     assert payload["summary"]["submitted"] == 1
     assert payload["summary"]["rejected"] == 1
+    assert payload["summary"]["flow"][0]["category"] == "rejected"
+    assert payload["summary"]["flow"][0]["count"] == 1
     assert payload["events"][0]["symbol"] == "AACB"
+    assert payload["events"][0]["progress_pct"] == 100
+    assert payload["events"][0]["direction"] == "buy"
+    assert payload["events"][0]["compact_label"] == "AACB BUY rejected"
     assert payload["events"][1]["broker_order_id"] == "paper-live-view"
 
 
@@ -651,6 +665,101 @@ def test_dashboard_service_disabling_autopilot_stops_background_loop(tmp_path: P
     assert saved["enabled"] is False
     assert stops == [True]
     assert payload["background"]["status"] == "stopped"
+
+
+def test_dashboard_service_overview_metrics_returns_portfolio_and_market_trend(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), quote_client=TrendingQuoteClient(), alpaca_client=FakeAlpacaClient())
+
+    payload = service.overview_metrics()
+
+    assert payload["ok"] is True
+    assert payload["portfolio"]["account_value"] == 1250.5
+    assert payload["portfolio"]["unrealized_pnl"] == 50
+    assert payload["portfolio"]["unrealized_pnl_pct"] == 25
+    assert payload["portfolio"]["source_status"] == "connected"
+    assert payload["market_trend"] == "UP"
+
+
+def test_dashboard_overview_metrics_endpoint(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), quote_client=TrendingQuoteClient(), alpaca_client=FakeAlpacaClient())
+    handler = make_handler(service)
+
+    status, body = _http_request(handler, "GET", "/api/overview-metrics")
+    payload = json.loads(body)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["portfolio"]["account_value"] == 1250.5
+    assert payload["market_trend"] == "UP"
+
+
+def test_dashboard_service_report_filters_trades_to_recent_window(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    recent = datetime.now(UTC).isoformat()
+    old = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    (logs / "decision_log.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"timestamp": old, "source": "autopilot_order", "symbol": "OLD", "action": "BUY_LIVE", "status": "submitted", "broker_order_id": "old-order", "review_only": False}),
+                json.dumps({"timestamp": recent, "source": "autopilot_order", "symbol": "MSFT", "action": "BUY_LIVE", "status": "submitted", "broker_order_id": "recent-order", "review_only": False}),
+            ]
+        )
+        + "\n"
+    )
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), quote_client=TrendingQuoteClient(), alpaca_client=FakeAlpacaClient())
+
+    payload = service.report(window_minutes=10)
+
+    assert payload["window_minutes"] == 10
+    assert payload["summary"]["trade_count"] == 1
+    assert payload["trades"][0]["symbol"] == "MSFT"
+    assert payload["trades"][0]["broker_order_id"] == "recent-order"
+
+
+def test_dashboard_service_loss_postmortem_report_and_apply(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = datetime.now(UTC)
+    (logs / "trade_outcomes.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"timestamp": (now - timedelta(hours=1)).isoformat(), "symbol": "MSFT", "realized_pnl": -8, "reason": "stop hit", "signals": ["market down"]}),
+                json.dumps({"timestamp": (now - timedelta(hours=2)).isoformat(), "symbol": "MSFT", "realized_pnl": -4, "reason": "stop hit again", "signals": ["market down"]}),
+            ]
+        )
+        + "\n"
+    )
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), quote_client=TrendingQuoteClient(), alpaca_client=FakeAlpacaClient())
+
+    report = service.loss_postmortem_report()
+    applied = service.apply_loss_postmortem_report(report["report_id"], reviewer_notes="Reviewed and approved.")
+
+    assert report["summary"]["loss_count"] == 2
+    assert report["patterns"]["symbols"][0]["symbol"] == "MSFT"
+    assert applied["ok"] is True
+    assert applied["learning"]["last_report_id"] == report["report_id"]
+    assert (tmp_path / "config" / "autopilot_learning.json").exists()
+
+
+def test_dashboard_loss_postmortem_endpoints(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "trade_outcomes.jsonl").write_text(
+        json.dumps({"timestamp": datetime.now(UTC).isoformat(), "symbol": "NVDA", "realized_pnl": -5, "reason": "failed breakout", "signals": ["volume faded"]}) + "\n"
+    )
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), quote_client=TrendingQuoteClient(), alpaca_client=FakeAlpacaClient())
+    handler = make_handler(service)
+
+    status, body = _http_request(handler, "GET", "/api/postmortem-report")
+    report = json.loads(body)
+    apply_status, apply_body = _http_request(handler, "POST", "/api/postmortem-apply", {"report_id": report["report_id"], "reviewer_notes": "Looks right."})
+    applied = json.loads(apply_body)
+
+    assert status == 200
+    assert report["summary"]["loss_count"] == 1
+    assert apply_status == 200
+    assert applied["status"] == "applied"
 
 
 def test_dashboard_service_autopilot_scan_and_execute_paper_order(tmp_path: Path) -> None:
@@ -944,6 +1053,10 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "showTab('live-panel'" in HTML
     assert 'id="live-order-feed"' in HTML
     assert 'id="live-order-summary"' in HTML
+    assert 'id="live-order-flow"' in HTML
+    assert 'class="live-grid"' in HTML
+    assert "live-mini-card" in HTML
+    assert "flow-segment" in HTML
     assert "/api/live-orders" in HTML
     assert "renderLiveOrders" in HTML
     assert "refreshLiveOrders" in HTML
@@ -1010,6 +1123,8 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "/api/autopilot-run" in HTML
     assert "/api/autopilot-background" in HTML
     assert "/api/autopilot-settings" in HTML
+    assert "/api/postmortem-report" in HTML
+    assert "/api/postmortem-apply" in HTML
     assert "/api/stocks" in HTML
     assert "renderTradeIdeas" in HTML
     assert "renderAutopilot" in HTML
@@ -1038,6 +1153,10 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
     assert "formatAutopilotOutput" in HTML
     assert "setAutopilotPaperDowntrend" in HTML
     assert "setAutopilotBackground" in HTML
+    assert "runLossPostmortem" in HTML
+    assert "applyPostmortemLearnings" in HTML
+    assert 'id="postmortem-output"' in HTML
+    assert "Loss Post-Mortem" in HTML
     assert "postBackgroundAutopilotResult" in HTML
     assert "formatBackgroundAutopilotOutput" in HTML
     assert "Background loop run" in HTML
