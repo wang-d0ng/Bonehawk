@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +26,7 @@ from scripts.growth_scanner import build_growth_candidates, build_growth_candida
 from scripts.market_intel import MarketIntelClient, Position, Watchlist, load_watchlist
 from scripts.market_scanner import build_alert_message, scan_market
 from scripts.market_universe import combine_symbols, load_market_universe, market_universe_snapshot
+from scripts.market_hours import evaluate_market_hours_gate, market_hours_state_after_gate
 from scripts.postmortem_report import apply_loss_postmortem_report, build_loss_postmortem_report
 from scripts.portfolio_sync import portfolio_sync_snapshot
 from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfolio_performance
@@ -33,6 +34,7 @@ from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_tra
 
 UI_THEME_VALUES = {"retro", "clean", "arcade", "classic", "algo-desk"}
 BACKGROUND_AUTOPILOT_INTERVAL_SECONDS = 10
+MARKET_HOURS_STATE_FILE = Path("state") / "autopilot_market_hours.json"
 SETUP_SECRET_KEYS = {
     "ALPACA_API_KEY",
     "ALPACA_SECRET_KEY",
@@ -205,13 +207,33 @@ class DashboardService:
         return portfolio_sync_snapshot(self.watchlist(), alpaca_portfolio=self._alpaca_portfolio())
 
     def autopilot(self) -> dict[str, Any]:
-        return self._with_autopilot_channels(self._autopilot_engine().snapshot())
+        config, market_gate = self._sync_autopilot_market_hours(load_autopilot_config(self.root / "config" / "autopilot.json"))
+        payload = self._autopilot_engine(config=config).snapshot()
+        payload["market_hours"] = market_gate
+        return self._with_autopilot_channels(payload)
 
     def autopilot_scan(self) -> dict[str, Any]:
         return self._with_autopilot_channels(self._autopilot_engine().scan(self._autopilot_watchlist()))
 
-    def autopilot_execute(self, confirm: str = "") -> dict[str, Any]:
-        return self._with_autopilot_channels(self._autopilot_engine().execute(self._autopilot_watchlist(), confirm=confirm))
+    def autopilot_execute(self, confirm: str = "", market_gate: dict[str, Any] | None = None) -> dict[str, Any]:
+        config = load_autopilot_config(self.root / "config" / "autopilot.json")
+        if market_gate is None:
+            config, market_gate = self._sync_autopilot_market_hours(config)
+        if not market_gate.get("can_execute", True):
+            return self._with_autopilot_channels(
+                {
+                    "ok": False,
+                    "status": market_gate.get("status", "market_closed"),
+                    "config": config.snapshot(),
+                    "orders": [],
+                    "executed": [],
+                    "blocked": [{"status": market_gate.get("status", "market_closed"), "reason": market_gate.get("message", "Market is closed.")}],
+                    "market_hours": market_gate,
+                    "message": market_gate.get("message", "Market is closed."),
+                }
+            )
+        payload = self._autopilot_engine(config=config).execute(self._autopilot_watchlist(), confirm=confirm, market_gate=market_gate)
+        return self._with_autopilot_channels(payload)
 
     def autopilot_background_status(self) -> dict[str, Any]:
         with self._background_lock:
@@ -273,13 +295,24 @@ class DashboardService:
                 self._background_last_started_at = started_at
                 self._background_last_error = ""
             config = load_autopilot_config(self.root / "config" / "autopilot.json")
+            config, market_gate = self._sync_autopilot_market_hours(config)
             if config.mode != "paper":
                 result = {
                     "ok": False,
                     "status": "paper_only",
                     "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
                     "paper_only": True,
+                    "market_hours": market_gate,
                     "message": "Background autopilot is paper-only and will not run while autopilot is in live mode.",
+                }
+            elif not market_gate.get("can_execute", True):
+                result = {
+                    "ok": False,
+                    "status": market_gate.get("status", "market_closed"),
+                    "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
+                    "paper_only": True,
+                    "market_hours": market_gate,
+                    "message": market_gate.get("message", "Market is closed."),
                 }
             elif not config.enabled:
                 result = {
@@ -287,11 +320,12 @@ class DashboardService:
                     "status": "disabled",
                     "interval_seconds": BACKGROUND_AUTOPILOT_INTERVAL_SECONDS,
                     "paper_only": True,
+                    "market_hours": market_gate,
                     "message": "Autopilot is disabled in config/autopilot.json.",
                 }
             else:
                 scan = self.autopilot_scan()
-                execution = self.autopilot_execute(confirm="")
+                execution = self.autopilot_execute(confirm="", market_gate=market_gate)
                 result = {
                     "ok": True,
                     "status": "cycle_completed",
@@ -299,6 +333,7 @@ class DashboardService:
                     "paper_only": True,
                     "started_at": started_at,
                     "finished_at": _utc_now(),
+                    "market_hours": market_gate,
                     "scan": _background_scan_summary(scan),
                     "execution": _background_execution_summary(execution),
                     "message": "Background scan and paper execution cycle completed.",
@@ -681,10 +716,29 @@ class DashboardService:
             "performance": performance,
         }
 
-    def _autopilot_engine(self) -> AutopilotEngine:
+    def _sync_autopilot_market_hours(self, config: AutopilotConfig) -> tuple[AutopilotConfig, dict[str, Any]]:
+        state_path = self.root / MARKET_HOURS_STATE_FILE
+        state = _read_json_object(state_path)
+        clock = _alpaca_clock(self._alpaca_client())
+        gate = evaluate_market_hours_gate(clock, enabled=config.enabled, state=state)
+        next_config = config
+        if gate.get("should_disable_autopilot"):
+            next_config = replace(config, enabled=False)
+            save_autopilot_config(self.root / "config" / "autopilot.json", next_config)
+        elif gate.get("should_enable_autopilot"):
+            next_config = replace(config, enabled=True)
+            save_autopilot_config(self.root / "config" / "autopilot.json", next_config)
+        next_state = market_hours_state_after_gate(gate, state)
+        if next_state != state:
+            _write_json_object(state_path, next_state)
+        if next_config.enabled != config.enabled:
+            gate = {**gate, "autopilot_enabled_before": config.enabled, "autopilot_enabled_after": next_config.enabled}
+        return next_config, gate
+
+    def _autopilot_engine(self, config: AutopilotConfig | None = None) -> AutopilotEngine:
         return AutopilotEngine(
             root=self.root,
-            config=load_autopilot_config(self.root / "config" / "autopilot.json"),
+            config=config or load_autopilot_config(self.root / "config" / "autopilot.json"),
             intel_client=self.intel_client,
             quote_client=self.quote_client,
             alpaca_client=self._alpaca_client(),
@@ -993,6 +1047,31 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         super().server_close()
 
 
+def _alpaca_clock(client: Any) -> dict[str, Any] | None:
+    if not hasattr(client, "get_clock"):
+        return None
+    try:
+        clock = client.get_clock()
+    except Exception:
+        return None
+    return clock if isinstance(clock, dict) else None
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_json_object(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _read_env_presence(path: Path) -> dict[str, str]:
     keys = {
         "TELEGRAM_BOT_TOKEN": "missing",
@@ -1076,6 +1155,8 @@ def _ticket_from_decision(row: dict[str, Any]) -> dict[str, Any] | None:
         "filled_quantity": row.get("filled_quantity"),
         "filled_average_price": row.get("filled_average_price"),
         "fill_status": row.get("fill_status") or _ticket_signal_value(row, "fill_status"),
+        "scheduled_for_market_open": row.get("scheduled_for_market_open"),
+        "target_fill_time": row.get("target_fill_time"),
         "message": row.get("reason"),
         "review_only": row.get("review_only", True),
     }
@@ -1126,6 +1207,8 @@ def _live_order_event(ticket: dict[str, Any]) -> dict[str, Any]:
         "filled_quantity": ticket.get("filled_quantity"),
         "filled_average_price": ticket.get("filled_average_price"),
         "fill_status": ticket.get("fill_status"),
+        "scheduled_for_market_open": ticket.get("scheduled_for_market_open"),
+        "target_fill_time": ticket.get("target_fill_time"),
         "message": ticket.get("message"),
         "review_only": ticket.get("review_only", True),
         "category": category,
@@ -1356,6 +1439,7 @@ def _background_execution_summary(execution: dict[str, Any]) -> dict[str, Any]:
         "rejected": rejected,
         "planned": int(summary.get("planned") or len(orders)),
         "blocked": int(summary.get("blocked") or len(blocked)),
+        "scheduled_for_market_open": len([item for item in executed if item.get("scheduled_for_market_open")]),
         "message": summary.get("message") or execution.get("message") or execution.get("notice") or "",
         "order_ids": [str(item.get("broker_order_id")) for item in executed[:5] if item.get("broker_order_id")],
     }
@@ -1385,6 +1469,7 @@ def _background_display_payload(scan: dict[str, Any], execution: dict[str, Any],
         },
         "data_sources": source.get("data_sources") or scan.get("data_sources") or {},
         "telegram": source.get("telegram") or scan.get("telegram") or {},
+        "market_hours": source.get("market_hours") or execution.get("market_hours") or result.get("market_hours") or {},
         "notice": source.get("notice") or scan.get("notice") or result.get("message", ""),
         "background": {
             "status": result.get("status", "unknown"),
@@ -1424,6 +1509,9 @@ def _compact_background_rows(rows: list[dict[str, Any]], limit: int) -> list[dic
         "exit_window_minutes",
         "reason",
         "signals",
+        "scheduled_for_market_open",
+        "target_fill_time",
+        "schedule_reason",
         "status",
         "broker_status",
         "broker_order_id",
@@ -2910,11 +2998,13 @@ HTML = """
     function renderAutopilot(data) {
       const config = data.config || {};
       const broker = data.broker || {};
+      const marketHours = data.market_hours || {};
       document.getElementById('autopilot-metrics').innerHTML = [
         metric('Status', humanize(data.status), `Mode ${escapeHtml(config.mode || 'paper')}`),
         metric('Broker', 'Alpaca', humanize(broker.status || 'unknown')),
         metric('Sizing', 'Dynamic', `${config.max_open_positions || 0} max open positions`),
         metric('Agent window', `${escapeHtml(config.scan_window_minutes || 5)}m`, 'Cash, price, probability, and edge'),
+        metric('Market clock', humanize(marketHours.status || 'unknown'), marketHours.next_open ? `Next open ${escapeHtml(marketHours.next_open)}` : 'Alpaca clock pending'),
         metric('Live gate', config.live_ready ? 'Ready' : 'Locked', config.allow_live ? 'Live permission on' : 'Paper-first')
       ].join('');
       document.getElementById('autopilot-orders').innerHTML = empty('Run Scan to build a fresh paper plan.');
@@ -2929,6 +3019,7 @@ HTML = """
       const last = data.last_result || {};
       const scan = last.scan || {};
       const execution = last.execution || {};
+      const marketHours = last.market_hours || {};
       const statusText = running ? 'Running' : 'Stopped';
       statusNode.textContent = statusText;
       statusNode.className = `pill ${running ? 'buy' : 'trim'}`;
@@ -2936,6 +3027,7 @@ HTML = """
         running ? `Auto-runs Scan + Run Paper every ${data.interval_seconds || 10} seconds.` : 'Background paper loop is stopped.',
         `Runs: ${data.runs || 0}`,
         last.status ? `Last: ${last.status}` : '',
+        marketHours.status ? `market ${marketHours.status}` : '',
         scan.orders !== undefined ? `planned ${scan.orders}` : '',
         execution.submitted !== undefined ? `submitted ${execution.submitted}` : '',
         data.last_error ? `error ${data.last_error}` : ''
@@ -3352,8 +3444,9 @@ HTML = """
       const avg = event.filled_average_price ? `avg ${money(event.filled_average_price)}` : '';
       const broker = event.broker_status ? `broker ${event.broker_status}` : '';
       const orderId = event.broker_order_id ? `order ${shortOrderId(event.broker_order_id)}` : 'no order id';
+      const schedule = event.scheduled_for_market_open ? `queued for open ${event.target_fill_time || ''}` : '';
       const age = formatAge(event.age_seconds);
-      const detail = [event.source || 'order', event.message || '', qty, filledQty, avg, broker, orderId].filter(Boolean).join(' · ');
+      const detail = [event.source || 'order', event.message || '', schedule, qty, filledQty, avg, broker, orderId].filter(Boolean).join(' · ');
       const progress = Math.max(0, Math.min(100, Number(event.progress_pct || 0)));
       return `<div class="live-event ${escapeHtml(rowClass)}">
         <span class="live-event-rail"></span>

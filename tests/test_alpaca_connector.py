@@ -149,6 +149,30 @@ def test_alpaca_client_loads_open_positions() -> None:
     assert payload[0]["qty"] == "2"
 
 
+def test_alpaca_client_get_clock_loads_market_clock() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://paper-api.alpaca.markets/v2/clock"
+        return httpx.Response(
+            200,
+            json={
+                "timestamp": "2026-06-26T13:25:00Z",
+                "is_open": False,
+                "next_open": "2026-06-26T13:30:00Z",
+                "next_close": "2026-06-26T20:00:00Z",
+            },
+        )
+
+    client = AlpacaTradingClient(
+        AlpacaConfig(api_key="key", secret_key="secret", paper=True),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    payload = client.get_clock()
+
+    assert payload["is_open"] is False
+    assert payload["next_open"] == "2026-06-26T13:30:00Z"
+
+
 def test_alpaca_client_loads_asset_metadata() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://paper-api.alpaca.markets/v2/assets/AACB"

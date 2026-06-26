@@ -144,6 +144,14 @@ class AlpacaTradingClient:
         payload = response.json()
         return payload if isinstance(payload, list) else []
 
+    def get_clock(self) -> dict[str, Any]:
+        if not self.config.is_configured:
+            raise AlpacaError("Alpaca API keys are missing.")
+        response = self.http_client.get(f"{self.config.trading_base_url}/v2/clock", headers=self.config.headers())
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+
     def get_asset(self, symbol: str) -> dict[str, Any]:
         normalized_symbol = str(symbol or "").strip().upper()
         if not normalized_symbol:

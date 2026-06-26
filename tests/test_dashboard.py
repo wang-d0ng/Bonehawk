@@ -106,9 +106,27 @@ class FakeAlpacaClient:
         }
 
 
+class FakeClockAlpacaClient(FakeAlpacaClient):
+    def __init__(self, clock: dict) -> None:
+        super().__init__()
+        self.clock = clock
+
+    def get_clock(self):
+        return self.clock
+
+
 class FakeNoPositionAlpacaClient(FakeAlpacaClient):
     def get_positions(self):
         return []
+
+
+class FakePreopenNoPositionAlpacaClient(FakeNoPositionAlpacaClient):
+    def __init__(self, clock: dict) -> None:
+        super().__init__()
+        self.clock = clock
+
+    def get_clock(self):
+        return self.clock
 
 
 class FakeFilledOrderAlpacaClient(FakeAlpacaClient):
@@ -146,15 +164,23 @@ class FakeBackgroundDashboardService(DashboardService):
         self.background_calls.append("scan")
         return {"ok": True, "status": "scanned", "orders": [{"symbol": "MSFT"}], "blocked": []}
 
-    def autopilot_execute(self, confirm: str = "") -> dict:
-        self.background_calls.append(f"run:{confirm}")
+    def autopilot_execute(self, confirm: str = "", market_gate: dict | None = None) -> dict:
+        self.background_calls.append(f"run:{confirm}:{(market_gate or {}).get('status', '')}")
         return {
             "ok": True,
             "status": "submitted",
             "mode": "paper",
             "orders": [{"symbol": "MSFT"}],
             "blocked": [],
-            "executed": [{"ok": True, "symbol": "MSFT", "broker_order_id": "paper-loop-order"}],
+            "executed": [
+                {
+                    "ok": True,
+                    "symbol": "MSFT",
+                    "broker_order_id": "paper-loop-order",
+                    "scheduled_for_market_open": bool((market_gate or {}).get("queue_orders_for_market_open")),
+                    "target_fill_time": (market_gate or {}).get("next_open"),
+                }
+            ],
             "execution_summary": {"submitted": 1, "rejected": 0, "planned": 1, "blocked": 0, "message": "Submitted."},
         }
 
@@ -781,6 +807,38 @@ def test_dashboard_service_autopilot_scan_and_execute_paper_order(tmp_path: Path
     assert (tmp_path / "logs" / "decision_log.jsonl").exists()
 
 
+def test_dashboard_autopilot_execute_preopen_orders_are_scheduled_for_open(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    state = tmp_path / "state"
+    config.mkdir()
+    state.mkdir()
+    now = datetime(2026, 6, 26, 13, 26, tzinfo=UTC)
+    next_open = now + timedelta(minutes=4)
+    (config / "watchlist.json").write_text(json.dumps({"symbols": ["MSFT"], "positions": [], "risk": {}}))
+    (config / "market_universe.json").write_text(json.dumps({"symbols": [], "max_scan_symbols": 0}))
+    (config / "autopilot.json").write_text(json.dumps({"enabled": False, "mode": "paper", "max_trade_usd": 25, "min_confidence": 40}))
+    (state / "autopilot_market_hours.json").write_text(json.dumps({"auto_paused": True, "resume_at": now.isoformat()}))
+    alpaca = FakePreopenNoPositionAlpacaClient(
+        {
+            "timestamp": now.isoformat(),
+            "is_open": False,
+            "next_open": next_open.isoformat(),
+            "next_close": (next_open + timedelta(hours=6, minutes=30)).isoformat(),
+        }
+    )
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=alpaca)
+
+    executed = service.autopilot_execute()
+    saved = json.loads((config / "autopilot.json").read_text())
+
+    assert executed["ok"] is True
+    assert executed["market_hours"]["status"] == "preopen_queue"
+    assert executed["executed"][0]["scheduled_for_market_open"] is True
+    assert executed["executed"][0]["target_fill_time"] == next_open.isoformat()
+    assert alpaca.orders[0][0].time_in_force == "day"
+    assert saved["enabled"] is True
+
+
 def test_dashboard_service_background_autopilot_cycle_runs_scan_then_paper(tmp_path: Path) -> None:
     config = tmp_path / "config"
     config.mkdir()
@@ -796,7 +854,7 @@ def test_dashboard_service_background_autopilot_cycle_runs_scan_then_paper(tmp_p
     assert payload["scan"]["status"] == "scanned"
     assert payload["execution"]["status"] == "submitted"
     assert payload["execution"]["submitted"] == 1
-    assert service.background_calls == ["scan", "run:"]
+    assert service.background_calls == ["scan", "run::clock_unavailable"]
     assert status["runs"] == 1
     assert status["paper_only"] is True
     assert status["last_result"]["execution"]["submitted"] == 1
@@ -804,6 +862,68 @@ def test_dashboard_service_background_autopilot_cycle_runs_scan_then_paper(tmp_p
     assert status["last_result"]["display"]["executed"][0]["broker_order_id"] == "paper-loop-order"
     assert status["last_result"]["display"]["background"]["scan_status"] == "scanned"
     assert status["last_result"]["display"]["background"]["run_status"] == "submitted"
+
+
+def test_background_cycle_auto_pauses_autopilot_when_market_is_closed(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    now = datetime(2026, 6, 26, 0, 0, tzinfo=UTC)
+    next_open = now + timedelta(hours=9, minutes=30)
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper"}))
+    service = FakeBackgroundDashboardService(
+        root=tmp_path,
+    )
+    service.alpaca_client = FakeClockAlpacaClient(
+        {
+            "timestamp": now.isoformat(),
+            "is_open": False,
+            "next_open": next_open.isoformat(),
+            "next_close": (next_open + timedelta(hours=6, minutes=30)).isoformat(),
+        }
+    )
+
+    payload = service.run_autopilot_background_cycle()
+    saved = json.loads((config / "autopilot.json").read_text())
+    state = json.loads((tmp_path / "state" / "autopilot_market_hours.json").read_text())
+
+    assert payload["ok"] is False
+    assert payload["status"] == "market_closed_auto_paused"
+    assert payload["market_hours"]["minutes_to_open"] == 570
+    assert saved["enabled"] is False
+    assert state["auto_paused"] is True
+    assert service.background_calls == []
+
+
+def test_background_cycle_resumes_five_minutes_before_open_and_queues_orders(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    state_dir = tmp_path / "state"
+    config.mkdir()
+    state_dir.mkdir()
+    now = datetime(2026, 6, 26, 13, 25, tzinfo=UTC)
+    next_open = now + timedelta(minutes=5)
+    (config / "autopilot.json").write_text(json.dumps({"enabled": False, "mode": "paper"}))
+    (state_dir / "autopilot_market_hours.json").write_text(json.dumps({"auto_paused": True, "resume_at": now.isoformat()}))
+    service = FakeBackgroundDashboardService(root=tmp_path)
+    service.alpaca_client = FakeClockAlpacaClient(
+        {
+            "timestamp": now.isoformat(),
+            "is_open": False,
+            "next_open": next_open.isoformat(),
+            "next_close": (next_open + timedelta(hours=6, minutes=30)).isoformat(),
+        }
+    )
+
+    payload = service.run_autopilot_background_cycle()
+    saved = json.loads((config / "autopilot.json").read_text())
+
+    assert payload["ok"] is True
+    assert payload["status"] == "cycle_completed"
+    assert payload["market_hours"]["status"] == "preopen_queue"
+    assert payload["market_hours"]["queue_orders_for_market_open"] is True
+    assert saved["enabled"] is True
+    assert service.background_calls == ["scan", "run::preopen_queue"]
+    assert payload["display"]["executed"][0]["scheduled_for_market_open"] is True
+    assert payload["display"]["executed"][0]["target_fill_time"] == next_open.isoformat()
 
 
 def test_dashboard_service_background_autopilot_refuses_live_mode(tmp_path: Path) -> None:

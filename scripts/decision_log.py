@@ -52,6 +52,8 @@ def _row(timestamp: str, source: str, idea: dict[str, Any]) -> dict[str, Any]:
         "filled_quantity": idea.get("filled_quantity"),
         "filled_average_price": idea.get("filled_average_price"),
         "fill_status": idea.get("fill_status"),
+        "scheduled_for_market_open": idea.get("scheduled_for_market_open"),
+        "target_fill_time": idea.get("target_fill_time"),
         "reason": idea.get("reason"),
         "signals": idea.get("signals"),
         "review_only": idea.get("review_only", True),

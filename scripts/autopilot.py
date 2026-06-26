@@ -82,7 +82,7 @@ class AutopilotEngine:
             "notice": "Autopilot scan is review-only until you run paper execution.",
         }
 
-    def execute(self, watchlist: Watchlist, confirm: str = "") -> dict[str, Any]:
+    def execute(self, watchlist: Watchlist, confirm: str = "", market_gate: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.config.enabled:
             return {
                 "ok": False,
@@ -91,6 +91,7 @@ class AutopilotEngine:
                 "orders": [],
                 "executed": [],
                 "blocked": [{"status": "disabled", "reason": "Autopilot is disabled in config/autopilot.json."}],
+                "market_hours": market_gate or {},
             }
         if self.config.mode == "live":
             if not self.config.allow_live:
@@ -122,6 +123,7 @@ class AutopilotEngine:
         else:
             planned_orders = list(decisions["orders"])
             for index, order in enumerate(planned_orders):
+                order = _order_with_market_open_schedule(order, market_gate)
                 request, broker_block = _broker_order_request(order, self.config, self.alpaca_client)
                 if broker_block:
                     decisions["blocked"].append(broker_block)
@@ -140,6 +142,8 @@ class AutopilotEngine:
                         "current_price": order.get("current_price"),
                         "action": order.get("action"),
                         "reason": order.get("reason"),
+                        "scheduled_for_market_open": order.get("scheduled_for_market_open"),
+                        "target_fill_time": order.get("target_fill_time"),
                     }
                 )
                 if response.get("status") == "rate_limited":
@@ -158,6 +162,7 @@ class AutopilotEngine:
             **scan_payload,
             **decisions,
             "executed": executed,
+            "market_hours": market_gate or {},
             "execution_summary": {
                 "submitted": len(submitted),
                 "rejected": len(rejected),
@@ -1063,6 +1068,17 @@ def _postmortem_learning_block(candidate: dict[str, Any], learning: dict[str, An
     }
 
 
+def _order_with_market_open_schedule(order: dict[str, Any], market_gate: dict[str, Any] | None) -> dict[str, Any]:
+    if not market_gate or not market_gate.get("queue_orders_for_market_open"):
+        return order
+    return {
+        **order,
+        "scheduled_for_market_open": True,
+        "target_fill_time": market_gate.get("next_open", ""),
+        "schedule_reason": "Submitted during pre-open queue window; regular-hours market order should queue for market open.",
+    }
+
+
 def _broker_order_request(order: dict[str, Any], config: AutopilotConfig, alpaca_client: AlpacaTradingClient) -> tuple[AlpacaOrderRequest | None, dict[str, Any] | None]:
     bracket_prices = _broker_bracket_prices(order, config)
     side = str(order.get("side") or "buy").lower()
@@ -1173,11 +1189,14 @@ def _decision_from_execution(item: dict[str, Any]) -> dict[str, Any]:
         "filled_quantity": item.get("filled_quantity"),
         "filled_average_price": item.get("filled_average_price"),
         "fill_status": item.get("fill_status"),
+        "scheduled_for_market_open": item.get("scheduled_for_market_open"),
+        "target_fill_time": item.get("target_fill_time"),
         "reason": item.get("message"),
         "signals": [
             f"broker_status {item.get('broker_status') or item.get('status')}",
             f"fill_status {item.get('fill_status') or 'unknown'}",
             f"notional {item.get('notional') or 'n/a'}",
+            f"target_fill_time {item.get('target_fill_time') or 'n/a'}" if item.get("scheduled_for_market_open") else "regular_hours_order",
         ],
         "review_only": item.get("review_only", True),
     }
