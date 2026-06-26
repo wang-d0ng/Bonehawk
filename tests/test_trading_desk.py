@@ -43,6 +43,47 @@ def test_order_truth_records_lifecycle_stage_and_summary(tmp_path: Path) -> None
     assert snapshot["events"][0]["notional"] == 25
 
 
+def test_order_truth_summary_uses_latest_broker_state(tmp_path: Path) -> None:
+    record_order_truth_event(
+        tmp_path,
+        "autopilot_order",
+        {
+            "symbol": "MSFT",
+            "side": "BUY",
+            "status": "submitted",
+            "broker_status": "accepted",
+            "broker_order_id": "order-1",
+            "filled_quantity": 0,
+            "fill_status": "not_filled_yet",
+        },
+        now=datetime(2026, 6, 26, 13, 0, tzinfo=UTC),
+    )
+    record_order_truth_event(
+        tmp_path,
+        "alpaca_order_reconcile",
+        {
+            "symbol": "MSFT",
+            "side": "BUY",
+            "status": "submitted",
+            "broker_status": "filled",
+            "broker_order_id": "order-1",
+            "filled_quantity": 1,
+            "filled_average_price": 101.25,
+            "fill_status": "filled",
+        },
+        now=datetime(2026, 6, 26, 13, 2, tzinfo=UTC),
+    )
+
+    snapshot = order_truth_snapshot(tmp_path)
+
+    assert snapshot["summary"]["submitted"] == 0
+    assert snapshot["summary"]["filled"] == 1
+    assert snapshot["summary"]["active"] == 0
+    assert snapshot["current"][0]["stage"] == "filled"
+    assert snapshot["current"][0]["filled_average_price"] == 101.25
+    assert len(snapshot["events"]) == 2
+
+
 def test_trade_journal_and_strategy_scorecard_track_pnl(tmp_path: Path) -> None:
     record_trade_journal_entry(
         tmp_path,

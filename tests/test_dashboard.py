@@ -11,6 +11,8 @@ from pathlib import Path
 from scripts.dashboard import BACKGROUND_AUTOPILOT_INTERVAL_SECONDS, DashboardService, HTML, json_response, make_handler
 from scripts.decision_log import record_decisions
 from scripts.market_intel import Watchlist
+from scripts.readiness import record_risk_acknowledgement
+from scripts.trading_desk import record_order_truth_event
 
 
 class FakeIntelClient:
@@ -64,6 +66,7 @@ class TrendingQuoteClient(FakeQuoteClient):
 class FakeAlpacaClient:
     def __init__(self) -> None:
         self.orders = []
+        self.cancel_all_called = False
 
     def snapshot(self):
         return {"status": "connected", "api_key": "set", "secret_key": "set", "paper": True}
@@ -105,6 +108,21 @@ class FakeAlpacaClient:
             "review_only": False,
         }
 
+    def get_clock(self):
+        return {
+            "timestamp": "2026-06-26T13:30:00Z",
+            "is_open": True,
+            "next_open": "2026-06-29T13:30:00Z",
+            "next_close": "2026-06-26T20:00:00Z",
+        }
+
+    def get_calendar(self, start: str, end: str):
+        return [{"date": start, "open": "09:30", "close": "16:00"}]
+
+    def cancel_all_orders(self):
+        self.cancel_all_called = True
+        return {"ok": True, "status": "cancel_requested", "canceled": 1}
+
 
 class FakeClockAlpacaClient(FakeAlpacaClient):
     def __init__(self, clock: dict) -> None:
@@ -118,6 +136,14 @@ class FakeClockAlpacaClient(FakeAlpacaClient):
 class FakeNoPositionAlpacaClient(FakeAlpacaClient):
     def get_positions(self):
         return []
+
+
+class FakeLiquidationAlpacaClient(FakeAlpacaClient):
+    def get_positions(self):
+        return [
+            {"symbol": "MSFT", "qty": "2", "qty_available": "1.5", "avg_entry_price": "100"},
+            {"symbol": "NVDA", "qty": "1", "qty_available": "0", "avg_entry_price": "120"},
+        ]
 
 
 class FakePreopenNoPositionAlpacaClient(FakeNoPositionAlpacaClient):
@@ -232,6 +258,7 @@ def test_dashboard_service_apply_setup_writes_env_and_autopilot_config_without_l
             "autopilot_enabled": True,
             "max_trade_usd": 35,
             "max_open_positions": 4,
+            "risk_acknowledged": True,
         }
     )
 
@@ -246,10 +273,21 @@ def test_dashboard_service_apply_setup_writes_env_and_autopilot_config_without_l
     assert "ALPACA_PAPER=true" in env_text
     assert "ALPACA_ALLOW_LIVE=false" in env_text
     assert "BONEHAWK_SETUP_COMPLETE=true" in env_text
+    assert (tmp_path / "state" / "risk_acknowledgement.json").exists()
     assert (tmp_path / "config" / "autopilot.json").exists()
     saved_config = json.loads((tmp_path / "config" / "autopilot.json").read_text())
     assert saved_config["max_open_positions"] == 4
     assert saved_config["max_trade_usd"] == 25
+
+
+def test_dashboard_service_apply_setup_requires_risk_acknowledgement(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient())
+
+    payload = service.apply_setup({"alpaca_api_key": "key", "alpaca_secret_key": "secret", "risk_acknowledged": False})
+
+    assert payload["ok"] is False
+    assert payload["status"] == "invalid_setup"
+    assert "risk" in payload["message"].lower()
 
 
 def test_dashboard_service_apply_setup_rejects_invalid_risk_numbers(tmp_path: Path) -> None:
@@ -610,6 +648,22 @@ def test_dashboard_service_tickets_refresh_alpaca_fill_status(tmp_path: Path) ->
     assert payload["tickets"][0]["message"] == "Alpaca order filled."
 
 
+def test_dashboard_service_reconcile_orders_records_current_broker_state(tmp_path: Path) -> None:
+    alpaca = FakeFilledOrderAlpacaClient()
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=alpaca)
+
+    service.stock_order("msft", "buy", "1", confirm="LIVE_ALPACA_ORDER")
+    payload = service.reconcile_orders()
+
+    assert payload["ok"] is True
+    assert payload["summary"]["refreshed"] == 1
+    assert payload["summary"]["terminal"] == 1
+    assert payload["order_truth"]["summary"]["filled"] == 1
+    assert payload["order_truth"]["summary"]["active"] == 0
+    assert payload["order_truth"]["current"][0]["source"] == "alpaca_order_reconcile"
+    assert payload["order_truth"]["current"][0]["filled_average_price"] == 101.25
+
+
 def test_dashboard_service_live_orders_summarizes_recent_order_events(tmp_path: Path) -> None:
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
     record_decisions(
@@ -652,6 +706,35 @@ def test_dashboard_service_live_orders_summarizes_recent_order_events(tmp_path: 
     assert payload["events"][1]["broker_order_id"] == "paper-live-view"
 
 
+def test_dashboard_service_live_orders_labels_canceled_orders(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
+    record_decisions(
+        tmp_path / "logs" / "decision_log.jsonl",
+        "autopilot_order",
+        [
+            {
+                "symbol": "MSFT",
+                "action": "AUTO_BUY_CANDIDATE",
+                "status": "submitted",
+                "broker_status": "canceled",
+                "broker_order_id": "paper-canceled",
+                "filled_quantity": 0,
+                "fill_status": "canceled",
+                "reason": "Alpaca order is canceled.",
+                "signals": ["notional 25"],
+                "review_only": False,
+            }
+        ],
+    )
+
+    payload = service.live_orders()
+
+    assert payload["summary"]["canceled"] == 1
+    assert payload["summary"]["submitted"] == 0
+    assert payload["events"][0]["category"] == "canceled"
+    assert payload["events"][0]["progress_pct"] == 100
+
+
 def test_dashboard_service_autopilot_snapshot_is_redacted(tmp_path: Path) -> None:
     config = tmp_path / "config"
     config.mkdir()
@@ -669,6 +752,75 @@ def test_dashboard_service_autopilot_snapshot_is_redacted(tmp_path: Path) -> Non
     assert payload["data_sources"]["execution"] == "Alpaca paper orders by default."
     assert "secret-secret" not in json.dumps(payload)
     assert "telegram-secret" not in json.dumps(payload)
+
+
+def test_dashboard_service_setup_diagnostics_redacts_and_explains_recovery(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "ALPACA_API_KEY=paper-key\n"
+        "ALPACA_SECRET_KEY=paper-secret\n"
+        "TELEGRAM_BOT_TOKEN=telegram-secret\n"
+        "ALLOWED_CHAT_IDS=123\n"
+        "BONEHAWK_SETUP_COMPLETE=true\n"
+    )
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper"}))
+    (tmp_path / "README.md").write_text("This project is trading software, not financial advice, and can lose money quickly.\n")
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
+
+    payload = service.setup_diagnostics()
+
+    assert payload["ok"] is True
+    assert payload["summary"]["failed"] == 0
+    assert payload["checks"]["alpaca_account"]["status"] == "pass"
+    assert payload["checks"]["market_clock"]["status"] == "pass"
+    assert payload["checks"]["risk_disclosure"]["status"] == "pass"
+    assert "paper-secret" not in json.dumps(payload)
+    assert "telegram-secret" not in json.dumps(payload)
+
+
+def test_dashboard_service_setup_diagnostics_explains_bad_alpaca_keys(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("ALPACA_API_KEY=paper-key\nALPACA_SECRET_KEY=paper-secret\n")
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeBrokenConfiguredAlpacaClient())
+
+    payload = service.setup_diagnostics()
+
+    assert payload["ok"] is False
+    assert payload["checks"]["alpaca_account"]["status"] == "fail"
+    assert "paper/live mode" in payload["checks"]["alpaca_account"]["recovery"]
+    assert "paper-secret" not in json.dumps(payload)
+
+
+def test_dashboard_service_emergency_liquidation_requires_confirmation(tmp_path: Path) -> None:
+    client = FakeLiquidationAlpacaClient()
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=client)
+
+    payload = service.emergency_liquidate(confirm="")
+
+    assert payload["ok"] is False
+    assert payload["status"] == "confirmation_required"
+    assert client.orders == []
+
+
+def test_dashboard_service_emergency_liquidation_cancels_orders_and_sells_available_positions(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper"}))
+    client = FakeLiquidationAlpacaClient()
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=client)
+
+    payload = service.emergency_liquidate(confirm="LIQUIDATE_ALL_POSITIONS")
+    saved = json.loads((config / "autopilot.json").read_text())
+
+    assert payload["ok"] is True
+    assert payload["summary"]["submitted"] == 1
+    assert payload["summary"]["skipped"] == 1
+    assert client.cancel_all_called is True
+    assert client.orders[0][0].symbol == "MSFT"
+    assert client.orders[0][0].side == "sell"
+    assert client.orders[0][0].quantity == 1.5
+    assert saved["enabled"] is False
+    assert (tmp_path / "logs" / "order_truth.jsonl").exists()
 
 
 def test_dashboard_service_disabling_autopilot_stops_background_loop(tmp_path: Path) -> None:
@@ -894,7 +1046,7 @@ def test_dashboard_service_background_autopilot_cycle_runs_scan_then_paper(tmp_p
     assert payload["scan"]["status"] == "scanned"
     assert payload["execution"]["status"] == "submitted"
     assert payload["execution"]["submitted"] == 1
-    assert service.background_calls == ["scan", "run::clock_unavailable"]
+    assert service.background_calls == ["scan", "run::market_open"]
     assert status["runs"] == 1
     assert status["paper_only"] is True
     assert status["last_result"]["execution"]["submitted"] == 1
@@ -1004,12 +1156,30 @@ def test_dashboard_service_updates_autopilot_setting_with_live_confirmation(tmp_
     service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
 
     blocked = service.set_autopilot_setting("mode", "live")
-    updated = service.set_autopilot_setting("mode", "live", confirm="LIVE_ALPACA_AUTOPILOT")
+    readiness_blocked = service.set_autopilot_setting("mode", "live", confirm="LIVE_ALPACA_AUTOPILOT")
 
     assert blocked["ok"] is False
     assert blocked["status"] == "confirmation_required"
+    assert readiness_blocked["ok"] is False
+    assert readiness_blocked["status"] == "live_readiness_locked"
+    assert readiness_blocked["config"]["mode"] == "paper"
+
+
+def test_dashboard_service_allows_live_autopilot_setting_after_readiness_passes(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "autopilot.json").write_text(json.dumps({"enabled": True, "mode": "paper"}))
+    (tmp_path / ".env").write_text("BONEHAWK_SETUP_COMPLETE=true\nALPACA_API_KEY=paper-key\nALPACA_SECRET_KEY=paper-secret\n")
+    (tmp_path / "README.md").write_text("This is trading software, not financial advice, and can lose money quickly.\n")
+    _seed_live_readiness_evidence(tmp_path)
+    record_risk_acknowledgement(tmp_path, accepted=True, actor="tester", now=datetime(2026, 6, 26, 12, 0, tzinfo=UTC))
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeAlpacaClient())
+
+    updated = service.set_autopilot_setting("mode", "live", confirm="LIVE_ALPACA_AUTOPILOT")
+
     assert updated["ok"] is True
     assert updated["config"]["mode"] == "live"
+    assert updated["live_readiness"]["status"] == "eligible"
 
 
 def test_dashboard_service_trade_ideas_returns_ranked_actions(tmp_path: Path) -> None:
@@ -1108,6 +1278,12 @@ def test_dashboard_handler_serves_get_routes(tmp_path: Path) -> None:
 
     index_status, index_body = _http_request(handler, "GET", "/")
     status_status, status_body = _http_request(handler, "GET", "/api/status")
+    diagnostics_status, diagnostics_body = _http_request(handler, "GET", "/api/setup-diagnostics")
+    beta_status, beta_body = _http_request(handler, "GET", "/api/private-beta-check")
+    paper_status, paper_body = _http_request(handler, "GET", "/api/paper-evidence")
+    live_ready_status, live_ready_body = _http_request(handler, "GET", "/api/live-readiness")
+    operational_status, operational_body = _http_request(handler, "GET", "/api/operational-health")
+    public_status, public_body = _http_request(handler, "GET", "/api/public-release-readiness")
     chart_status, chart_body = _http_request(handler, "GET", "/api/stock-chart?symbol=msft&range=1w")
     live_status, live_body = _http_request(handler, "GET", "/api/live-orders")
     missing_status, missing_body = _http_request(handler, "GET", "/nope")
@@ -1116,6 +1292,18 @@ def test_dashboard_handler_serves_get_routes(tmp_path: Path) -> None:
     assert "bonehawk" in index_body
     assert status_status == 200
     assert json.loads(status_body)["mode"] == "missing"
+    assert diagnostics_status == 200
+    assert "checks" in json.loads(diagnostics_body)
+    assert beta_status == 200
+    assert "checks" in json.loads(beta_body)
+    assert paper_status == 200
+    assert "summary" in json.loads(paper_body)
+    assert live_ready_status == 200
+    assert "checks" in json.loads(live_ready_body)
+    assert operational_status == 200
+    assert "checks" in json.loads(operational_body)
+    assert public_status == 200
+    assert "checks" in json.loads(public_body)
     assert chart_status == 200
     assert json.loads(chart_body)["symbol"] == "MSFT"
     assert live_status == 200
@@ -1135,6 +1323,7 @@ def test_dashboard_handler_serves_post_routes(tmp_path: Path) -> None:
 
     theme_status, theme_body = _http_request(handler, "POST", "/api/ui-theme", {"theme": "classic"})
     ticket_status, ticket_body = _http_request(handler, "POST", "/api/stock-order", {"symbol": "msft", "side": "buy", "quantity": "1", "confirm": "LIVE_ALPACA_ORDER"})
+    liquidation_status, liquidation_body = _http_request(handler, "POST", "/api/emergency-liquidate", {"confirm": ""})
     inputs_status, inputs_body = _http_request(handler, "POST", "/api/commands/run", {"id": "pytest", "inputs": []})
     bad_status, bad_body = _http_request(handler, "POST", "/api/trading-mode", raw="{")
 
@@ -1142,10 +1331,25 @@ def test_dashboard_handler_serves_post_routes(tmp_path: Path) -> None:
     assert json.loads(theme_body)["theme"] == "classic"
     assert ticket_status == 200
     assert json.loads(ticket_body)["broker_order_id"] == "alpaca-paper-order"
+    assert liquidation_status == 409
+    assert json.loads(liquidation_body)["status"] == "confirmation_required"
     assert inputs_status == 400
     assert json.loads(inputs_body)["status"] == "bad_request"
     assert bad_status == 400
     assert json.loads(bad_body)["status"] == "bad_request"
+
+
+def test_dashboard_handler_serves_order_reconcile_route(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), alpaca_client=FakeFilledOrderAlpacaClient())
+    service.stock_order("msft", "buy", "1", confirm="LIVE_ALPACA_ORDER")
+    handler = make_handler(service)
+
+    status_code, body = _http_request(handler, "POST", "/api/reconcile-orders", {})
+
+    assert status_code == 200
+    payload = json.loads(body)
+    assert payload["summary"]["refreshed"] == 1
+    assert payload["order_truth"]["summary"]["filled"] == 1
 
 
 def test_dashboard_handler_serves_autopilot_background_routes(tmp_path: Path) -> None:
@@ -1180,6 +1384,18 @@ def test_dashboard_html_has_unique_ids_and_app_shell() -> None:
 
     assert len(ids) == len(set(ids))
     assert 'class="app-shell"' in HTML
+    assert "/api/setup-diagnostics" in HTML
+    assert "/api/private-beta-check" in HTML
+    assert "/api/paper-evidence" in HTML
+    assert "/api/live-readiness" in HTML
+    assert "/api/operational-health" in HTML
+    assert "/api/public-release-readiness" in HTML
+    assert "/api/emergency-liquidate" in HTML
+    assert "/api/reconcile-orders" in HTML
+    assert "Paper Evidence" in HTML
+    assert "Live Readiness" in HTML
+    assert "Risk acknowledgement" in HTML
+    assert "LIQUIDATE_ALL_POSITIONS" in HTML
     assert 'class="metric-grid"' in HTML
     assert 'id="ticker-tape"' in HTML
     assert 'class="terminal-mark"' in HTML
@@ -1330,6 +1546,50 @@ def test_dashboard_overview_places_news_and_insiders_under_risk_flags() -> None:
     insider_index = HTML.index("<h2>Insider Filings</h2>", news_index)
 
     assert right_rail_start < risk_index < news_index < insider_index
+
+
+def _seed_live_readiness_evidence(root: Path) -> None:
+    start = datetime(2026, 6, 22, 14, 0, tzinfo=UTC)
+    for index in range(10):
+        timestamp = start + timedelta(days=index // 4, minutes=index)
+        status = "rejected" if index == 8 else "submitted"
+        broker_status = "rejected" if index == 8 else "filled"
+        fill_status = "rejected" if index == 8 else "filled"
+        record_order_truth_event(
+            root,
+            "autopilot_order",
+            {
+                "symbol": f"T{index}",
+                "side": "BUY",
+                "status": status,
+                "broker_status": broker_status,
+                "broker_order_id": f"paper-{index}",
+                "filled_quantity": 0 if index == 8 else 1,
+                "filled_average_price": 100 + index,
+                "fill_status": fill_status,
+                "review_only": False,
+            },
+            now=timestamp,
+        )
+    outcomes = [5, -2, 6, 4, -1, 3, 2, 1, -1, 1]
+    path = root / "logs" / "trade_outcomes.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "timestamp": (start + timedelta(days=index // 4, minutes=index + 10)).isoformat(),
+                    "symbol": f"T{index}",
+                    "realized_pnl": pnl,
+                    "strategy": "momentum_breakout",
+                    "review_only": False,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+            for index, pnl in enumerate(outcomes)
+        )
+    )
 
 
 def _http_request(handler, method: str, path: str, payload: dict | None = None, raw: str | None = None) -> tuple[int, str]:

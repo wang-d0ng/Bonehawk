@@ -152,6 +152,18 @@ class AlpacaTradingClient:
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
 
+    def get_calendar(self, start: str, end: str) -> list[dict[str, Any]]:
+        if not self.config.is_configured:
+            raise AlpacaError("Alpaca API keys are missing.")
+        response = self.http_client.get(
+            f"{self.config.trading_base_url}/v2/calendar",
+            headers=self.config.headers(),
+            params={"start": str(start), "end": str(end)},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
     def get_asset(self, symbol: str) -> dict[str, Any]:
         normalized_symbol = str(symbol or "").strip().upper()
         if not normalized_symbol:
@@ -173,6 +185,51 @@ class AlpacaTradingClient:
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        normalized_id = str(order_id or "").strip()
+        if not normalized_id:
+            return {"ok": False, "status": "invalid_order_id", "message": "Alpaca order id is missing.", "review_only": True}
+        if not self.config.is_configured:
+            return {"ok": False, "status": "not_configured", "message": "Alpaca keys are missing.", "review_only": True}
+        try:
+            response = self.http_client.delete(f"{self.config.trading_base_url}/v2/orders/{normalized_id}", headers=self.config.headers())
+            request_id = response.headers.get("X-Request-ID")
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            return {
+                "ok": False,
+                "status": "cancel_rejected",
+                "message": "Alpaca rejected the cancel request.",
+                "detail": _safe_http_error(error),
+                "request_id": error.response.headers.get("X-Request-ID"),
+                "review_only": True,
+            }
+        except httpx.HTTPError as error:
+            return {"ok": False, "status": "network_error", "message": "Alpaca cancel request failed.", "detail": _safe_error(error), "review_only": True}
+        return {"ok": True, "status": "cancel_requested", "broker": "alpaca", "broker_order_id": normalized_id, "request_id": request_id, "review_only": False}
+
+    def cancel_all_orders(self) -> dict[str, Any]:
+        if not self.config.is_configured:
+            return {"ok": False, "status": "not_configured", "message": "Alpaca keys are missing.", "review_only": True}
+        try:
+            response = self.http_client.delete(f"{self.config.trading_base_url}/v2/orders", headers=self.config.headers())
+            request_id = response.headers.get("X-Request-ID")
+            response.raise_for_status()
+            payload = response.json() if response.content else []
+        except httpx.HTTPStatusError as error:
+            return {
+                "ok": False,
+                "status": "cancel_rejected",
+                "message": "Alpaca rejected the cancel-all request.",
+                "detail": _safe_http_error(error),
+                "request_id": error.response.headers.get("X-Request-ID"),
+                "review_only": True,
+            }
+        except httpx.HTTPError as error:
+            return {"ok": False, "status": "network_error", "message": "Alpaca cancel-all request failed.", "detail": _safe_error(error), "review_only": True}
+        rows = payload if isinstance(payload, list) else []
+        return {"ok": True, "status": "cancel_requested", "broker": "alpaca", "canceled": len(rows), "orders": rows, "request_id": request_id, "review_only": False}
 
     def place_order(self, request: AlpacaOrderRequest, confirm: str = "") -> dict[str, Any]:
         validation = _validate_order_request(request)

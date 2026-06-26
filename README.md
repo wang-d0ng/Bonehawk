@@ -35,6 +35,10 @@ Then open `http://127.0.0.1:8765`.
 
 On first launch, Bonehawk opens a setup wizard when Alpaca paper keys or `config/autopilot.json` are missing. The wizard saves values into `.env`, creates `config/autopilot.json`, keeps live Alpaca permission off, and marks `BONEHAWK_SETUP_COMPLETE=true` when setup is complete.
 
+Setup also requires a local risk acknowledgement. This records that the user understands Bonehawk is not financial advice, automated trading can lose money, and live mode remains the user's responsibility.
+
+The Settings tab includes setup diagnostics for recovery when keys, paper/live mode, Telegram, market clock, or Alpaca calendar checks fail. These diagnostics report only set/missing status and safe error messages; they do not print secret values.
+
 Optional Telegram settings:
 
 ```bash
@@ -114,6 +118,10 @@ Buy/Sell buttons in the dashboard create tickets. The `Record Ticket` button log
 
 Order responses appear as top-right notifications and are logged in the Tickets tab with status, broker order id, and message details.
 
+The Live View tab and Settings hardening panel include `Reconcile Orders`. This refreshes active Alpaca broker order IDs, records the latest fill/cancel/reject state in Order Truth, and keeps the current active-order count from treating old submitted events as still open.
+
+Emergency liquidation is available in Settings behind the confirmation phrase `LIQUIDATE_ALL_POSITIONS`. It disables autopilot, stops the background loop, cancels open Alpaca orders when the connector supports it, and submits market sell orders for available position quantities. Use this only when you understand the paper/live mode currently configured.
+
 ## Trading Desk
 
 The AI Desk includes a Trading Desk panel that keeps the bot accountable:
@@ -124,6 +132,10 @@ The AI Desk includes a Trading Desk panel that keeps the bot accountable:
 - Shadow Mode records what the bot would have done and compares those decisions against later prices before live trust.
 - Backtest runs a lightweight historical sanity check over loaded price histories.
 - Data Confidence scores quote, news, account, market-clock, and order-health inputs before execution.
+
+The Settings tab also includes a Private Beta check. It verifies local readiness items such as setup completion, Alpaca paper mode, release DMG/checksum presence, tests directory presence, and risk disclosure text. Passing this check does not mean a strategy is profitable; it only means the local install is better prepared for trusted paper-testers.
+
+Private beta and live-readiness panels also track paper evidence: market sessions captured, broker order attempts, rejection rate, drawdown, win rate, and net paper P/L. Live mode stays locked until setup diagnostics pass, the risk acknowledgement is recorded, and paper evidence clears the local thresholds.
 
 ## Alpaca Autopilot
 
@@ -159,6 +171,15 @@ When Bonehawk is open, the background paper loop auto-runs Scan + Run Paper ever
 
 Live Alpaca autopilot is locked behind two gates: `mode=live` requires `LIVE_ALPACA_AUTOPILOT`, and `allow_live=true` requires `ALLOW_LIVE_ALPACA`.
 
+Live mode also applies a dynamic exposure ceiling before any buy order reaches Alpaca. The cap is derived from available cash, portfolio value, probability, edge, and current open exposure; sell/exit orders remain allowed so the bot can reduce risk.
+
+The Settings hardening panel exposes:
+
+- `Paper Evidence`: proof collected from local Order Truth and trade outcome logs.
+- `Live Readiness`: the live-mode lock report.
+- `Operational Health`: setup, data, market clock, background loop, and order-health status.
+- `Public Release`: DMG/checksum, packaged smoke, code-signing, notarization, and evidence checks.
+
 ## Desktop App
 
 Run Bonehawk as a desktop app:
@@ -174,6 +195,14 @@ python scripts/build_desktop_app.py
 ```
 
 The build output is `dist/Bonehawk.app`. The desktop app icon lives at `assets/app_icon.png`, with the macOS bundle icon generated at `assets/app_icon.icns`.
+
+Run the packaged smoke check after building:
+
+```bash
+python scripts/packaged_smoke.py
+```
+
+The public-release gate expects `logs/packaged_smoke.json` to pass and `dist/notarization.json` to show a signed, accepted notarization receipt. Bonehawk cannot create Apple signing credentials for you; use your Apple Developer certificate and notarization workflow, then save the receipt.
 
 ## Settings Commands
 

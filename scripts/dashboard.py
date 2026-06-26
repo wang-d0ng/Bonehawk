@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.alpaca_connector import AlpacaConfig, AlpacaOrderRequest, AlpacaTradingClient, alpaca_order_fill_snapshot
+from scripts.alpaca_connector import LIVE_CONFIRM_PHRASE, AlpacaConfig, AlpacaOrderRequest, AlpacaTradingClient, alpaca_order_fill_snapshot
 from scripts.autopilot import AutopilotConfig, AutopilotEngine, load_autopilot_config, save_autopilot_config, update_autopilot_config
 from scripts.command_center import command_catalog, run_command
 from scripts.decision_log import latest_decisions, record_decisions
@@ -29,7 +29,16 @@ from scripts.market_universe import combine_symbols, load_market_universe, marke
 from scripts.market_hours import evaluate_market_hours_gate, market_hours_state_after_gate
 from scripts.postmortem_report import apply_loss_postmortem_report, build_loss_postmortem_report
 from scripts.portfolio_sync import portfolio_sync_snapshot
+from scripts.private_beta_check import build_private_beta_report
 from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfolio_performance
+from scripts.readiness import (
+    build_live_readiness_report,
+    build_operational_health_report,
+    build_paper_evidence_report,
+    build_public_release_report,
+    record_risk_acknowledgement,
+    risk_acknowledgement_status,
+)
 from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
 from scripts.trading_desk import (
     build_backtest,
@@ -45,6 +54,7 @@ from scripts.trading_desk import (
 UI_THEME_VALUES = {"retro", "clean", "arcade", "classic", "algo-desk"}
 BACKGROUND_AUTOPILOT_INTERVAL_SECONDS = 10
 MARKET_HOURS_STATE_FILE = Path("state") / "autopilot_market_hours.json"
+EMERGENCY_LIQUIDATE_CONFIRM_PHRASE = "LIQUIDATE_ALL_POSITIONS"
 SETUP_SECRET_KEYS = {
     "ALPACA_API_KEY",
     "ALPACA_SECRET_KEY",
@@ -85,6 +95,7 @@ class DashboardService:
         self._background_last_started_at = ""
         self._background_last_finished_at = ""
         self._ticket_refresh_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._last_order_reconciliation: dict[str, Any] = _empty_reconciliation_report()
 
     def status(self) -> dict[str, Any]:
         env = _read_env_presence(self.root / ".env")
@@ -134,7 +145,8 @@ class DashboardService:
         env = _read_env_presence(self.root / ".env")
         autopilot_path = self.root / "config" / "autopilot.json"
         alpaca_ready = env.get("ALPACA_API_KEY") == "set" and env.get("ALPACA_SECRET_KEY") == "set"
-        complete = alpaca_ready and autopilot_path.exists() and env.get("BONEHAWK_SETUP_COMPLETE") == "true"
+        risk_ack = risk_acknowledgement_status(self.root)
+        complete = alpaca_ready and autopilot_path.exists() and bool(risk_ack.get("accepted")) and env.get("BONEHAWK_SETUP_COMPLETE") == "true"
         return {
             "ok": True,
             "required": not complete,
@@ -152,8 +164,57 @@ class DashboardService:
                     "status": "set" if env.get("TELEGRAM_BOT_TOKEN") == "set" and env.get("ALLOWED_CHAT_IDS") == "set" else "optional",
                     "message": "Telegram alerts are optional.",
                 },
+                "risk_acknowledgement": {
+                    "status": "set" if risk_ack.get("accepted") else "missing",
+                    "message": "Required acknowledgement that automated trading is not financial advice and can lose money.",
+                },
             },
             "env": {key: env.get(key, "missing") for key in sorted(env) if key in SETUP_SECRET_KEYS or key.startswith("ALPACA_") or key == "BONEHAWK_SETUP_COMPLETE"},
+        }
+
+    def setup_diagnostics(self) -> dict[str, Any]:
+        env = _read_env_presence(self.root / ".env")
+        autopilot_path = self.root / "config" / "autopilot.json"
+        client = self._alpaca_client()
+        checks: dict[str, dict[str, Any]] = {
+            "alpaca_keys": _diagnostic_check(
+                env.get("ALPACA_API_KEY") == "set" and env.get("ALPACA_SECRET_KEY") == "set",
+                "Alpaca keys are present.",
+                "Add Alpaca paper API key and secret in setup.",
+            ),
+            "autopilot_config": _diagnostic_check(
+                autopilot_path.exists(),
+                "Autopilot config exists.",
+                "Create config/autopilot.json through setup.",
+            ),
+            "telegram": _diagnostic_check(
+                env.get("TELEGRAM_BOT_TOKEN") == "set" and env.get("ALLOWED_CHAT_IDS") == "set",
+                "Telegram command channel is configured.",
+                "Telegram is optional; add TELEGRAM_BOT_TOKEN and ALLOWED_CHAT_IDS to use phone controls.",
+                warn=True,
+            ),
+            "risk_disclosure": _diagnostic_check(
+                _risk_disclosure_present(self.root / "README.md"),
+                "Risk disclosure is present.",
+                "README.md must clearly say this is not financial advice and that trading can lose money.",
+            ),
+            "live_mode": _diagnostic_check(
+                env.get("ALPACA_PAPER", "true") != "false" and env.get("ALPACA_ALLOW_LIVE", "false") not in {"true", "1", "yes", "on"},
+                "Live trading is disabled.",
+                "Set ALPACA_PAPER=true and ALPACA_ALLOW_LIVE=false for private beta testing.",
+            ),
+        }
+        checks["alpaca_account"] = self._diagnose_alpaca_account(client)
+        checks["market_clock"] = self._diagnose_market_clock(client)
+        checks["market_calendar"] = self._diagnose_market_calendar(client)
+        summary = _diagnostic_summary(checks)
+        return {
+            "ok": summary["failed"] == 0,
+            "status": "ready" if summary["failed"] == 0 else "needs_attention",
+            "summary": summary,
+            "checks": checks,
+            "env": {key: env.get(key, "missing") for key in sorted(env) if key in SETUP_SECRET_KEYS or key.startswith("ALPACA_") or key == "BONEHAWK_SETUP_COMPLETE"},
+            "message": "Setup diagnostics completed without exposing secret values.",
         }
 
     def apply_setup(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -175,6 +236,7 @@ class DashboardService:
         _write_env_value(env_path, "ALPACA_ALLOW_LIVE", "false")
         _write_env_value(env_path, "TRADING_MODE", "paper")
         _write_env_value(env_path, "BONEHAWK_SETUP_COMPLETE", "true")
+        record_risk_acknowledgement(self.root, accepted=True, actor="setup")
 
         autopilot_path = self.root / "config" / "autopilot.json"
         existing = load_autopilot_config(autopilot_path)
@@ -383,6 +445,17 @@ class DashboardService:
         config = load_autopilot_config(path)
         next_config, payload = update_autopilot_config(config, setting, value, confirm=confirm)
         if payload.get("ok"):
+            if str(setting or "").strip() in {"mode", "allow_live"} and (str(value).strip().lower() == "live" or _setup_bool(value, default=False)):
+                readiness = self.live_readiness()
+                if not readiness.get("ok"):
+                    return {
+                        "ok": False,
+                        "status": "live_readiness_locked",
+                        "message": readiness.get("message", "Live readiness checks are locked."),
+                        "config": config.snapshot(),
+                        "live_readiness": readiness,
+                    }
+                payload["live_readiness"] = readiness
             save_autopilot_config(path, next_config)
             payload["config"] = next_config.snapshot()
             if str(setting or "").strip() == "enabled" and not next_config.enabled:
@@ -562,6 +635,66 @@ class DashboardService:
         )
         return result
 
+    def emergency_liquidate(self, confirm: str = "") -> dict[str, Any]:
+        if str(confirm or "").strip() != EMERGENCY_LIQUIDATE_CONFIRM_PHRASE:
+            return {
+                "ok": False,
+                "status": "confirmation_required",
+                "confirm_phrase": EMERGENCY_LIQUIDATE_CONFIRM_PHRASE,
+                "message": "Emergency liquidation requires typed confirmation.",
+            }
+        config_path = self.root / "config" / "autopilot.json"
+        config = load_autopilot_config(config_path)
+        save_autopilot_config(config_path, replace(config, enabled=False))
+        self.stop_autopilot_background()
+        client = self._alpaca_client()
+        cancel_result = client.cancel_all_orders() if hasattr(client, "cancel_all_orders") else {"ok": False, "status": "unsupported", "message": "Cancel-all is not available for this broker client."}
+        try:
+            positions = client.get_positions()
+        except Exception as error:
+            return {
+                "ok": False,
+                "status": "positions_unavailable",
+                "cancel_result": cancel_result,
+                "message": "Could not load positions for emergency liquidation.",
+                "detail": _safe_error_message(error),
+            }
+        submitted: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for position in positions:
+            liquidation = _liquidation_position(position)
+            if not liquidation["can_sell"]:
+                skipped.append(liquidation)
+                continue
+            order = AlpacaOrderRequest(symbol=liquidation["symbol"], side="sell", quantity=liquidation["quantity"], order_type="market", time_in_force="day")
+            result = client.place_order(order, confirm=LIVE_CONFIRM_PHRASE)
+            row = {
+                **result,
+                "symbol": result.get("symbol") or liquidation["symbol"],
+                "side": result.get("side") or "SELL",
+                "quantity": result.get("quantity") or liquidation["quantity"],
+                "action": "EMERGENCY_LIQUIDATE",
+                "reason": result.get("message") or "Emergency liquidation order submitted.",
+            }
+            submitted.append(row)
+            record_order_truth_event(self.root, "emergency_liquidation", row)
+            record_trade_journal_entry(self.root, "emergency_liquidation", {"symbol": liquidation["symbol"], "side": "sell", "action": "EMERGENCY_LIQUIDATE", "reason": "Emergency liquidation requested.", "quantity": liquidation["quantity"]}, row)
+        record_decisions(self.root / "logs" / "decision_log.jsonl", "emergency_liquidation", submitted + skipped)
+        rejected = [item for item in submitted if not item.get("ok")]
+        return {
+            "ok": not rejected,
+            "status": "liquidation_submitted" if submitted else "no_sellable_positions",
+            "cancel_result": cancel_result,
+            "submitted": submitted,
+            "skipped": skipped,
+            "summary": {
+                "submitted": len([item for item in submitted if item.get("ok")]),
+                "rejected": len(rejected),
+                "skipped": len(skipped),
+            },
+            "message": "Autopilot stopped, open orders canceled when supported, and sell orders submitted for available positions.",
+        }
+
     def tickets(self) -> dict[str, Any]:
         rows = latest_decisions(self.root / "logs" / "decision_log.jsonl", limit=200)
         tickets = [_ticket_from_decision(row) for row in rows]
@@ -586,8 +719,74 @@ class DashboardService:
                 "last_error": background.get("last_error"),
                 "last_finished_at": background.get("last_finished_at"),
             },
+            "reconciliation": self._last_order_reconciliation,
             "message": "Live View is watching recent buy/sell tickets and Alpaca broker responses.",
         }
+
+    def reconcile_orders(self, limit: Any = 80) -> dict[str, Any]:
+        limit_value = int(max(1, min(250, _safe_float(limit, 80))))
+        snapshot = order_truth_snapshot(self.root, limit=limit_value)
+        refreshable = _refreshable_order_events(snapshot.get("current") or snapshot.get("active") or [])
+        if not refreshable:
+            report = {
+                "ok": True,
+                "status": "nothing_to_reconcile",
+                "checked_at": datetime.now(UTC).isoformat(),
+                "summary": {"checked": 0, "refreshed": 0, "failed": 0, "terminal": 0, "active": len(snapshot.get("active") or [])},
+                "refreshed": [],
+                "failed": [],
+                "order_truth": snapshot,
+                "message": "No active Alpaca broker orders need reconciliation.",
+            }
+            self._last_order_reconciliation = _reconciliation_public_summary(report)
+            return report
+        client = self._alpaca_client()
+        if not hasattr(client, "get_order"):
+            report = {
+                "ok": False,
+                "status": "unsupported",
+                "checked_at": datetime.now(UTC).isoformat(),
+                "summary": {"checked": 0, "refreshed": 0, "failed": 0, "terminal": 0, "active": len(snapshot.get("active") or [])},
+                "refreshed": [],
+                "failed": [],
+                "order_truth": snapshot,
+                "message": "The current broker client does not support order status lookup.",
+            }
+            self._last_order_reconciliation = _reconciliation_public_summary(report)
+            return report
+
+        refreshed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for event in refreshable[:12]:
+            order_id = str(event.get("broker_order_id") or "").strip()
+            try:
+                order = client.get_order(order_id)
+            except Exception as error:
+                failed.append({"broker_order_id": order_id, "symbol": event.get("symbol"), "message": _safe_error_message(error)})
+                continue
+            row = _truth_row_with_alpaca_order(event, order)
+            refreshed.append(record_order_truth_event(self.root, "alpaca_order_reconcile", row))
+
+        next_snapshot = order_truth_snapshot(self.root, limit=limit_value)
+        terminal = [item for item in refreshed if item.get("stage") in {"filled", "rejected", "canceled"}]
+        report = {
+            "ok": not failed,
+            "status": "reconciled" if refreshed else "reconcile_failed",
+            "checked_at": datetime.now(UTC).isoformat(),
+            "summary": {
+                "checked": len(refreshable[:12]),
+                "refreshed": len(refreshed),
+                "failed": len(failed),
+                "terminal": len(terminal),
+                "active": len(next_snapshot.get("active") or []),
+            },
+            "refreshed": refreshed,
+            "failed": failed,
+            "order_truth": next_snapshot,
+            "message": "Active Alpaca order statuses refreshed.",
+        }
+        self._last_order_reconciliation = _reconciliation_public_summary(report)
+        return report
 
     def loss_postmortem_report(self, window_hours: Any = 24) -> dict[str, Any]:
         hours = int(max(1, min(168, _safe_float(window_hours, 24))))
@@ -681,6 +880,28 @@ class DashboardService:
             "backtest": build_backtest(histories),
             "message": "Trading desk snapshot updated.",
         }
+
+    def private_beta_check(self) -> dict[str, Any]:
+        return build_private_beta_report(self.root, version=_project_version(self.root / "pyproject.toml"))
+
+    def paper_evidence(self) -> dict[str, Any]:
+        return build_paper_evidence_report(self.root)
+
+    def live_readiness(self) -> dict[str, Any]:
+        return build_live_readiness_report(self.root, diagnostics=self.setup_diagnostics())
+
+    def public_release_readiness(self) -> dict[str, Any]:
+        return build_public_release_report(self.root, version=_project_version(self.root / "pyproject.toml"))
+
+    def operational_health(self) -> dict[str, Any]:
+        config, market_gate = self._sync_autopilot_market_hours(load_autopilot_config(self.root / "config" / "autopilot.json"))
+        return build_operational_health_report(
+            self.root,
+            setup_diagnostics=self.setup_diagnostics(),
+            trading_desk=self.trading_desk(),
+            background=self.autopilot_background_status(),
+            market_hours=market_gate,
+        )
 
     def _market_trend(self) -> str:
         try:
@@ -790,6 +1011,32 @@ class DashboardService:
         if next_config.enabled != config.enabled:
             gate = {**gate, "autopilot_enabled_before": config.enabled, "autopilot_enabled_after": next_config.enabled}
         return next_config, gate
+
+    def _diagnose_alpaca_account(self, client: Any) -> dict[str, Any]:
+        try:
+            account = client.get_account()
+        except Exception as error:
+            return _diagnostic_check(False, "", f"Alpaca account check failed. Check key pair and paper/live mode. Detail: {_safe_error_message(error)}")
+        return _diagnostic_check(bool(account), "Alpaca account is reachable.", "Alpaca returned an empty account payload.")
+
+    def _diagnose_market_clock(self, client: Any) -> dict[str, Any]:
+        if not hasattr(client, "get_clock"):
+            return _diagnostic_check(False, "", "Alpaca clock is unavailable for this connector.", warn=True)
+        try:
+            clock = client.get_clock()
+        except Exception as error:
+            return _diagnostic_check(False, "", f"Market clock check failed. Detail: {_safe_error_message(error)}", warn=True)
+        return _diagnostic_check(bool(clock), "Alpaca market clock is reachable.", "Alpaca returned an empty market clock.", warn=True)
+
+    def _diagnose_market_calendar(self, client: Any) -> dict[str, Any]:
+        if not hasattr(client, "get_calendar"):
+            return _diagnostic_check(False, "", "Alpaca calendar is unavailable for this connector.", warn=True)
+        today = datetime.now(UTC).date()
+        try:
+            calendar = client.get_calendar(today.isoformat(), (today + timedelta(days=14)).isoformat())
+        except Exception as error:
+            return _diagnostic_check(False, "", f"Market calendar check failed. Detail: {_safe_error_message(error)}", warn=True)
+        return _diagnostic_check(bool(calendar), "Alpaca market calendar is reachable.", "Alpaca returned no upcoming trading sessions.", warn=True)
 
     def _autopilot_engine(self, config: AutopilotConfig | None = None) -> AutopilotEngine:
         return AutopilotEngine(
@@ -921,6 +1168,18 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 self._send(*json_response(service.status()))
             elif path == "/api/setup-status":
                 self._send(*json_response(service.setup_status()))
+            elif path == "/api/setup-diagnostics":
+                self._send(*json_response(service.setup_diagnostics()))
+            elif path == "/api/private-beta-check":
+                self._send(*json_response(service.private_beta_check()))
+            elif path == "/api/paper-evidence":
+                self._send(*json_response(service.paper_evidence()))
+            elif path == "/api/live-readiness":
+                self._send(*json_response(service.live_readiness()))
+            elif path == "/api/operational-health":
+                self._send(*json_response(service.operational_health()))
+            elif path == "/api/public-release-readiness":
+                self._send(*json_response(service.public_release_readiness()))
             elif path == "/api/market-intel":
                 self._send(*json_response(service.market_intel()))
             elif path == "/api/portfolio-sync":
@@ -1054,6 +1313,24 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 result = service.stock_order(payload.get("symbol"), payload.get("side"), payload.get("quantity"), confirm=str(payload.get("confirm", "")))
                 status = 200 if result.get("ok") else 409 if result.get("status") in {"confirmation_required", "live_not_allowed", "not_configured"} else 400
                 self._send(*json_response(result, status=status))
+            elif self.path == "/api/emergency-liquidate":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.emergency_liquidate(confirm=str(payload.get("confirm", "")))
+                status = 200 if result.get("ok") else 409 if result.get("status") == "confirmation_required" else 400
+                self._send(*json_response(result, status=status))
+            elif self.path == "/api/reconcile-orders":
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send(*json_response({"ok": False, "status": "bad_request", "message": str(error)}, status=400))
+                    return
+                result = service.reconcile_orders(limit=payload.get("limit", 80))
+                status = 200 if result.get("ok") else 400
+                self._send(*json_response(result, status=status))
             elif self.path == "/api/postmortem-apply":
                 try:
                     payload = self._read_json_body()
@@ -1130,6 +1407,65 @@ def _write_json_object(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _diagnostic_check(ok: bool, message: str, recovery: str, *, warn: bool = False) -> dict[str, Any]:
+    status = "pass" if ok else "warn" if warn else "fail"
+    return {
+        "status": status,
+        "message": message if ok else recovery,
+        "recovery": "" if ok else recovery,
+    }
+
+
+def _diagnostic_summary(checks: dict[str, dict[str, Any]]) -> dict[str, int]:
+    return {
+        "passed": sum(1 for check in checks.values() if check.get("status") == "pass"),
+        "warn": sum(1 for check in checks.values() if check.get("status") == "warn"),
+        "failed": sum(1 for check in checks.values() if check.get("status") == "fail"),
+        "total": len(checks),
+    }
+
+
+def _risk_disclosure_present(path: Path) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8").lower()
+    return "not financial advice" in text and "can lose money" in text
+
+
+def _safe_error_message(error: Exception) -> str:
+    return str(error)[:300]
+
+
+def _liquidation_position(position: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(position.get("symbol") or "").upper()
+    held_quantity = abs(_safe_float(position.get("qty")))
+    raw_available = position.get("qty_available")
+    available_quantity = abs(_safe_float(raw_available, held_quantity)) if raw_available not in {None, ""} else held_quantity
+    quantity = round(min(held_quantity, available_quantity), 8)
+    can_sell = bool(symbol and quantity > 0)
+    return {
+        "symbol": symbol,
+        "side": "sell",
+        "action": "EMERGENCY_LIQUIDATE" if can_sell else "EMERGENCY_SKIP_RESERVED",
+        "quantity": quantity,
+        "held_quantity": round(held_quantity, 8),
+        "available_quantity": quantity,
+        "status": "planned" if can_sell else "skipped",
+        "reason": "Sellable position found for emergency liquidation." if can_sell else "No available shares to sell; the position may already be reserved by open orders.",
+        "can_sell": can_sell,
+        "review_only": True,
+    }
+
+
+def _project_version(path: Path) -> str:
+    if not path.exists():
+        return ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("version") and "=" in line:
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
 def _read_env_presence(path: Path) -> dict[str, str]:
     keys = {
         "TELEGRAM_BOT_TOKEN": "missing",
@@ -1162,6 +1498,12 @@ def _ui_theme_from_env(env: dict[str, str]) -> str:
 
 
 def _validate_setup_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not _setup_bool(payload.get("risk_acknowledged"), default=False):
+        return {
+            "ok": False,
+            "status": "invalid_setup",
+            "message": "Risk acknowledgement is required before Bonehawk setup can complete.",
+        }
     for key in ("alpaca_api_key", "alpaca_secret_key", "telegram_bot_token", "allowed_chat_ids"):
         value = payload.get(key)
         if value is not None and len(str(value)) > 4096:
@@ -1187,7 +1529,7 @@ def _setup_bool(value: Any, default: bool) -> bool:
 def _ticket_from_decision(row: dict[str, Any]) -> dict[str, Any] | None:
     source = str(row.get("source") or "")
     action = str(row.get("action") or "")
-    ticket_sources = {"stock_order_intent", "alpaca_stock_order", "stock_order_attempt", "autopilot_order"}
+    ticket_sources = {"stock_order_intent", "alpaca_stock_order", "stock_order_attempt", "autopilot_order", "emergency_liquidation"}
     if source not in ticket_sources and "_INTENT" not in action and "_LIVE" not in action and "_ALPACA" not in action:
         return None
     status = str(row.get("status") or "").strip().lower()
@@ -1230,6 +1572,63 @@ def _ticket_with_alpaca_order(ticket: dict[str, Any], order: dict[str, Any]) -> 
         "filled_average_price": fill["filled_average_price"],
         "fill_status": fill_status,
         "message": _refreshed_order_message(fill_status, ticket.get("message")),
+    }
+
+
+def _empty_reconciliation_report() -> dict[str, Any]:
+    return {
+        "status": "not_run",
+        "checked_at": "",
+        "summary": {"checked": 0, "refreshed": 0, "failed": 0, "terminal": 0, "active": 0},
+    }
+
+
+def _reconciliation_public_summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": report.get("status", "unknown"),
+        "checked_at": report.get("checked_at", ""),
+        "summary": report.get("summary") or {},
+    }
+
+
+def _refreshable_order_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    refreshable: list[dict[str, Any]] = []
+    for event in events:
+        order_id = str(event.get("broker_order_id") or "").strip()
+        if not order_id or order_id in seen or bool(event.get("review_only", True)):
+            continue
+        stage = str(event.get("stage") or "").lower()
+        fill_status = str(event.get("fill_status") or "").lower()
+        broker_status = str(event.get("broker_status") or "").lower()
+        if stage in {"filled", "rejected", "canceled"} or fill_status in {"filled", "rejected", "canceled", "cancelled", "expired"} or broker_status in {"filled", "rejected", "canceled", "cancelled", "expired"}:
+            continue
+        seen.add(order_id)
+        refreshable.append(event)
+    return refreshable
+
+
+def _truth_row_with_alpaca_order(event: dict[str, Any], order: dict[str, Any]) -> dict[str, Any]:
+    fill = alpaca_order_fill_snapshot(order)
+    fill_status = fill["fill_status"]
+    return {
+        "symbol": order.get("symbol") or event.get("symbol"),
+        "side": event.get("side") or order.get("side"),
+        "action": event.get("action") or "ALPACA_ORDER_RECONCILE",
+        "status": event.get("status") or "submitted",
+        "broker_status": order.get("status") or event.get("broker_status"),
+        "broker_order_id": order.get("id") or event.get("broker_order_id"),
+        "client_order_id": order.get("client_order_id") or event.get("client_order_id"),
+        "quantity": _safe_float(order.get("qty"), _safe_float(event.get("quantity"))),
+        "notional": event.get("notional"),
+        "current_price": event.get("current_price"),
+        "filled_quantity": fill["filled_quantity"],
+        "filled_average_price": fill["filled_average_price"],
+        "fill_status": fill_status,
+        "scheduled_for_market_open": event.get("scheduled_for_market_open"),
+        "target_fill_time": event.get("target_fill_time"),
+        "message": _refreshed_order_message(fill_status, event.get("reason")),
+        "review_only": False,
     }
 
 
@@ -1278,8 +1677,11 @@ def _live_order_event(ticket: dict[str, Any]) -> dict[str, Any]:
 
 def _live_order_category(status: str, broker_status: str, fill_status: str, has_order_id: bool) -> str:
     rejected_statuses = {"rejected", "not_configured", "live_not_allowed", "confirmation_required", "invalid_symbol", "invalid_side", "invalid_quantity", "invalid_size"}
+    canceled_statuses = {"canceled", "cancelled", "expired", "done_for_day"}
     if fill_status == "filled" or broker_status == "filled":
         return "filled"
+    if fill_status in canceled_statuses or broker_status in canceled_statuses or status in canceled_statuses:
+        return "canceled"
     if status in rejected_statuses or broker_status == "rejected":
         return "rejected"
     if has_order_id or status in {"submitted", "accepted", "new"}:
@@ -1290,14 +1692,14 @@ def _live_order_category(status: str, broker_status: str, fill_status: str, has_
 
 
 def _live_order_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
-    categories = {"submitted": 0, "rejected": 0, "filled": 0, "recorded": 0, "blocked": 0, "unknown": 0}
+    categories = {"submitted": 0, "rejected": 0, "filled": 0, "canceled": 0, "recorded": 0, "blocked": 0, "unknown": 0}
     for event in events:
         category = str(event.get("category") or "unknown")
         categories[category if category in categories else "unknown"] += 1
     categories["total"] = len(events)
     categories["flow"] = [
         {"category": category, "count": categories[category], "pct": round((categories[category] / len(events)) * 100, 1) if events else 0}
-        for category in ("rejected", "filled", "submitted", "recorded", "blocked", "unknown")
+        for category in ("rejected", "canceled", "filled", "submitted", "recorded", "blocked", "unknown")
         if categories[category]
     ]
     return categories
@@ -1307,6 +1709,7 @@ def _live_order_progress(category: str) -> int:
     return {
         "filled": 100,
         "rejected": 100,
+        "canceled": 100,
         "submitted": 62,
         "recorded": 35,
         "blocked": 18,
@@ -2552,7 +2955,10 @@ HTML = """
       <section id="live-panel" class="tab-panel">
         <div class="section-head">
           <h2>Live Order View</h2>
-          <div id="live-order-status" class="muted"></div>
+          <div class="toolbar" style="justify-content:flex-end">
+            <div id="live-order-status" class="muted"></div>
+            <button data-action onclick="runOrderReconciliation()">Reconcile</button>
+          </div>
         </div>
         <div class="live-grid">
           <div class="panel-block">
@@ -2596,6 +3002,17 @@ HTML = """
           <div class="panel-block">
             <h2>Autopilot Controls</h2>
             <div id="autopilot-settings" class="data-list"></div>
+          </div>
+          <div class="panel-block">
+            <h2>Private Beta Hardening</h2>
+            <div class="panel-sub">Setup recovery, release readiness, and emergency exit controls.</div>
+            <div class="toolbar" style="justify-content:flex-start;margin:10px 0">
+              <button data-action onclick="runSetupDiagnostics()">Diagnostics</button>
+              <button data-action onclick="runPrivateBetaCheck()">Beta Check</button>
+              <button data-action onclick="runOrderReconciliation()">Reconcile Orders</button>
+              <button data-action class="danger" onclick="runEmergencyLiquidation()">Liquidate</button>
+            </div>
+            <div id="hardening-status" class="data-list"></div>
           </div>
           <div class="panel-block">
             <h2>Interface</h2>
@@ -2652,6 +3069,11 @@ HTML = """
             <input id="setup-chat-ids" type="text" autocomplete="off" placeholder="Optional comma-separated IDs">
           </label>
         </div>
+        <label class="setup-field">
+          <input id="setup-risk-acknowledged" type="checkbox">
+          Risk acknowledgement
+          <span class="muted">I understand Bonehawk is not financial advice, automated trading can lose money, and live mode is my responsibility.</span>
+        </label>
         <div class="setup-actions">
           <button type="button" onclick="hideSetupModal()">Skip for now</button>
           <button type="submit" class="primary" data-action>Save Setup</button>
@@ -2720,7 +3142,7 @@ HTML = """
     let setupDismissed = false;
     let lastBackgroundRunRendered = 0;
     let lastPostmortemReportId = '';
-    const ESSENTIAL_COMMAND_IDS = new Set(['telegram-test', 'telegram-autopilot-once', 'telegram-autopilot-loop', 'daily-loop', 'pytest']);
+    const ESSENTIAL_COMMAND_IDS = new Set(['telegram-test', 'telegram-autopilot-once', 'telegram-autopilot-loop', 'daily-loop', 'pytest', 'packaged-smoke']);
 
     async function getJson(url, options) {
       const res = await fetch(url, options);
@@ -2893,8 +3315,16 @@ HTML = """
       window.localStorage.setItem('bonehawk-sidebar-collapsed', 'false');
     }
     async function refreshStatus() {
-      const data = await getJson('/api/status');
-      const setup = await getJson('/api/setup-status');
+      const [data, setup, diagnostics, beta, paperEvidence, liveReadiness, publicRelease, operationalHealth] = await Promise.all([
+        getJson('/api/status'),
+        getJson('/api/setup-status'),
+        getJson('/api/setup-diagnostics'),
+        getJson('/api/private-beta-check'),
+        getJson('/api/paper-evidence'),
+        getJson('/api/live-readiness'),
+        getJson('/api/public-release-readiness'),
+        getJson('/api/operational-health')
+      ]);
       const mode = String(data.mode || 'unknown');
       document.getElementById('rail-mode').textContent = `Mode ${mode}`;
       document.getElementById('market-state').textContent = `Market data live · mode ${mode.toUpperCase()}`;
@@ -2905,6 +3335,7 @@ HTML = """
       applyUiTheme(data.ui_theme || data.env?.BONEHAWK_UI_THEME || 'retro');
       document.getElementById('status').innerHTML = Object.entries(data.env).map(([k,v]) => row(escapeHtml(k), '', pill(v))).join('');
       renderUiThemeSettings(data);
+      renderHardeningStatus(diagnostics, beta, paperEvidence, liveReadiness, publicRelease, operationalHealth);
       renderSetupModal(setup);
     }
     function renderSetupModal(data) {
@@ -2937,7 +3368,8 @@ HTML = """
         telegram_bot_token: document.getElementById('setup-telegram-token').value,
         allowed_chat_ids: document.getElementById('setup-chat-ids').value,
         autopilot_enabled: true,
-        max_open_positions: document.getElementById('setup-max-open-positions').value
+        max_open_positions: document.getElementById('setup-max-open-positions').value,
+        risk_acknowledged: document.getElementById('setup-risk-acknowledged').checked
       };
       await runAction('Saving setup...', async () => {
         const data = await getJson('/api/setup', {
@@ -3531,6 +3963,8 @@ HTML = """
       const events = data.events || [];
       const summary = data.summary || {};
       const background = data.background || {};
+      const reconciliation = data.reconciliation || {};
+      const reconcileSummary = reconciliation.summary || {};
       const statusNode = document.getElementById('live-order-status');
       if (!statusNode) return;
       const total = summary.total ?? events.length;
@@ -3539,6 +3973,7 @@ HTML = """
         liveMiniCard('Filled', summary.filled || 0, 'complete', 'filled'),
         liveMiniCard('Open', summary.submitted || 0, 'submitted', 'submitted'),
         liveMiniCard('Rejected', summary.rejected || 0, 'blocked', 'rejected'),
+        liveMiniCard('Canceled', summary.canceled || 0, 'closed', 'canceled'),
         liveMiniCard('Tickets', summary.recorded || 0, 'review only', 'recorded')
       ].join('');
       const flow = summary.flow || [];
@@ -3551,6 +3986,7 @@ HTML = """
       document.getElementById('live-order-background').innerHTML = [
         liveSideCard('Loop', background.running ? 'Background scan and paper run is active.' : 'Background scan and paper run is stopped.', pill(background.status || 'unknown', background.running ? 'buy' : 'trim')),
         liveSideCard('Runs', `${background.runs || 0} completed`, background.last_finished_at ? escapeHtml(background.last_finished_at) : ''),
+        liveSideCard('Reconcile', `${reconcileSummary.refreshed || 0} refreshed · ${reconcileSummary.terminal || 0} terminal`, reconciliation.checked_at ? escapeHtml(reconciliation.checked_at) : 'Not run yet.'),
         background.last_error ? liveSideCard('Last error', background.last_error, pill('error', 'sell')) : liveSideCard('Last error', 'No background loop error reported.', pill('clear', 'buy'))
       ].join('');
     }
@@ -3615,7 +4051,7 @@ HTML = """
       const value = String(category || '').toLowerCase();
       if (value === 'submitted' || value === 'filled' || value === 'recorded') return 'buy';
       if (value === 'rejected') return 'sell';
-      if (value === 'blocked') return 'trim';
+      if (value === 'blocked' || value === 'canceled') return 'trim';
       return 'quiet';
     }
     async function refreshLiveOrders() {
@@ -3851,6 +4287,23 @@ HTML = """
     function renderSettings(data) {
       document.getElementById('capabilities').innerHTML = Object.entries(data.capabilities || {}).map(([key, value]) => row(escapeHtml(key), escapeHtml(value))).join('');
     }
+    function renderHardeningStatus(diagnostics, beta, paperEvidence = {}, liveReadiness = {}, publicRelease = {}, operationalHealth = {}) {
+      const diagnosticSummary = diagnostics.summary || {};
+      const betaSummary = beta.summary || {};
+      const paperSummary = paperEvidence.summary || {};
+      const publicSummary = publicRelease.summary || {};
+      const operationalSummary = operationalHealth.summary || {};
+      document.getElementById('hardening-status').innerHTML = [
+        row('Setup diagnostics', `${diagnosticSummary.passed || 0} pass · ${diagnosticSummary.warn || 0} warn · ${diagnosticSummary.failed || 0} fail`, pill(diagnostics.status || 'unknown', diagnostics.ok ? 'buy' : 'trim')),
+        row('Private beta', `${betaSummary.passed || 0} pass · ${betaSummary.warn || 0} warn · ${betaSummary.failed || 0} fail`, pill(beta.status || 'unknown', beta.ok ? 'buy' : 'sell')),
+        row('Paper Evidence', `${paperSummary.market_sessions || 0} sessions · ${paperSummary.submitted || 0} orders · ${Number(paperSummary.rejection_rate_pct || 0).toFixed(1)}% rejected`, pill(paperEvidence.status || 'collecting', paperEvidence.ok ? 'buy' : 'trim')),
+        row('Live Readiness', liveReadiness.message || 'Live readiness not checked yet.', pill(liveReadiness.status || 'locked', liveReadiness.ok ? 'buy' : 'sell')),
+        row('Public Release', `${publicSummary.passed || 0} pass · ${publicSummary.failed || 0} fail`, pill(publicRelease.status || 'not_ready', publicRelease.ok ? 'buy' : 'trim')),
+        row('Operational Health', `${operationalSummary.passed || 0} pass · ${operationalSummary.failed || 0} fail`, pill(operationalHealth.status || 'unknown', operationalHealth.ok ? 'buy' : 'trim')),
+        row('Order reconciliation', 'Refreshes active Alpaca order IDs into the order truth stream.', pill('manual', 'quiet')),
+        row('Emergency exit', 'Requires LIQUIDATE_ALL_POSITIONS and disables autopilot before sell orders.', pill('guarded', 'sell'))
+      ].join('');
+    }
     function normalizeUiTheme(theme) {
       const value = String(theme || 'retro').toLowerCase();
       return ['retro', 'clean', 'arcade', 'algo-desk', 'classic'].includes(value) ? value : 'clean';
@@ -3909,6 +4362,54 @@ HTML = """
           settingSwitch([{label: 'Off', value: 'false'}, {label: 'On', value: 'true'}], String(Boolean(config.paper_trade_downtrend)), 'setAutopilotPaperDowntrend')
         )
       ].join('');
+    }
+    async function runSetupDiagnostics() {
+      await runAction('Running setup diagnostics...', async () => {
+        const data = await getJson('/api/setup-diagnostics');
+        document.getElementById('command-output').textContent = JSON.stringify(data, null, 2);
+        setStatus(data.ok ? 'Setup diagnostics passed.' : 'Setup diagnostics need attention.', data.ok ? 'ok' : 'error');
+        const beta = await getJson('/api/private-beta-check');
+        renderHardeningStatus(data, beta);
+      }, false, false);
+    }
+    async function runPrivateBetaCheck() {
+      await runAction('Running private beta readiness check...', async () => {
+        const data = await getJson('/api/private-beta-check');
+        document.getElementById('command-output').textContent = JSON.stringify(data, null, 2);
+        setStatus(data.ok ? 'Private beta check passed.' : 'Private beta check needs attention.', data.ok ? 'ok' : 'error');
+        const diagnostics = await getJson('/api/setup-diagnostics');
+        renderHardeningStatus(diagnostics, data);
+      }, false, false);
+    }
+    async function runOrderReconciliation() {
+      await runAction('Reconciling Alpaca order statuses...', async () => {
+        const data = await getJson('/api/reconcile-orders', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({limit: 120})
+        });
+        document.getElementById('command-output').textContent = JSON.stringify(data, null, 2);
+        setStatus(data.message || 'Order reconciliation finished.', data.ok ? 'ok' : 'error');
+        await refreshTickets();
+        await refreshLiveOrders();
+      }, false, false);
+    }
+    async function runEmergencyLiquidation() {
+      const confirm = window.prompt('Type LIQUIDATE_ALL_POSITIONS to cancel open orders, disable autopilot, and sell all available positions.', '');
+      if (confirm === null) return;
+      await runAction('Submitting emergency liquidation...', async () => {
+        const response = await fetch('/api/emergency-liquidate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({confirm})
+        });
+        const data = await response.json();
+        document.getElementById('command-output').textContent = JSON.stringify(data, null, 2);
+        setStatus(data.message || 'Emergency liquidation handled.', response.ok && data.ok ? 'ok' : 'error');
+        await refreshTickets();
+        await refreshLiveOrders();
+        await refreshStatus();
+      }, true, false);
     }
     function renderCommands(data) {
       const commands = (data.commands || []).filter(command => ESSENTIAL_COMMAND_IDS.has(command.id));

@@ -173,6 +173,53 @@ def test_alpaca_client_get_clock_loads_market_clock() -> None:
     assert payload["next_open"] == "2026-06-26T13:30:00Z"
 
 
+def test_alpaca_client_loads_market_calendar() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://paper-api.alpaca.markets/v2/calendar?start=2026-06-26&end=2026-06-29"
+        return httpx.Response(
+            200,
+            json=[
+                {"date": "2026-06-26", "open": "09:30", "close": "16:00"},
+                {"date": "2026-06-29", "open": "09:30", "close": "16:00"},
+            ],
+        )
+
+    client = AlpacaTradingClient(
+        AlpacaConfig(api_key="key", secret_key="secret", paper=True),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    payload = client.get_calendar("2026-06-26", "2026-06-29")
+
+    assert len(payload) == 2
+    assert payload[0]["date"] == "2026-06-26"
+
+
+def test_alpaca_client_cancels_order_and_all_open_orders() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/v2/orders/order-123":
+            return httpx.Response(204, headers={"X-Request-ID": "cancel-123"})
+        return httpx.Response(200, json=[{"id": "order-1", "status": 200}, {"id": "order-2", "status": 200}])
+
+    client = AlpacaTradingClient(
+        AlpacaConfig(api_key="key", secret_key="secret", paper=True),
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    canceled = client.cancel_order("order-123")
+    all_canceled = client.cancel_all_orders()
+
+    assert calls == ["DELETE /v2/orders/order-123", "DELETE /v2/orders"]
+    assert canceled["ok"] is True
+    assert canceled["status"] == "cancel_requested"
+    assert canceled["request_id"] == "cancel-123"
+    assert all_canceled["ok"] is True
+    assert all_canceled["canceled"] == 2
+
+
 def test_alpaca_client_loads_asset_metadata() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://paper-api.alpaca.markets/v2/assets/AACB"

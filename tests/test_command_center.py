@@ -78,7 +78,7 @@ def test_run_command_status_action_does_not_spawn_process(tmp_path: Path) -> Non
 def test_command_catalog_includes_desktop_actions() -> None:
     ids = {command["id"] for command in command_catalog()["commands"]}
 
-    assert {"desktop-run", "desktop-build"}.issubset(ids)
+    assert {"desktop-run", "desktop-build", "packaged-smoke"}.issubset(ids)
 
 
 def test_redact_output_masks_sensitive_values() -> None:

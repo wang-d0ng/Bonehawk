@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from scripts.alpaca_connector import LIVE_CONFIRM_PHRASE
 from scripts.autopilot import AutopilotConfig, AutopilotEngine, load_autopilot_config
 from scripts.market_intel import Watchlist
 from scripts.quotes import PriceHistory, Quote
@@ -639,6 +640,24 @@ def test_autopilot_live_mode_blocks_downtrend_entries(tmp_path: Path) -> None:
     assert payload["market_trend"] == "DOWN"
     assert payload["orders"] == []
     assert payload["agentic_scan"]["opportunities"] == []
+    assert alpaca.orders == []
+
+
+def test_autopilot_live_mode_blocks_oversized_dynamic_exposure(tmp_path: Path) -> None:
+    alpaca = FakeAlpacaClient(cash=100000, buying_power=100000, portfolio_value=100000)
+    engine = AutopilotEngine(
+        root=tmp_path,
+        config=AutopilotConfig(enabled=True, mode="live", allow_live=True, max_trade_usd=1000, max_kelly_fraction=0.25, min_confidence=40, max_open_positions=5),
+        intel_client=FakeIntelClient(["MSFT"]),
+        quote_client=FakeQuoteClient(),
+        alpaca_client=alpaca,
+    )
+
+    payload = engine.execute(Watchlist(symbols=["MSFT"], positions=[], risk={}, aliases={}), confirm=LIVE_CONFIRM_PHRASE)
+
+    assert payload["executed"] == []
+    assert any(item["status"] == "live_exposure_limit" for item in payload["blocked"])
+    assert payload["blocked"][0]["live_exposure_cap"] < payload["blocked"][0]["notional"]
     assert alpaca.orders == []
 
 

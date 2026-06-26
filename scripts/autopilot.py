@@ -324,6 +324,10 @@ class AutopilotEngine:
                 "source": "autopilot",
                 "review_only": True,
             }
+            live_exposure_block = _live_exposure_block(order, scan_payload, self.config)
+            if live_exposure_block:
+                blocked.append(live_exposure_block)
+                continue
             orders.append(order)
             buy_order_count += 1
             remaining_cash = max(0, remaining_cash - notional)
@@ -1086,6 +1090,48 @@ def _order_notional(candidate: dict[str, Any], remaining_cash: float) -> float:
         return 0
     notional = min(suggested, remaining_cash)
     return notional if notional >= 1 else 0
+
+
+def _live_exposure_block(order: dict[str, Any], scan_payload: dict[str, Any], config: AutopilotConfig) -> dict[str, Any] | None:
+    if config.mode != "live" or str(order.get("side") or "").lower() != "buy":
+        return None
+    account = scan_payload.get("account_state") or {}
+    cash = _safe_float(account.get("available_cash") or account.get("cash"))
+    portfolio_value = _safe_float(account.get("portfolio_value") or account.get("equity") or cash)
+    notional = _safe_float(order.get("notional"))
+    if cash <= 0 or portfolio_value <= 0:
+        return {**order, "status": "live_exposure_limit", "reason": "Live exposure blocked because Alpaca cash and portfolio value are unavailable.", "live_exposure_cap": 0}
+    cap = _live_order_exposure_cap(order, cash, portfolio_value)
+    open_exposure = sum(_safe_float(position.get("market_value")) for position in scan_payload.get("open_positions", []))
+    total_cap = round(portfolio_value * 0.35, 2)
+    if open_exposure + notional > total_cap:
+        return {
+            **order,
+            "status": "live_exposure_limit",
+            "reason": f"Live exposure blocked because open positions plus this order would exceed 35% of portfolio value (${total_cap:.2f}).",
+            "live_exposure_cap": cap,
+            "live_total_exposure_cap": total_cap,
+            "current_exposure": round(open_exposure, 2),
+        }
+    if notional > cap:
+        return {
+            **order,
+            "status": "live_exposure_limit",
+            "reason": f"Live exposure blocked. Derived cap is ${cap:.2f} from cash, portfolio value, probability, and edge; planned order is ${notional:.2f}.",
+            "live_exposure_cap": cap,
+            "live_total_exposure_cap": total_cap,
+            "current_exposure": round(open_exposure, 2),
+        }
+    return None
+
+
+def _live_order_exposure_cap(order: dict[str, Any], cash: float, portfolio_value: float) -> float:
+    probability = _safe_float(order.get("probability_up"), 0.5)
+    edge_pct = max(0, _safe_float(order.get("edge_pct"), 0))
+    probability_strength = _clamp_float((probability - 0.5) / 0.45, 0, 1, 0)
+    edge_strength = _clamp_float(edge_pct / 2, 0, 1, 0)
+    quality_fraction = _clamp_float(0.0025 + probability_strength * 0.004 + edge_strength * 0.003, 0.0025, 0.01, 0.0025)
+    return round(max(1, min(cash * quality_fraction, portfolio_value * 0.01)), 2)
 
 
 def _learning_risk_fraction(learning: dict[str, Any]) -> float:

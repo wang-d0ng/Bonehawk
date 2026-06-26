@@ -46,12 +46,14 @@ def order_truth_snapshot(root: Path, *, limit: int = 80) -> dict[str, Any]:
         events = [_event_from_decision(row) for row in latest_decisions(root / "logs" / "decision_log.jsonl", limit=limit)]
         events = [event for event in events if event]
     sorted_events = sorted(events, key=lambda item: str(item.get("timestamp") or ""), reverse=True)[:limit]
-    summary = _stage_counts(sorted_events)
-    active = [event for event in sorted_events if event.get("stage") in {"created", "submitted", "partial_fill", "queued"}]
+    current_events = _current_order_events(sorted_events)
+    summary = _stage_counts(current_events)
+    active = [event for event in current_events if event.get("stage") in {"created", "submitted", "partial_fill", "queued"}]
     return {
         "ok": True,
         "status": "ready",
         "events": sorted_events,
+        "current": current_events,
         "active": active[:20],
         "summary": {**summary, "total": len(sorted_events), "active": len(active)},
         "message": "Order truth center reconciles tickets, broker ids, fills, rejects, and queued market-open orders.",
@@ -300,6 +302,27 @@ def _stage_counts(events: list[dict[str, Any]]) -> dict[str, int]:
         stage = str(event.get("stage") or "created")
         counts[stage if stage in counts else "created"] += 1
     return counts
+
+
+def _current_order_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest_by_key: dict[str, dict[str, Any]] = {}
+    for event in sorted(events, key=lambda item: str(item.get("timestamp") or "")):
+        latest_by_key[_order_identity(event)] = event
+    return sorted(latest_by_key.values(), key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+
+
+def _order_identity(event: dict[str, Any]) -> str:
+    broker_order_id = str(event.get("broker_order_id") or "").strip()
+    if broker_order_id:
+        return f"broker:{broker_order_id}"
+    client_order_id = str(event.get("client_order_id") or "").strip()
+    if client_order_id:
+        return f"client:{client_order_id}"
+    timestamp = str(event.get("timestamp") or "")
+    source = str(event.get("source") or "")
+    symbol = _symbol(event)
+    action = str(event.get("action") or "")
+    return f"event:{timestamp}:{source}:{symbol}:{action}"
 
 
 def _strategy_name(decision: dict[str, Any]) -> str:
