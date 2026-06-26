@@ -18,6 +18,8 @@ class FakeTelegramService:
         self.mode = mode
         self.executed = False
         self.scanned = False
+        self.background_started = False
+        self.background_stopped = False
         self.settings: list[tuple[str, object, str]] = []
 
     def autopilot(self):
@@ -58,11 +60,40 @@ class FakeTelegramService:
         self.settings.append((setting, value, confirm))
         return {"ok": True, "status": "updated", "message": f"{setting} updated.", "config": {str(setting): value}}
 
+    def start_autopilot_background(self):
+        self.background_started = True
+        return {"ok": True, "status": "started", "running": True}
+
+    def stop_autopilot_background(self):
+        self.background_stopped = True
+        return {"ok": True, "status": "stopped", "running": False}
+
     def tickets(self):
         return {
             "tickets": [
                 {"symbol": "MSFT", "side": "BUY", "status": "submitted", "broker_status": "accepted", "fill_status": "not_filled_yet", "broker_order_id": "paper-order"}
             ]
+        }
+
+    def portfolio_sync(self):
+        return {
+            "positions": [
+                {"symbol": "MSFT", "quantity": 2, "current_price": 100, "unrealized_pnl": 4.25},
+                {"symbol": "NVDA", "quantity": 1, "current_price": 120, "unrealized_pnl": -1.5},
+            ],
+            "performance": {"account_value": 1250.5, "unrealized_pnl": 2.75},
+        }
+
+    def trading_desk(self):
+        return {
+            "ok": True,
+            "status": "ready",
+            "data_health": {"status": "healthy", "score": 90, "risk_action": "normal"},
+            "order_truth": {"summary": {"active": 1, "submitted": 1, "rejected": 0, "filled": 0}},
+            "trade_journal": {"summary": {"entries": 3, "wins": 2, "losses": 1, "net_pnl": 5.5}},
+            "strategy_scorecard": {"strategies": [{"strategy": "momentum_breakout", "win_rate_pct": 66.7, "net_pnl": 5.5}]},
+            "shadow_mode": {"summary": {"open": 1, "evaluated": 4, "wins": 3, "losses": 1, "avg_return_pct": 0.8}},
+            "backtest": {"summary": {"symbols_tested": 12, "passing": 7, "best_symbol": "MSFT", "best_return_pct": 2.4}},
         }
 
     def report(self, window_minutes: int = 10):
@@ -137,6 +168,36 @@ def test_handle_autopilot_command_updates_paper_safe_settings() -> None:
     assert response.ok is True
     assert disabled.ok is True
     assert service.settings == [("max_trade_usd", 50.0, ""), ("enabled", False, "")]
+
+
+def test_handle_autopilot_command_pauses_resumes_and_kills_background() -> None:
+    service = FakeTelegramService()
+
+    paused = handle_autopilot_command("/bh pause", service)
+    resumed = handle_autopilot_command("/bh resume", service)
+    killed = handle_autopilot_command("/bh kill", service)
+
+    assert paused.ok is True
+    assert resumed.ok is True
+    assert killed.ok is True
+    assert service.background_started is True
+    assert service.background_stopped is True
+    assert service.settings == [("enabled", False, ""), ("enabled", True, ""), ("enabled", False, "")]
+
+
+def test_handle_autopilot_command_reports_orders_positions_and_health() -> None:
+    service = FakeTelegramService()
+
+    orders = handle_autopilot_command("/bh orders", service)
+    positions = handle_autopilot_command("/bh positions", service)
+    health = handle_autopilot_command("/bh health", service)
+    desk = handle_autopilot_command("/bh desk", service)
+
+    assert orders.ok is True
+    assert "paper-order" in orders.message
+    assert "MSFT 2" in positions.message
+    assert "Data health: healthy 90" in health.message
+    assert "Best backtest: MSFT" in desk.message
 
 
 def test_handle_autopilot_command_sends_recent_report() -> None:

@@ -443,6 +443,10 @@ def test_autopilot_scan_generates_paper_buy_plan(tmp_path: Path) -> None:
     assert payload["agentic_scan"]["opportunities"]
     assert "kelly" in " ".join(payload["orders"][0]["signals"]).lower()
     assert "available_cash" in payload["agentic_scan"]["opportunities"][0]
+    assert payload["data_health"]["status"] in {"healthy", "degraded"}
+    assert payload["backtest"]["summary"]["symbols_tested"] >= 1
+    assert "shadow_mode" in payload
+    assert "strategy_scorecard" in payload
 
 
 def test_autopilot_execute_places_paper_orders_and_records_decisions(tmp_path: Path) -> None:
@@ -464,6 +468,8 @@ def test_autopilot_execute_places_paper_orders_and_records_decisions(tmp_path: P
     assert alpaca.orders[0][0].take_profit is None
     assert payload["orders"][0]["stop_loss"] is not None
     assert (tmp_path / "logs" / "decision_log.jsonl").exists()
+    assert (tmp_path / "logs" / "order_truth.jsonl").exists()
+    assert (tmp_path / "logs" / "trade_journal.jsonl").exists()
 
 
 def test_autopilot_buy_uses_whole_quantity_for_non_fractionable_assets(tmp_path: Path) -> None:

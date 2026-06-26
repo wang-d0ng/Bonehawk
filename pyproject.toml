@@ -1,6 +1,6 @@
 [project]
 name = "bonehawk"
-version = "0.1.0"
+version = "0.1.2"
 description = "AI trading dashboard with Alpaca paper trading, market scanning, and Telegram notifications."
 readme = "README.md"
 requires-python = ">=3.11"

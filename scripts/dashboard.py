@@ -31,6 +31,16 @@ from scripts.postmortem_report import apply_loss_postmortem_report, build_loss_p
 from scripts.portfolio_sync import portfolio_sync_snapshot
 from scripts.quotes import CHART_RANGES, YahooQuoteClient, compute_alpaca_portfolio_performance
 from scripts.trade_ideas import build_market_trend, build_trade_ideas, build_trade_ideas_message
+from scripts.trading_desk import (
+    build_backtest,
+    build_data_health,
+    order_truth_snapshot,
+    record_order_truth_event,
+    record_trade_journal_entry,
+    shadow_mode_snapshot,
+    strategy_scorecard,
+    trade_journal_snapshot,
+)
 
 UI_THEME_VALUES = {"retro", "clean", "arcade", "classic", "algo-desk"}
 BACKGROUND_AUTOPILOT_INTERVAL_SECONDS = 10
@@ -475,6 +485,7 @@ class DashboardService:
         reason = f"{request.side} intent captured from dashboard. No live stock order was placed."
         intent = {
             "symbol": request.symbol,
+            "side": request.side.lower(),
             "action": f"{request.side}_INTENT",
             "confidence": None,
             "current_price": current_price,
@@ -485,6 +496,7 @@ class DashboardService:
             "review_only": True,
         }
         record_decisions(self.root / "logs" / "decision_log.jsonl", "stock_order_intent", [intent])
+        record_order_truth_event(self.root, "stock_order_intent", intent)
         return {
             "ok": True,
             "status": "recorded",
@@ -509,6 +521,18 @@ class DashboardService:
             time_in_force="day",
         )
         result = self._alpaca_client().place_order(order, confirm=confirm)
+        order_context = {
+            "symbol": request.symbol,
+            "side": request.side.lower(),
+            "action": f"{request.side}_MANUAL_ORDER",
+            "quantity": request.quantity,
+            "reason": "Manual dashboard order.",
+            "signals": ["manual dashboard order"],
+            "review_only": bool(result.get("review_only", False)),
+        }
+        truth_row = {**result, "action": order_context["action"], "reason": result.get("message"), "quantity": result.get("quantity", request.quantity)}
+        record_order_truth_event(self.root, "alpaca_stock_order" if result.get("ok") else "stock_order_attempt", truth_row)
+        record_trade_journal_entry(self.root, "alpaca_stock_order" if result.get("ok") else "stock_order_attempt", order_context, truth_row)
         record_decisions(
             self.root / "logs" / "decision_log.jsonl",
             "alpaca_stock_order" if result.get("ok") else "stock_order_attempt",
@@ -627,6 +651,37 @@ class DashboardService:
             },
         }
 
+    def trading_desk(self) -> dict[str, Any]:
+        config, market_gate = self._sync_autopilot_market_hours(load_autopilot_config(self.root / "config" / "autopilot.json"))
+        watchlist = self._autopilot_watchlist()
+        snapshot = self.intel_client.snapshot(watchlist)
+        symbols = _trade_quote_symbols({"scans": [{"symbol": symbol} for symbol in watchlist.symbols]}, watchlist.positions, limit=40)
+        symbols = list(dict.fromkeys([*symbols, *[position.symbol for position in watchlist.positions], "SPY", "QQQ"]))
+        quotes = self.quote_client.get_quotes(symbols)
+        histories = self.quote_client.get_histories(symbols)
+        account_state = self._autopilot_engine(config=config)._account_state()
+        order_truth = order_truth_snapshot(self.root)
+        health = build_data_health(
+            market_snapshot=snapshot,
+            quotes=quotes,
+            account_state=account_state,
+            market_gate=market_gate,
+            order_summary=order_truth.get("summary") or {},
+        )
+        return {
+            "ok": True,
+            "status": "ready",
+            "updated_at": datetime.now(UTC).isoformat(),
+            "market_hours": market_gate,
+            "data_health": health,
+            "order_truth": order_truth,
+            "trade_journal": trade_journal_snapshot(self.root),
+            "strategy_scorecard": strategy_scorecard(self.root),
+            "shadow_mode": shadow_mode_snapshot(self.root, quotes, min_age_minutes=config.scan_window_minutes),
+            "backtest": build_backtest(histories),
+            "message": "Trading desk snapshot updated.",
+        }
+
     def _market_trend(self) -> str:
         try:
             histories = self.quote_client.get_histories(["SPY", "QQQ"])
@@ -661,6 +716,7 @@ class DashboardService:
                 continue
             self._ticket_refresh_cache[order_id] = (now, order)
             refreshed[index] = _ticket_with_alpaca_order(ticket, order)
+            record_order_truth_event(self.root, "alpaca_order_refresh", refreshed[index])
         return refreshed
 
     def _alpaca_client(self) -> Any:
@@ -871,6 +927,8 @@ def make_handler(service: DashboardService) -> type[BaseHTTPRequestHandler]:
                 self._send(*json_response(service.portfolio_sync()))
             elif path == "/api/overview-metrics":
                 self._send(*json_response(service.overview_metrics()))
+            elif path == "/api/trading-desk":
+                self._send(*json_response(service.trading_desk()))
             elif path == "/api/autopilot":
                 self._send(*json_response(service.autopilot()))
             elif path == "/api/autopilot-background":
@@ -2296,6 +2354,36 @@ HTML = """
                 <button data-action onclick="setAutopilotBackground(false)">Stop</button>
               </div>
             </div>
+            <div class="panel-block">
+              <div class="section-head">
+                <div>
+                  <h2>Trading Desk</h2>
+                  <div class="panel-sub">Order truth, journal, strategy scorecard, shadow mode, backtest, and data confidence.</div>
+                </div>
+                <span id="desk-health-pill" class="pill quiet">Loading</span>
+              </div>
+              <div id="desk-metrics" class="metric-grid"></div>
+              <div class="two-col">
+                <div>
+                  <h2>Order Truth</h2>
+                  <div id="desk-order-truth" class="data-list"></div>
+                </div>
+                <div>
+                  <h2>Strategy Scorecard</h2>
+                  <div id="desk-scorecard" class="data-list"></div>
+                </div>
+              </div>
+              <div class="two-col">
+                <div>
+                  <h2>Shadow Mode</h2>
+                  <div id="desk-shadow" class="data-list"></div>
+                </div>
+                <div>
+                  <h2>Backtest</h2>
+                  <div id="desk-backtest" class="data-list"></div>
+                </div>
+              </div>
+            </div>
             <div class="desk-grid">
               <div class="panel-block">
                 <div class="section-head">
@@ -2877,7 +2965,7 @@ HTML = """
     }
     async function refreshIntel() {
       setStatus('Refreshing market data...', 'muted');
-      const [data, trades, growth, sync, logs, tickets, stocks, autopilot, background, liveOrders] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/stocks'), getJson('/api/autopilot'), getJson('/api/autopilot-background'), getJson('/api/live-orders')]);
+      const [data, trades, growth, sync, logs, tickets, stocks, autopilot, background, liveOrders, tradingDesk] = await Promise.all([getJson('/api/market-intel'), getJson('/api/trade-ideas'), getJson('/api/growth-candidates'), getJson('/api/portfolio-sync'), getJson('/api/decision-log'), getJson('/api/tickets'), getJson('/api/stocks'), getJson('/api/autopilot'), getJson('/api/autopilot-background'), getJson('/api/live-orders'), getJson('/api/trading-desk')]);
       renderPortfolio(data, trades, sync);
       renderTicker(trades);
       renderTradeIdeas(trades);
@@ -2885,6 +2973,7 @@ HTML = """
       renderStocks(stocks);
       renderAutopilot(autopilot);
       renderAutopilotBackground(background);
+      renderTradingDesk(tradingDesk);
       renderAutopilotSettings(autopilot);
       renderScanner(trades, data);
       renderNews(data);
@@ -3010,6 +3099,44 @@ HTML = """
       document.getElementById('autopilot-orders').innerHTML = empty('Run Scan to build a fresh paper plan.');
       renderRiskGuard(data);
       renderAutopilotAgents(data);
+    }
+    function renderTradingDesk(data) {
+      const health = data.data_health || {};
+      const truth = (data.order_truth || {}).summary || {};
+      const journal = (data.trade_journal || {}).summary || {};
+      const scorecard = data.strategy_scorecard || {};
+      const strategies = scorecard.strategies || [];
+      const shadow = (data.shadow_mode || {}).summary || {};
+      const backtest = (data.backtest || {}).summary || {};
+      const healthPill = document.getElementById('desk-health-pill');
+      if (healthPill) {
+        healthPill.textContent = `${humanize(health.status || 'unknown')} ${health.score || 0}`;
+        healthPill.className = `pill ${health.status === 'healthy' ? 'buy' : health.status === 'degraded' ? 'trim' : 'sell'}`;
+      }
+      document.getElementById('desk-metrics').innerHTML = [
+        metric('Data confidence', `${health.score || 0}/100`, humanize(health.risk_action || 'unknown')),
+        metric('Active orders', String(truth.active || 0), `${truth.submitted || 0} submitted · ${truth.rejected || 0} rejected`),
+        metric('Journal P&L', money(journal.net_pnl || 0), `${journal.wins || 0}W / ${journal.losses || 0}L`),
+        metric('Best backtest', escapeHtml(backtest.best_symbol || 'none'), `${Number(backtest.best_return_pct || 0).toFixed(2)}%`)
+      ].join('');
+      document.getElementById('desk-order-truth').innerHTML = [
+        row('Lifecycle', `${truth.created || 0} created · ${truth.queued || 0} queued · ${truth.filled || 0} filled`, pill(`${truth.total || 0} total`, 'quiet')),
+        row('Broker outcomes', `${truth.submitted || 0} submitted · ${truth.partial_fill || 0} partial · ${truth.canceled || 0} canceled`, pill(`${truth.rejected || 0} rejected`, truth.rejected ? 'sell' : 'buy')),
+        row('Data health action', escapeHtml(health.risk_action || 'unknown'), pill(health.status || 'unknown', health.status === 'healthy' ? 'buy' : 'trim'))
+      ].join('');
+      document.getElementById('desk-scorecard').innerHTML = strategies.slice(0, 4).map(item => row(
+        escapeHtml(item.strategy || 'strategy'),
+        `${item.submitted || 0} submitted · ${item.wins || 0}W/${item.losses || 0}L · avg ${money(item.avg_pnl || 0)}`,
+        `${Number(item.win_rate_pct || 0).toFixed(1)}% ${pill(item.status || 'collecting', item.status === 'throttle' ? 'sell' : item.status === 'promote' ? 'buy' : 'quiet')}`
+      )).join('') || empty('No strategy outcomes recorded yet.');
+      document.getElementById('desk-shadow').innerHTML = [
+        row('Shadow outcomes', `${shadow.evaluated || 0} evaluated · ${shadow.open || 0} open`, pill(`${shadow.wins || 0}W/${shadow.losses || 0}L`, shadow.wins >= shadow.losses ? 'buy' : 'trim')),
+        row('Average return', `${Number(shadow.avg_return_pct || 0).toFixed(2)}%`, pill('paperless', 'quiet'))
+      ].join('');
+      document.getElementById('desk-backtest').innerHTML = [
+        row('Symbols tested', `${backtest.symbols_tested || 0}`, pill(`${backtest.passing || 0} pass`, backtest.passing ? 'buy' : 'quiet')),
+        row('Best setup', escapeHtml(backtest.best_symbol || 'none'), `${Number(backtest.best_return_pct || 0).toFixed(2)}%`)
+      ].join('');
     }
     function renderAutopilotBackground(data) {
       const statusNode = document.getElementById('autopilot-background-status');

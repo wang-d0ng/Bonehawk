@@ -17,6 +17,16 @@ from scripts.market_universe import combine_symbols, load_market_universe
 from scripts.postmortem_report import load_active_postmortem_learnings
 from scripts.quotes import YahooQuoteClient
 from scripts.trade_ideas import build_market_trend, build_trade_ideas
+from scripts.trading_desk import (
+    build_backtest,
+    build_data_health,
+    order_truth_snapshot,
+    record_order_truth_event,
+    record_shadow_candidates,
+    record_trade_journal_entry,
+    shadow_mode_snapshot,
+    strategy_scorecard,
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +82,7 @@ class AutopilotEngine:
         scan_payload = self._build_scan(watchlist)
         decisions = self._build_orders(scan_payload, watchlist)
         record_decisions(self.root / "logs" / "decision_log.jsonl", "autopilot_scan", decisions["orders"])
+        record_shadow_candidates(self.root, decisions["orders"])
         return {
             "ok": True,
             "status": "scanned",
@@ -132,20 +143,21 @@ class AutopilotEngine:
                         break
                     continue
                 response = self.alpaca_client.place_order(request, confirm=confirm)
-                executed.append(
-                    {
-                        **response,
-                        "symbol": response.get("symbol") or order.get("symbol"),
-                        "side": response.get("side") or order.get("side"),
-                        "quantity": response.get("quantity") or order.get("quantity"),
-                        "notional": response.get("notional") or order.get("notional"),
-                        "current_price": order.get("current_price"),
-                        "action": order.get("action"),
-                        "reason": order.get("reason"),
-                        "scheduled_for_market_open": order.get("scheduled_for_market_open"),
-                        "target_fill_time": order.get("target_fill_time"),
-                    }
-                )
+                executed_row = {
+                    **response,
+                    "symbol": response.get("symbol") or order.get("symbol"),
+                    "side": response.get("side") or order.get("side"),
+                    "quantity": response.get("quantity") or order.get("quantity"),
+                    "notional": response.get("notional") or order.get("notional"),
+                    "current_price": order.get("current_price"),
+                    "action": order.get("action"),
+                    "reason": order.get("reason"),
+                    "scheduled_for_market_open": order.get("scheduled_for_market_open"),
+                    "target_fill_time": order.get("target_fill_time"),
+                }
+                executed.append(executed_row)
+                record_order_truth_event(self.root, "autopilot_order", executed_row)
+                record_trade_journal_entry(self.root, "autopilot_order", order, executed_row)
                 if response.get("status") == "rate_limited":
                     decisions["blocked"].extend(_rate_limit_blocks(planned_orders[index + 1 :]))
                     break
@@ -189,6 +201,14 @@ class AutopilotEngine:
         histories = self.quote_client.get_histories(quote_symbols)
         technicals = {symbol: history.technicals() for symbol, history in histories.items()}
         market_trend = build_market_trend(technicals)
+        order_truth = order_truth_snapshot(self.root)
+        data_health = build_data_health(
+            market_snapshot=snapshot,
+            quotes=quotes,
+            account_state=account_state,
+            market_gate={},
+            order_summary=order_truth.get("summary") or {},
+        )
         ideas = build_trade_ideas(scan_result, quotes, active_watchlist.positions, active_watchlist.risk, technicals=technicals, market_trend=market_trend, max_ideas=12)
         growth = build_growth_candidates(scan_result, quotes, technicals, market_trend=market_trend, max_candidates=12)
         agentic_scan = run_agentic_scan(
@@ -224,6 +244,11 @@ class AutopilotEngine:
             "account_state": account_state,
             "open_positions": open_positions,
             "exit_candidates": exit_candidates,
+            "data_health": data_health,
+            "order_truth": order_truth,
+            "strategy_scorecard": strategy_scorecard(self.root),
+            "shadow_mode": shadow_mode_snapshot(self.root, quotes, min_age_minutes=self.config.scan_window_minutes),
+            "backtest": build_backtest(histories),
         }
 
     def _build_orders(self, scan_payload: dict[str, Any], watchlist: Watchlist) -> dict[str, list[dict[str, Any]]]:
@@ -235,6 +260,21 @@ class AutopilotEngine:
         open_slots = max(0, self.config.max_open_positions - len(held_symbols))
         learning = load_active_postmortem_learnings(self.root)
         remaining_cash = _safe_float((scan_payload.get("account_state") or {}).get("available_cash"), 0) * _learning_risk_fraction(learning)
+        data_health = scan_payload.get("data_health") or {}
+        if data_health.get("risk_action") == "pause_execution":
+            return {
+                "orders": [],
+                "blocked": [
+                    {
+                        "status": "data_health_pause",
+                        "reason": f"Data confidence is {data_health.get('status', 'unsafe')}; execution paused until feeds recover.",
+                        "data_health_score": data_health.get("score", 0),
+                        "review_only": True,
+                    }
+                ],
+            }
+        if data_health.get("risk_action") == "reduce_size":
+            remaining_cash *= 0.5
         loss_block = _daily_loss_block(scan_payload.get("account_state") or {}, self.config)
         if loss_block:
             return {"orders": [], "blocked": [loss_block]}
@@ -261,6 +301,10 @@ class AutopilotEngine:
                 continue
             if candidate["symbol"] in held_symbols:
                 blocked.append({**candidate, "status": "blocked", "reason": "Already in configured positions."})
+                continue
+            strategy_block = _strategy_scorecard_block(candidate, scan_payload.get("strategy_scorecard") or {})
+            if strategy_block:
+                blocked.append(strategy_block)
                 continue
             learning_block = _postmortem_learning_block(candidate, learning)
             if learning_block:
@@ -1066,6 +1110,40 @@ def _postmortem_learning_block(candidate: dict[str, Any], learning: dict[str, An
         "reason": f"{reason} Cooldown active until {until}.",
         "cooldown_until": until,
     }
+
+
+def _strategy_scorecard_block(candidate: dict[str, Any], scorecard: dict[str, Any]) -> dict[str, Any] | None:
+    strategy = _candidate_strategy_name(candidate)
+    for row in scorecard.get("strategies") or []:
+        if str(row.get("strategy") or "") != strategy:
+            continue
+        if row.get("status") != "throttle":
+            return None
+        return {
+            **candidate,
+            "status": "strategy_throttled",
+            "reason": f"Strategy {strategy} is throttled by the scorecard after recent losses.",
+            "strategy": strategy,
+            "win_rate_pct": row.get("win_rate_pct"),
+            "net_pnl": row.get("net_pnl"),
+            "review_only": True,
+        }
+    return None
+
+
+def _candidate_strategy_name(candidate: dict[str, Any]) -> str:
+    for signal in candidate.get("signals") or []:
+        text = str(signal).strip().lower()
+        if text.startswith("strategy "):
+            return text.split(" ", 1)[1].strip().replace(" ", "_") or "autopilot"
+    action = str(candidate.get("action") or "").lower()
+    if "growth" in action:
+        return "quick_growth"
+    if "buy" in action or "candidate" in action:
+        return "momentum_breakout"
+    if "sell" in action or "exit" in action:
+        return "exit_intelligence"
+    return "autopilot"
 
 
 def _order_with_market_open_schedule(order: dict[str, Any], market_gate: dict[str, Any] | None) -> dict[str, Any]:

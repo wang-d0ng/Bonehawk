@@ -60,11 +60,16 @@ Only chats listed in `ALLOWED_CHAT_IDS` can control the bot. Supported commands:
 - `/bh status`
 - `/bh scan`
 - `/bh run` for paper-mode execution only
+- `/bh report`
 - `/bh tickets`
-- `/bh enable` or `/bh disable`
+- `/bh orders`
+- `/bh positions`
+- `/bh health`
+- `/bh desk`
+- `/bh pause`, `/bh resume`, or `/bh kill`
 - `/bh paper-mode`
 - `/bh size 25`
-- `/bh positions 3`
+- `/bh max-positions 3`
 - `/bh confidence 55`
 
 ## Market Scanner
@@ -108,6 +113,17 @@ Buy/Sell buttons in the dashboard create tickets. The `Record Ticket` button log
 - With `ALPACA_PAPER=false`, Bonehawk also requires `ALPACA_ALLOW_LIVE=true` and the confirmation phrase `LIVE_ALPACA_ORDER`.
 
 Order responses appear as top-right notifications and are logged in the Tickets tab with status, broker order id, and message details.
+
+## Trading Desk
+
+The AI Desk includes a Trading Desk panel that keeps the bot accountable:
+
+- Order Truth tracks each order from intent to broker submit, queued market-open order, partial fill, fill, reject, or cancel.
+- Trade Journal stores the thesis, confidence, sizing method, risk plan, exit plan, broker id, and realized P/L when available.
+- Strategy Scorecard groups journaled trades by strategy and can throttle strategies after enough negative evidence.
+- Shadow Mode records what the bot would have done and compares those decisions against later prices before live trust.
+- Backtest runs a lightweight historical sanity check over loaded price histories.
+- Data Confidence scores quote, news, account, market-clock, and order-health inputs before execution.
 
 ## Alpaca Autopilot
 

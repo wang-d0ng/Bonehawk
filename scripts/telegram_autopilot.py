@@ -146,17 +146,34 @@ def handle_autopilot_command(text: str, service: Any) -> CommandResponse:
         return CommandResponse(True, "executed", _format_execution(service.autopilot_execute()))
     if command == "report":
         return CommandResponse(True, "report", _format_report(service.report(window_minutes=_report_window_minutes(args))))
-    if command == "tickets":
+    if command in {"tickets", "orders"}:
         return CommandResponse(True, "tickets", _format_tickets(service.tickets()))
-    if command in {"enable", "on"}:
-        return _setting_response(service.set_autopilot_setting("enabled", True), "Autopilot enabled.")
-    if command in {"disable", "off"}:
-        return _setting_response(service.set_autopilot_setting("enabled", False), "Autopilot disabled.")
+    if command == "positions":
+        return CommandResponse(True, "positions", _format_positions(service.portfolio_sync()))
+    if command in {"pause", "disable", "off"}:
+        payload = service.set_autopilot_setting("enabled", False)
+        if hasattr(service, "stop_autopilot_background"):
+            service.stop_autopilot_background()
+        return _setting_response(payload, "Autopilot paused.")
+    if command in {"resume", "enable", "on"}:
+        payload = service.set_autopilot_setting("enabled", True)
+        if payload.get("ok") and hasattr(service, "start_autopilot_background"):
+            service.start_autopilot_background()
+        return _setting_response(payload, "Autopilot resumed.")
+    if command == "kill":
+        payload = service.set_autopilot_setting("enabled", False)
+        if hasattr(service, "stop_autopilot_background"):
+            service.stop_autopilot_background()
+        return CommandResponse(bool(payload.get("ok")), "kill_switch", f"Bonehawk kill switch: {payload.get('message') or 'Autopilot stopped.'}")
+    if command == "health":
+        return CommandResponse(True, "health", _format_health(service.trading_desk()))
+    if command == "desk":
+        return CommandResponse(True, "desk", _format_desk(service.trading_desk()))
     if command == "paper-mode":
         return _setting_response(service.set_autopilot_setting("mode", "paper"), "Autopilot mode set to paper.")
     if command in {"size", "trade-size"}:
         return _number_setting(service, "max_trade_usd", args, "Max trade size")
-    if command in {"positions", "max-positions"}:
+    if command in {"max-positions", "position-limit"}:
         return _number_setting(service, "max_open_positions", args, "Max open positions")
     if command in {"confidence", "min-confidence"}:
         return _number_setting(service, "min_confidence", args, "Minimum confidence")
@@ -233,6 +250,54 @@ def _format_tickets(payload: dict[str, Any]) -> str:
             f"{ticket.get('broker_order_id') or ''}".strip()
         )
     return "\n".join(lines)
+
+
+def _format_positions(payload: dict[str, Any]) -> str:
+    positions = payload.get("positions") or []
+    if not positions:
+        positions = ((payload.get("performance") or {}).get("positions") or [])
+    if not positions:
+        return "Bonehawk Positions: no open positions found."
+    lines = ["Bonehawk Positions:"]
+    for position in positions[:8]:
+        symbol = str(position.get("symbol") or "UNKNOWN").upper()
+        quantity = _format_quantity(position.get("quantity"))
+        price = _money(position.get("current_price"))
+        pnl = _money(position.get("unrealized_pnl"))
+        lines.append(f"{symbol} {quantity} @ {price} P/L {pnl}".strip())
+    return "\n".join(lines)
+
+
+def _format_health(payload: dict[str, Any]) -> str:
+    health = payload.get("data_health") or {}
+    lines = [
+        f"Bonehawk Data health: {health.get('status', 'unknown')} {health.get('score', 0)}",
+        f"Risk action: {health.get('risk_action', 'unknown')}",
+    ]
+    for check in (health.get("checks") or [])[:5]:
+        mark = "OK" if check.get("ok") else "WARN"
+        lines.append(f"{mark} {check.get('name', 'check')}: {check.get('message', '')}")
+    return "\n".join(lines)
+
+
+def _format_desk(payload: dict[str, Any]) -> str:
+    health = payload.get("data_health") or {}
+    truth = (payload.get("order_truth") or {}).get("summary") or {}
+    journal = (payload.get("trade_journal") or {}).get("summary") or {}
+    strategy = ((payload.get("strategy_scorecard") or {}).get("strategies") or [{}])[0]
+    shadow = (payload.get("shadow_mode") or {}).get("summary") or {}
+    backtest = (payload.get("backtest") or {}).get("summary") or {}
+    return "\n".join(
+        [
+            "Bonehawk Desk:",
+            f"Data health: {health.get('status', 'unknown')} {health.get('score', 0)}",
+            f"Orders active/submitted/rejected: {truth.get('active', 0)}/{truth.get('submitted', 0)}/{truth.get('rejected', 0)}",
+            f"Journal entries: {journal.get('entries', 0)} net {_money(journal.get('net_pnl'))}",
+            f"Top strategy: {strategy.get('strategy', 'none')} {strategy.get('win_rate_pct', 0)}% win {_money(strategy.get('net_pnl'))}",
+            f"Shadow W/L/open: {shadow.get('wins', 0)}/{shadow.get('losses', 0)}/{shadow.get('open', 0)}",
+            f"Best backtest: {backtest.get('best_symbol', 'none')} {backtest.get('best_return_pct', 0)}%",
+        ]
+    )
 
 
 def _format_report(payload: dict[str, Any]) -> str:
@@ -314,11 +379,13 @@ def _help_message() -> str:
         "/bh scan\n"
         "/bh run  (paper only)\n"
         "/bh report\n"
-        "/bh tickets\n"
-        "/bh enable | /bh disable\n"
+        "/bh tickets | /bh orders\n"
+        "/bh positions\n"
+        "/bh health | /bh desk\n"
+        "/bh pause | /bh resume | /bh kill\n"
         "/bh paper-mode\n"
         "/bh size 25\n"
-        "/bh positions 3\n"
+        "/bh max-positions 3\n"
         "/bh confidence 55"
     )
 

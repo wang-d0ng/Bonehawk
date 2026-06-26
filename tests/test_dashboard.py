@@ -719,6 +719,46 @@ def test_dashboard_overview_metrics_endpoint(tmp_path: Path) -> None:
     assert payload["market_trend"] == "UP"
 
 
+def test_dashboard_service_trading_desk_returns_truth_health_and_scorecards(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), quote_client=TrendingQuoteClient(), alpaca_client=FakeAlpacaClient())
+    record_decisions(
+        tmp_path / "logs" / "decision_log.jsonl",
+        "autopilot_order",
+        [
+            {
+                "symbol": "MSFT",
+                "side": "buy",
+                "status": "submitted",
+                "broker_status": "accepted",
+                "broker_order_id": "paper-order",
+                "reason": "test order",
+            }
+        ],
+    )
+
+    payload = service.trading_desk()
+
+    assert payload["ok"] is True
+    assert payload["order_truth"]["summary"]["submitted"] == 1
+    assert payload["data_health"]["status"] in {"healthy", "degraded"}
+    assert "trade_journal" in payload
+    assert "strategy_scorecard" in payload
+    assert "shadow_mode" in payload
+    assert "backtest" in payload
+
+
+def test_dashboard_trading_desk_endpoint(tmp_path: Path) -> None:
+    service = DashboardService(root=tmp_path, intel_client=FakeIntelClient(), quote_client=TrendingQuoteClient(), alpaca_client=FakeAlpacaClient())
+    handler = make_handler(service)
+
+    status, body = _http_request(handler, "GET", "/api/trading-desk")
+    payload = json.loads(body)
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert "data_health" in payload
+
+
 def test_dashboard_service_report_filters_trades_to_recent_window(tmp_path: Path) -> None:
     logs = tmp_path / "logs"
     logs.mkdir()
