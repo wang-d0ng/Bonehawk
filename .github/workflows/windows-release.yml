@@ -1,0 +1,116 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload assets to. Leave blank to use pyproject version."
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the release as a prerelease if it must be created."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows release
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      INPUT_TAG: ${{ inputs.tag }}
+      INPUT_PRERELEASE: ${{ inputs.prerelease }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pytest>=8.2.0" "pytest-cov>=5.0.0" "pyinstaller>=6.0.0" pillow
+
+      - name: Generate Windows icon
+        shell: pwsh
+        run: |
+          python -c "from PIL import Image; img=Image.open('assets/app_icon.png'); img.save('assets/app_icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Build Windows app
+        run: python scripts/build_desktop_app.py
+
+      - name: Package Windows app
+        id: package
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          $tag = $env:INPUT_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $tag = "v$version"
+          }
+          $releaseDir = "dist-release"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          $zipPath = Join-Path $releaseDir "Bonehawk-$version-Windows-x64.zip"
+          Compress-Archive -Path "dist/Bonehawk/*" -DestinationPath $zipPath -Force
+          $checksumPath = "$zipPath.sha256"
+          $hash = Get-FileHash $zipPath -Algorithm SHA256
+          "$($hash.Hash.ToLower())  $(Split-Path $zipPath -Leaf)" | Out-File -FilePath $checksumPath -Encoding ascii
+          @"
+          Bonehawk Windows $version
+
+          Windows x64 desktop build for Bonehawk.
+
+          Download the zip, extract it, and run Bonehawk.exe.
+          This app is financial automation software. Keep it in paper mode until you have verified your own risk controls and results.
+          "@ | Out-File -FilePath release-notes-windows.md -Encoding utf8
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "checksum_path=$checksumPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bonehawk-Windows-x64
+          path: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ steps.package.outputs.checksum_path }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.package.outputs.tag }}"
+          $version = "${{ steps.package.outputs.version }}"
+          $zipPath = "${{ steps.package.outputs.zip_path }}"
+          $checksumPath = "${{ steps.package.outputs.checksum_path }}"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            $releaseArgs = @(
+              "release", "create", $tag,
+              "--repo", $env:GITHUB_REPOSITORY,
+              "--title", "Bonehawk $tag",
+              "--notes-file", "release-notes-windows.md"
+            )
+            if ($env:INPUT_PRERELEASE -eq "true") {
+              $releaseArgs += "--prerelease"
+            } else {
+              $releaseArgs += "--latest"
+            }
+            gh @releaseArgs
+          }
+          gh release upload $tag $zipPath $checksumPath --repo $env:GITHUB_REPOSITORY --clobber

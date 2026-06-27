@@ -188,13 +188,15 @@ Run Bonehawk as a desktop app:
 python scripts/desktop_app.py
 ```
 
-Build a Mac desktop app bundle:
+Build a desktop app locally:
 
 ```bash
 python scripts/build_desktop_app.py
 ```
 
-The build output is `dist/Bonehawk.app`. The desktop app icon lives at `assets/app_icon.png`, with the macOS bundle icon generated at `assets/app_icon.icns`.
+The macOS build output is `dist/Bonehawk.app`. The Windows build output is `dist/Bonehawk/Bonehawk.exe` when the same script runs on Windows. The desktop app icon lives at `assets/app_icon.png`, with the macOS bundle icon generated at `assets/app_icon.icns`.
+
+Windows releases are built by the GitHub Actions workflow `Windows Release`. It runs the test suite on `windows-latest`, builds the PyInstaller app, packages `Bonehawk-<version>-Windows-x64.zip`, writes a `.sha256` checksum, and uploads both files to the selected GitHub release tag.
 
 Run the packaged smoke check after building:
 
